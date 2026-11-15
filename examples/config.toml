@@ -1,0 +1,29 @@
+# Copy to ~/.config/researcher/config.toml and edit.
+# Layout of the example library:
+#   ~/research/rust/linux-notes.html
+#   ~/research/rust/memory-leaks.pdf
+#   ~/research/rust/memory-usage.md
+#   ~/research/web/seo.md
+#   ~/research/myapp/roadmap/index.html      (a folder with index.html = one document)
+
+library = "~/research"
+default_set = "rust"
+
+[aliases]
+rs = "rust"
+app = "myapp"
+
+# A topic set: ids are paths inside the library without the extension. Globs work.
+[sets.rust]
+docs = ["rust/linux-notes", "rust/memory-*"]
+
+[sets.web]
+docs = ["web/*"]
+
+# A project set: pulls in other sets and adds its own documents.
+[sets.myapp]
+include = ["rust"]
+docs = ["myapp/roadmap"]
+
+# Any other name (for example `/researcher side-project`) is a custom set:
+# the first call shows the whole library and you tick what that project needs.
