@@ -218,27 +218,60 @@ def build_sets(cfg, catalog, conf, names):
     return sets, kinds
 
 
+class Texts:
+    """Lazy {doc id: plain text}. `d in texts` is False for documents that cannot be read."""
+
+    def __init__(self, paths):
+        self.paths, self.cache, self.errors = paths, {}, {}
+
+    def __contains__(self, d):
+        if d in self.cache:
+            return True
+        if d not in self.paths or d in self.errors:
+            return False
+        try:
+            self.cache[d] = to_text(self.paths[d])
+        except (OSError, RuntimeError) as e:
+            self.errors[d] = str(e)
+            return False
+        return True
+
+    def __getitem__(self, d):
+        if d not in self:
+            raise KeyError(d)
+        return self.cache[d]
+
+    def get(self, d, default=""):
+        return self.cache[d] if d in self else default
+
+
 def sections_for(names, sets, kinds, conf, texts, setup):
-    """One section per requested set: its docs, the pre-ticked ones, the NEW ones."""
+    """One section per requested set.
+
+    docs     what the set is made of (for a custom set: the whole library)
+    main     documents shown at the top: the set's own plus extras saved earlier
+    other    the rest of the library, offered as "add from your library"
+    ticked   pre-ticked documents; new = added since the preset was saved
+    """
+    catalog = sets["all"]
     out = []
     for n in names:
         docs = sets[n]
         saved = conf.get(n)
+        known = set(saved.get("known", [])) if saved else set()
+        selected = set(saved.get("selected", [])) if saved else set()
+        new = {d for d in docs if d not in known} if saved else set()
         if kinds[n] == "custom":  # nothing ticked on first use, new docs never auto-ticked
-            if saved is None:
-                ticked, new, remember = set(), set(), True
-            else:
-                new = {d for d in docs if d not in set(saved.get("known", []))}
-                ticked = set(saved.get("selected", [])) & set(docs)
-                remember = bool(new) or setup
-        elif saved is None:  # first use: everything ticked, remember it
-            ticked, new, remember = set(docs), set(), True
+            ticked = selected & set(docs)
+            remember = saved is None or bool(new) or setup
+            main = [d for d in docs if d in ticked or d in new] if saved else []
         else:
-            new = {d for d in docs if d not in set(saved.get("known", []))}
-            ticked = (set(saved.get("selected", [])) | new) & set(docs)
-            remember = bool(new) or setup
-        out.append({"name": n, "kind": kinds[n], "docs": docs, "new": new,
-                    "ticked": {d for d in ticked if d in texts},  # missing files cannot load
+            ticked = set(docs) if saved is None else (selected | new)
+            remember = saved is None or bool(new) or setup
+            main = docs + [d for d in catalog if d in selected and d not in docs]
+        other = [d for d in catalog if d not in set(main)]
+        out.append({"name": n, "kind": kinds[n], "docs": docs, "main": main, "other": other,
+                    "new": new, "ticked": {d for d in ticked if d in texts},  # unreadable: no
                     "remember": remember, "first": saved is None})
     return out
 
@@ -272,7 +305,7 @@ def save_conf(path, conf):
 
 # ---------------------------------------------------------------- popup
 
-def popup(sections, texts, setup):
+def popup(sections, texts, setup, command=""):
     """Show the chooser. Returns {set: (ticked set, remember)}, None if cancelled or "timeout".
     Raises RuntimeError when no display/GTK 4 is available."""
     try:
@@ -284,7 +317,7 @@ def popup(sections, texts, setup):
     if not Gtk.init_check():
         raise RuntimeError("no display")
     Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
-    esc = GLib.markup_escape_text
+    esc = lambda t: GLib.markup_escape_text(t, -1)
     loop = GLib.MainLoop()
     result = {"value": None}
     boxes = {}  # set name -> [(doc, CheckButton)]
@@ -293,15 +326,26 @@ def popup(sections, texts, setup):
     def k(d):
         return len(texts.get(d, "")) / CHARS_PER_K
 
-    win = Gtk.Window(title="Researcher" + (" - change defaults" if setup else ""))
-    win.set_default_size(720, 760)
+    def folder(d):
+        return d.rpartition("/")[0]
+
+    win = Gtk.Window(title="Researcher for Claude - " +
+                     ("change saved presets" if setup else "choose research to load"))
+    win.set_default_size(720, 780)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for m in ("top", "bottom", "start", "end"):
         getattr(outer, f"set_margin_{m}")(14)
+    names = ", ".join(f"<b>{esc(s['name'])}</b>" for s in sections)
     head = Gtk.Label(xalign=0, wrap=True)
-    head.set_markup("<b>Tick the research to load.</b>  Nothing is sent to Claude until you "
-                    "press " + ("<b>Save</b>." if setup else "<b>Load</b>.")
-                    + "  NEW = added since this set's default was saved.")
+    if setup:
+        head.set_markup(f"<big><b>Change the saved presets</b></big> for {names}\n"
+                        "Tick what each should contain, then press <b>Save presets</b>. "
+                        "Nothing is loaded.")
+    else:
+        head.set_markup(f"<big><b>Claude Code wants to load research</b></big> for {names}\n"
+                        "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
+                        "Claude until then; <b>Cancel</b> loads nothing."
+                        + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
     outer.append(head)
     scroll = Gtk.ScrolledWindow(vexpand=True)
     body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -309,80 +353,97 @@ def popup(sections, texts, setup):
     outer.append(scroll)
     total = Gtk.Label(xalign=0)
 
-    def chosen():
-        return {d for lst in boxes.values() for d, cb in lst if cb.get_active()}
-
     def update(*_):
-        c = chosen()
-        total.set_markup(f"<b>{len(c)} docs, ~{sum(k(d) for d in c):.0f}k tokens</b>"
-                         + ("" if setup else "  (to be loaded)"))
+        c = {d for lst in boxes.values() for d, cb in lst if cb.get_active()}
+        total.set_markup(f"<b>{len(c)} documents, ~{sum(k(d) for d in c):.0f}k tokens</b>"
+                         + ("" if setup else " will be loaded"))
+        ok.set_label(f"Save presets" if setup else f"Load {len(c)} documents")
+        ok.set_sensitive(setup or bool(c))
+
+    def add_docs(target, docs, sec, lst):
+        """Check boxes for `docs`, with a small folder heading when more than one folder shows."""
+        folders = {folder(d) for d in docs}
+        last = None
+        for d in docs:
+            if len(folders) > 1 and folder(d) != last:
+                last = folder(d)
+                h = Gtk.Label(xalign=0)
+                h.set_markup(f"<small><b>{esc(last + '/' if last else '(top level)')}</b></small>")
+                h.set_margin_top(6)
+                h.set_margin_start(12)
+                target.append(h)
+            cb = Gtk.CheckButton()
+            l = Gtk.Label(xalign=0)
+            shown = d.rpartition("/")[2] if len(folders) > 1 else d
+            if d in texts:
+                extra = "  <span foreground='#ffcc33'><b>NEW</b></span>" if d in sec["new"] else ""
+                l.set_markup(f"{esc(shown)}  <small>~{k(d):.0f}k</small>{extra}")
+                cb.set_active(d in sec["ticked"])
+            else:
+                l.set_markup(f"<s>{esc(shown)}</s>  <span foreground='#ff6666'>"
+                             "MISSING or unreadable</span>")
+                cb.set_sensitive(False)
+            cb.set_child(l)
+            cb.set_margin_start(24 if len(folders) > 1 else 12)
+            cb.connect("toggled", update)
+            target.append(cb)
+            lst.append((d, cb))
 
     for sec in sections:
         n = sec["name"]
         custom = sec["kind"] == "custom"
-        note = "  · first use" if sec["first"] else (
-            f"  · {len(sec['new'])} new" if sec["new"] else "")
-        lbl = Gtk.Label(xalign=0)
-        lbl.set_margin_top(10)
-        lbl.set_markup(f"<big><b>{esc(n, -1)}</b></big>  <small>"
-                       f"{'custom set' if custom else 'set'}, {len(sec['docs'])} docs{note}</small>")
+        if sec["first"]:
+            sub = ("new set: nothing saved yet. Tick the research this one needs; it is saved "
+                   "as its preset." if custom else
+                   f"{len(sec['docs'])} documents (no preset saved yet, all ticked)")
+        else:
+            sub = f"saved preset: {len(sec['ticked'] - sec['new'])} documents" + (
+                f", {len(sec['new'])} new in the library" if sec["new"] else "")
+        lbl = Gtk.Label(xalign=0, wrap=True)
+        lbl.set_margin_top(12)
+        lbl.set_markup(f"<big><b>{esc(n)}</b></big>\n<small>{esc(sub)}</small>")
         body.append(lbl)
-        row = Gtk.Box(spacing=6)
         lst = []
-        for text, fn in (("All", lambda l: [cb.set_active(cb.get_sensitive()) for _, cb in l]),
-                         ("None", lambda l: [cb.set_active(False) for _, cb in l]),
-                         ("Saved default", None)):
+        row = Gtk.Box(spacing=6)
+        for text, fn in (("Select all", lambda l: [cb.set_active(cb.get_sensitive()) for _, cb in l]),
+                         ("Select none", lambda l: [cb.set_active(False) for _, cb in l]),
+                         ("Back to saved preset", None)):
             b = Gtk.Button(label=text)
             if fn is None:
                 b.connect("clicked", lambda _b, l=lst, s=sec["ticked"]:
                           [cb.set_active(d in s) for d, cb in l])
-                if sec["first"]:
-                    b.set_sensitive(False)
+                b.set_sensitive(not sec["first"])
             else:
                 b.connect("clicked", lambda _b, l=lst, f=fn: f(l))
             row.append(b)
         body.append(row)
-        fold = None  # custom sets fold the unticked, not-new docs under "Other research"
-        if custom and not sec["first"]:
-            keep = [d for d in sec["docs"] if d in sec["ticked"] or d in sec["new"]]
-            order = keep + [d for d in sec["docs"] if d not in keep]
-            fold = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        else:
-            keep, order = sec["docs"], sec["docs"]
-        for d in order:
-            target = fold if (fold is not None and d not in keep) else body
-            cb = Gtk.CheckButton()
-            l = Gtk.Label(xalign=0)
-            if d in texts:
-                extra = "  <span foreground='#ffcc33'><b>NEW</b></span>" if d in sec["new"] else ""
-                l.set_markup(f"{esc(d, -1)}  <small>~{k(d):.0f}k</small>{extra}")
-                cb.set_active(d in sec["ticked"])
-            else:
-                l.set_markup(f"<s>{esc(d, -1)}</s>  <span foreground='#ff6666'>MISSING</span>")
-                cb.set_sensitive(False)
-            cb.set_child(l)
-            cb.set_margin_start(12)
-            cb.connect("toggled", update)
-            target.append(cb)
-            lst.append((d, cb))
-        if fold is not None and len(order) > len(keep):
-            ex = Gtk.Expander(label=f"Other research ({len(order) - len(keep)})")
+        if sec["main"]:
+            add_docs(body, sec["main"], sec, lst)
+        if sec["other"]:
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            ex = Gtk.Expander(label=("Your library: tick the research to use"
+                                     if not sec["main"] else
+                                     f"Add other research from your library ({len(sec['other'])} more)"))
             ex.set_margin_start(12)
-            ex.set_child(fold)
+            ex.set_margin_top(6)
+            ex.set_expanded(not sec["main"])
+            ex.set_child(inner)
             body.append(ex)
+            add_docs(inner, sec["other"], sec, lst)
         boxes[n] = lst
-        rb = Gtk.CheckButton(label=f"Save this choice as the default for {n}")
+        rb = Gtk.CheckButton(label=f"Remember this choice as the preset for {n}")
         rb.set_active(sec["remember"])
         if setup:
             rb.set_sensitive(False)
         rb.set_margin_start(12)
+        rb.set_margin_top(6)
         body.append(rb)
         remember[n] = rb
 
     outer.append(total)
     bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-    cancel = Gtk.Button(label="Cancel")
-    ok = Gtk.Button(label="Save" if setup else "Load")
+    cancel = Gtk.Button(label="Close without saving" if setup else "Cancel (load nothing)")
+    ok = Gtk.Button(label="Load")
     ok.add_css_class("suggested-action")
     bar.append(cancel)
     bar.append(ok)
@@ -448,7 +509,8 @@ def main(argv=None):
                                  description="Load saved research documents into Claude Code.")
     ap.add_argument("sets", nargs="*", metavar="SET")
     ap.add_argument("--setup", action="store_true", help="change saved defaults, load nothing")
-    ap.add_argument("--no-popup", action="store_true", help="use the saved defaults, ask nothing")
+    ap.add_argument("--no-popup", action="store_true",
+                    help="use the saved defaults, ask nothing (same as RESEARCHER_NO_POPUP=1)")
     ap.add_argument("--list", action="store_true", help="list sets and saved defaults")
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
@@ -503,22 +565,19 @@ def main(argv=None):
         return 2
 
     alldocs = list(dict.fromkeys(d for n in names for d in sets[n]))
-    texts, missing = {}, []
+    texts = Texts(paths)
+    missing = []
     for d in alldocs:
-        p = paths.get(d)
-        if p is None:
+        if d not in paths:
             missing.append(f"MISSING  {d} (not in {library})")
-            continue
-        try:
-            texts[d] = to_text(p)
-        except (OSError, RuntimeError) as e:
-            missing.append(f"UNREADABLE  {p} ({e})")
+        elif d not in texts:
+            missing.append(f"UNREADABLE  {paths[d]} ({texts.errors[d]})")
     secs = sections_for(names, sets, kinds, conf, texts, args.setup)
 
     picks = None
-    if not args.no_popup:
+    if not (args.no_popup or os.environ.get("RESEARCHER_NO_POPUP")):
         try:
-            picks = popup(secs, texts, args.setup)
+            picks = popup(secs, texts, args.setup, "researcher " + " ".join(names))
         except RuntimeError as e:
             print(f"NO POPUP ({e}): using the saved defaults")
         else:
@@ -536,9 +595,10 @@ def main(argv=None):
     if picks is None:  # --no-popup or no display: saved defaults, nothing saved
         picks = {s["name"]: (s["ticked"], False) for s in secs}
 
+    order = {s["name"]: s["main"] + s["other"] for s in secs}
     for n, (ticked, keep) in picks.items():
         if keep or args.setup:
-            conf[n] = {"selected": [d for d in sets[n] if d in ticked], "known": list(sets[n])}
+            conf[n] = {"selected": [d for d in order[n] if d in ticked], "known": list(sets[n])}
             if kinds[n] == "custom":
                 conf[n]["custom"] = True
             print(f"SAVED default for {n}: {len(ticked)} of {len(sets[n])} docs")
@@ -549,7 +609,8 @@ def main(argv=None):
         return 0
 
     chosen = {d for t, _ in picks.values() for d in t}
-    docs = [d for d in alldocs if d in chosen and d in texts]
+    docs = [d for d in dict.fromkeys(alldocs + [d for s in secs for d in s["main"] + s["other"]])
+            if d in chosen and d in texts]
     written = write_outputs(args.out or cache_home(), docs, texts, paths)
     total = 0
     for d, dst in zip(docs, written):

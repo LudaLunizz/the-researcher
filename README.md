@@ -75,7 +75,7 @@ Documents are loaded into Claude's context as text. Treat them like any untruste
 python3 -I -m unittest discover -s tests -v
 ```
 
-The tests cover the library scan, set expansion, saved defaults, custom sets, and the command line. The popup needs a display and is not covered by CI.
+The tests cover the library scan, set expansion, saved defaults, custom sets, and the command line. The popup needs a display and is not covered by CI. It only opens when the script is run for a load or `--setup`; set `RESEARCHER_NO_POPUP=1` to make that impossible (scripts, CI).
 
 ## License
 

@@ -26,6 +26,8 @@ def write(path, text=""):
 
 class Env(unittest.TestCase):
     def setUp(self):
+        os.environ["RESEARCHER_NO_POPUP"] = "1"  # tests must never open a window
+        self.addCleanup(os.environ.pop, "RESEARCHER_NO_POPUP", None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.lib = os.path.join(self.tmp.name, "lib")
@@ -118,6 +120,25 @@ class SetTests(Env):
         self.assertEqual(sec["new"], {"rust/memory-b"})
         self.assertEqual(sec["ticked"], {"rust/linux", "rust/memory-b"})
 
+    def test_defined_set_offers_rest_of_library_and_keeps_extras(self):
+        conf = {"rust": {"selected": ["rust/linux", "web/seo"],
+                         "known": ["rust/linux", "rust/memory-a", "rust/memory-b"]}}
+        cat = list(R.scan(self.lib))
+        sets, kinds = R.build_sets(R.load_config(self.cfg), cat, conf, [])
+        texts = {d: "x" for d in cat}
+        sec = R.sections_for(["rust"], sets, kinds, conf, texts, False)[0]
+        self.assertEqual(sec["main"], sets["rust"] + ["web/seo"])
+        self.assertEqual(sec["other"], ["app/roadmap"])
+        self.assertEqual(sec["ticked"], {"rust/linux", "web/seo"})
+
+    def test_extra_doc_from_library_is_loaded_with_saved_preset(self):
+        write(os.path.join(self.conf_dir, "choices.json"), json.dumps(
+            {"rust": {"selected": ["rust/linux", "web/seo"],
+                      "known": ["rust/linux", "rust/memory-a", "rust/memory-b"]}}))
+        code, out = self.run_main("--no-popup", "rust")
+        self.assertIn("total: 2 docs", out)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "web - seo.txt")))
+
     def test_invalid_name_not_custom(self):
         sets, _ = R.build_sets({}, [], {}, ["Bad Name!"])
         self.assertNotIn("Bad Name!", sets)
@@ -144,6 +165,11 @@ class MainTests(Env):
         self.assertEqual(code, 0)
         self.assertIn("MISSING  app/ghost", out)
         self.assertIn("total: 4 docs", out)
+
+    def test_env_switch_blocks_popup(self):
+        code, out = self.run_main("rust")  # no --no-popup flag, env switch only
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("NO POPUP (", out)
 
     def test_custom_without_choice_loads_nothing(self):
         code, out = self.run_main("--no-popup", "newproj")
