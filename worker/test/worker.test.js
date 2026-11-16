@@ -23,6 +23,14 @@ const record = (over = {}) => ({
   v: 1,
   ...over,
 });
+/** A version 2 record: `fmt` has chats too, `fmt_chars` is the loaded characters per format. */
+const record2 = (over = {}) => ({
+  ...record(),
+  v: 2,
+  fmt: { chat: 0, html: 4, md: 3, pdf: 0, txt: 0 },
+  fmt_chars: { chat: 0, html: 40000, md: 29652, pdf: 0, txt: 0 }, // adds up to chars (69652)
+  ...over,
+});
 const payload = (...loads) => ({ schema: 1, loads: loads.length ? loads : [record()] });
 /** What `researcher --usage-send` sends: schema 2, every record numbered by its log line. */
 const sent = (...loads) => ({ schema: 2, loads: loads.map((r, i) => ({ ...r, seq: r.seq ?? i + 1 })) });
@@ -182,6 +190,10 @@ test("stats are totals only", async () => {
     chars: 69652 + 10,
     // per record with its own tk (2300): (3 + 10) chars squeezed, (lib_chars - chars) not loaded
     tokens_squeezed: Math.round((3 * 1000) / 2300 + (10 * 1000) / 2300),
+    tokens_from_squeeze: Math.round((3 * 1000) / 2300 + (10 * 1000) / 2300),
+    tokens_from_conversion: 0, // version 1 records do not say which formats their characters are
+    chat_loads: 0,
+    loads_with_formats: 0,
     tokens_not_loaded: Math.round(((2239282 - 69652) * 1000) / 2300 + ((2239282 - 10) * 1000) / 2300),
   });
 });
@@ -212,4 +224,87 @@ test("nothing else is served", async () => {
   const env = { DB: fakeD1() };
   assert.equal((await worker.fetch(new Request("https://x.test/"), env)).status, 200);
   assert.equal((await worker.fetch(new Request("https://x.test/admin"), env)).status, 404);
+});
+
+test("version 2 records: chats, characters per format, and they must add up", () => {
+  assert.equal(recordError(record2(), NOW), null);
+  assert.equal(recordError(record2({ fmt: { chat: 7, html: 0, md: 0, pdf: 0, txt: 0 }, fmt_chars: { chat: 69652, html: 0, md: 0, pdf: 0, txt: 0 } }), NOW), null);
+  const bad = [
+    record2({ fmt_chars: undefined }), // v2 needs fmt_chars
+    record2({ fmt_chars: { chat: 0, html: 1, md: 1, pdf: 0, txt: 0 } }), // does not add up to chars
+    record2({ fmt_chars: { html: 40000, md: 29652, pdf: 0, txt: 0 } }), // chat missing
+    record2({ fmt: { html: 4, md: 3, pdf: 0, txt: 0 } }), // v1 fmt in a v2 record
+    record2({ fmt: { chat: 1, html: 4, md: 3, pdf: 0, txt: 0 } }), // does not add up to docs
+    record2({ fmt_chars: { chat: 0, html: -1, md: 69653, pdf: 0, txt: 0 } }),
+    record({ fmt_chars: { chat: 0, html: 40000, md: 29652, pdf: 0, txt: 0 } }), // v1 has none
+    record2({ v: 3 }),
+    record2({ title: "x" }),
+  ];
+  for (const rec of bad) assert.notEqual(recordError(rec, NOW), null, JSON.stringify(rec));
+  const { rows } = parsePayload(sent(record2()), NOW);
+  assert.deepEqual([rows[0].chat, rows[0].html_chars, rows[0].md_chars, rows[0].pdf_chars], [0, 40000, 29652, 0]);
+  assert.equal(parsePayload(payload(record2()), NOW).error, undefined); // schema 1 file, v2 record
+});
+
+test("version 1 hashes are unchanged; version 2 adds its numbers to the hash", async () => {
+  const old = createHash("sha256")
+    .update("7d75b3c23f2e4970|2026-11-16|7|0|4|3|0|113432|69655|69652|114|2239282|2300")
+    .digest("hex");
+  assert.equal(await rowHash(parsePayload(payload(), NOW).rows[0]), old);
+  const a = await rowHash(parsePayload(payload(record2()), NOW).rows[0]);
+  const b = await rowHash(parsePayload(payload(record2({ fmt_chars: { chat: 0, html: 39999, md: 29653, pdf: 0, txt: 0 } })), NOW).rows[0]);
+  assert.notEqual(a, old);
+  assert.notEqual(a, b);
+});
+
+test("tokens squeezed = the squeeze + reading text instead of the HTML/PDF original", async () => {
+  const env = { DB: fakeD1() };
+  // 2300 characters per 1000 tokens. One load: 4600 raw -> 2300 loaded (squeeze 2300 chars),
+  // 1000 html chars (saves 0.73 each) and 500 pdf chars (saves 1.2 each) and 800 md, no saving.
+  const rec = record2({
+    raw: 4600, chars: 2300, tk: 2300,
+    docs: 6, fmt: { chat: 0, html: 2, md: 2, pdf: 2, txt: 0 },
+    fmt_chars: { chat: 0, html: 1000, md: 800, pdf: 500, txt: 0 },
+  });
+  await post(sent(rec, record()), env); // plus one version 1 load: 3 chars squeezed, no conversion part
+  const stats = await (await worker.fetch(new Request("https://x.test/v1/stats"), env)).json();
+  const squeeze = (2300 * 1000) / 2300 + (3 * 1000) / 2300;
+  const convert = ((1000 * 0.73 + 500 * 1.2) * 1000) / 2300;
+  assert.equal(stats.tokens_from_squeeze, Math.round(squeeze));
+  assert.equal(stats.tokens_from_conversion, Math.round(convert));
+  assert.equal(stats.tokens_squeezed, Math.round(squeeze + convert));
+  assert.equal(stats.loads_with_formats, 1);
+  const badge = await (await worker.fetch(new Request("https://x.test/v1/badge/squeezed"), env)).json();
+  assert.equal(badge.message, short(squeeze + convert));
+});
+
+test("chat loads are counted as loads and have no conversion saving", async () => {
+  const env = { DB: fakeD1() };
+  const chat = record2({
+    docs: 2, fmt: { chat: 2, html: 0, md: 0, pdf: 0, txt: 0 },
+    fmt_chars: { chat: 69652, html: 0, md: 0, pdf: 0, txt: 0 }, raw: 69652,
+  });
+  await post(sent(chat), env);
+  const stats = await (await worker.fetch(new Request("https://x.test/v1/stats"), env)).json();
+  assert.equal(stats.chat_loads, 1);
+  assert.equal(stats.tokens_from_conversion, 0);
+  assert.equal(stats.tokens_from_squeeze, 0);
+  assert.equal(stats.documents, 2);
+});
+
+test("the migration brings an old table to the new shape", () => {
+  const db = new DatabaseSync(":memory:");
+  // the table as it was before record version 2
+  db.exec(`CREATE TABLE loads (h TEXT PRIMARY KEY, id TEXT NOT NULL, day TEXT NOT NULL, docs INTEGER NOT NULL,
+    pdf INTEGER NOT NULL, html INTEGER NOT NULL, md INTEGER NOT NULL, txt INTEGER NOT NULL, src_bytes INTEGER NOT NULL,
+    raw INTEGER NOT NULL, chars INTEGER NOT NULL, lib_docs INTEGER NOT NULL, lib_chars INTEGER NOT NULL, tk INTEGER NOT NULL)`);
+  db.exec("INSERT INTO loads VALUES ('h','7d75b3c23f2e4970','2026-11-16',1,0,1,0,0,1,1,1,1,1,2300)");
+  db.exec(readFileSync(new URL("../migrations/0002_formats.sql", import.meta.url), "utf8"));
+  const row = db.prepare("SELECT chat, pdf_chars, html_chars, chat_chars FROM loads").get();
+  assert.deepEqual({ ...row }, { chat: 0, pdf_chars: null, html_chars: null, chat_chars: null });
+  // the migrated table has the same columns as a fresh one
+  const fresh = new DatabaseSync(":memory:");
+  fresh.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
+  const cols = (d) => d.prepare("PRAGMA table_info(loads)").all().map((c) => c.name).sort();
+  assert.deepEqual(cols(db), cols(fresh));
 });

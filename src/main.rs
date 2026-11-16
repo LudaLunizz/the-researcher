@@ -433,6 +433,7 @@ fn run(args: Args) -> i32 {
                 reg_path: &util::join(&cfg_dir, "sessions.json"),
                 presets_path: &util::join(&cfg_dir, "contexts.json"),
                 out_dir: &out,
+                cfg_path: &cfg_path,
             },
         );
     }
@@ -445,7 +446,7 @@ fn run(args: Args) -> i32 {
             }
         };
         let out = args.out.clone().unwrap_or_else(cache_home);
-        return sessions::main(action, &cfg, &util::join(&cfg_dir, "sessions.json"), &out);
+        return sessions::main(action, &cfg, &cfg_path, &util::join(&cfg_dir, "sessions.json"), &out);
     }
 
     match load(&args, &cfg_path, &state_path) {
@@ -643,14 +644,7 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
         && usage::enabled(&cfg)
         && let Ok(rec) = usage::record(&docs, &mut texts, &paths)
     {
-        usage::log(&rec); // the log must never break a load
-        match usage::share(&cfg) {
-            usage::Share::On => usage::send_in_background(cfg_path),
-            usage::Share::Off => {}
-            usage::Share::Undecided => {
-                share_note = Some("USAGE SHARING: not decided (researcher --usage-share on|off)");
-            }
-        }
+        share_note = usage::finish(&cfg, cfg_path, &rec); // the log must never break a load
     }
     let mut total = 0;
     for (d, dst) in docs.iter().zip(&written) {

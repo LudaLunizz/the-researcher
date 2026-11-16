@@ -40,9 +40,9 @@ Every document of your library gets one plain-text file in the researcher's own 
 
 ## Usage log
 
-After every load the researcher appends one line to `~/.local/share/researcher/usage.jsonl`, so you can see what it saves on **your** library. It is local and anonymous, and **nothing is sent unless you say yes** (see Sharing below).
+After every load the researcher appends one line to `~/.local/share/researcher/usage.jsonl`, so you can see what it saves on **your** library. A load is a library load (`researcher SET`) or earlier chats loaded as context (`--context`, `--session-load`); listing, setting up and cancelling load nothing and log nothing. It is local and anonymous, and **nothing is sent unless you say yes** (see Sharing below).
 
-What a line holds, and nothing else: the day, a random install id (`usage-id` next to the log; delete it to start a new one), how many documents were loaded and in which formats (pdf, html, md, txt), and character sums: source bytes, converted text before and after squeezing, and the whole library after squeezing. It never holds a title, a path, a set name or where your library is. The log is plain JSON lines; read it before you share anything.
+What a line holds, and nothing else: the day, a random install id (`usage-id` next to the log; delete it to start a new one), how many documents were loaded and in which formats (pdf, html, md, txt, or `chat` for a chat loaded as context), and character sums: source bytes, converted text before and after squeezing, the loaded characters per format, and the whole library (or every chat that could have been loaded) after squeezing. It never holds a title, a path, a set name or where your library is. The log is plain JSON lines; read it before you share anything.
 
 ```
 researcher --usage                 totals: characters loaded, squeezed away, left unticked, with estimated tokens
@@ -50,6 +50,7 @@ researcher --usage-export [FILE]   write the records to FILE (default researcher
 ```
 
 - **Squeezed away** is real: converted text before minus after the squeeze, for the documents you loaded.
+- **Converted** is the saving from reading text instead of the original: an HTML page costs 1.73x its converted text and a PDF 2.2x (measured below), so each loaded HTML character saves 0.73 and each PDF character 1.2 of a text character. Markdown, text files and chats are read as they are and save nothing here. Older log lines (before 0.5) do not say their formats and add nothing to this number.
 - **Left unticked** compares each load with loading your whole library; it is a ceiling, not a measurement, because nobody would load everything.
 - Tokens are estimated from characters (2.4 per token, see below), not counted by a tokenizer.
 - Switch the log off with `[usage]` `log = false` in `config.toml`; then no log and no install id are written.
@@ -67,7 +68,7 @@ researcher --usage-send            send the lines not sent yet, now
 
 - With sharing on, each load starts a sender in the background: the load never waits on the network, and a failed send is tried again after the next load.
 - What is sent is the log lines as they are, plus `seq`: the line's number in your log, so two identical loads on one day both count and a line sent twice is stored once. Nothing else: no title, path, set name, library location, GitHub login or account. The receiver ([`worker/`](worker/)) refuses any other field and keeps no IP address, headers or request logs (Cloudflare still sees the connection, as any host does).
-- The two badges at the top are live totals over every shared load: **tokens squeezed** is measured (the converted text before minus after squeezing); **tokens not loaded** compares each load with loading the whole library every time, so it is a ceiling, not a measurement. Both are estimated from characters with the ratio each load used (2.4 per token). Raw totals: [`/v1/stats`](https://the-researcher-usage.ludalunizz.workers.dev/v1/stats).
+- The two badges at the top are live totals over every shared load: **tokens squeezed** is the squeeze (the converted text before minus after squeezing) plus the conversion saving above (reading text instead of the HTML or PDF), both from the ratios measured on 85 reports; **tokens not loaded** compares each load with loading the whole library every time, so it is a ceiling, not a measurement. Both are estimated from characters with the ratio each load used (2.4 per token). Raw totals: [`/v1/stats`](https://the-researcher-usage.ludalunizz.workers.dev/v1/stats).
 - `researcher --usage` ends with the sharing state and how many lines wait. `usage-sent` next to the log holds how far the log was sent.
 - `[usage] url = "..."` sends to your own receiver instead (the same `worker/` deployed on your account).
 - To have your lines removed from the project's receiver, open an issue with your install id (the `usage-id` file); then delete `usage-id` to start a new one.

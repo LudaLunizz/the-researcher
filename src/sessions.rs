@@ -330,7 +330,7 @@ pub enum Action {
     Load { id: String },
 }
 
-pub fn main(action: Action, cfg: &Config, reg_path: &str, out_dir: &str) -> i32 {
+pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_dir: &str) -> i32 {
     let Some(st) = settings(cfg) else {
         println!(
             "SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to track closed sessions; nothing done"
@@ -376,11 +376,20 @@ pub fn main(action: Action, cfg: &Config, reg_path: &str, out_dir: &str) -> i32 
                     return Err(ConfigError(format!("the transcript of {} is gone", label(&sid, &rec))));
                 }
                 let text = session_text(&sid, &rec, &read_transcript(&file));
-                let written = write_outputs(out_dir, &[(format!("sessions/{sid}"), file, text.clone())]).map_err(io)?;
+                let written =
+                    write_outputs(out_dir, &[(format!("sessions/{sid}"), file.clone(), text.clone())]).map_err(io)?;
                 let n = chars(&text);
                 println!("SESSION {}", label(&sid, &rec));
                 println!("{n:>7} chars  {}", written[0]);
                 println!("total: 1 session, {n} chars (~{}k tokens)", n / CHARS_PER_K);
+                // one chat, against every chat that could have been loaded
+                let all: Vec<u64> = sessions(&reg).values().map(chat_chars).collect();
+                let bytes = fs::metadata(&file).map_or(0, |m| m.len());
+                if let Some(note) =
+                    usage_of_chats(cfg, cfg_path, &[(n, bytes)], (all.len(), all.iter().sum::<u64>() as usize))
+                {
+                    println!("{note}");
+                }
                 return Ok(Some(0));
             }
             Action::List { .. } => {
@@ -536,6 +545,20 @@ pub struct ContextArgs<'a> {
     pub reg_path: &'a str,
     pub presets_path: &'a str,
     pub out_dir: &'a str,
+    pub cfg_path: &'a str,
+}
+
+fn chat_chars(rec: &Value) -> u64 {
+    rec.get("chars").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Log a chat load (and send it when sharing is on). Returns the sharing note, if any.
+fn usage_of_chats(cfg: &Config, cfg_path: &str, loaded: &[(usize, u64)], lib: (usize, usize)) -> Option<&'static str> {
+    if loaded.is_empty() || !crate::usage::enabled(cfg) {
+        return None;
+    }
+    let rec = crate::usage::chat_record(loaded, lib).ok()?;
+    crate::usage::finish(cfg, cfg_path, &rec)
 }
 
 /// `--context [PRESET ...]`: pick earlier chats (all folders) in the popup and write each as a
@@ -659,9 +682,11 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
         }
     };
     let mut total = 0;
-    for ((label, (_, _, text)), path) in labels.iter().zip(&docs).zip(&written) {
+    let mut loaded = Vec::new();
+    for ((label, (_, file, text)), path) in labels.iter().zip(&docs).zip(&written) {
         let n = chars(text);
         total += n;
+        loaded.push((n, fs::metadata(file).map_or(0, |m| m.len())));
         println!("CHAT {label}");
         println!("{n:>7} chars  {path}");
     }
@@ -669,6 +694,11 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
         println!("MISSING  chat {sid} (its transcript is gone)");
     }
     println!("total: {} chats, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
+    // every chat that could have been loaded is the "whole library" of this load
+    let lib = (catalog.len(), catalog.iter().map(|sid| chat_chars(&map[sid]) as usize).sum());
+    if let Some(note) = usage_of_chats(cfg, a.cfg_path, &loaded, lib) {
+        println!("{note}");
+    }
     0
 }
 
