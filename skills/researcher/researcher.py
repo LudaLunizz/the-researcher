@@ -9,6 +9,8 @@ Usage: researcher.py [SET ...]             popup, then write the ticked docs as 
        researcher.py --no-popup SET [...]  use the saved defaults, ask nothing
        researcher.py --list                show sets, saved defaults, library size
        researcher.py --sync                make/refresh the plain-text copy of the whole library
+       researcher.py --usage               local totals: characters and tokens saved
+       researcher.py --usage-export [FILE] write the anonymous usage records to a file (not sent)
        researcher.py --init [LIBRARY]      write a starter config.toml
        researcher.py --sessions | --rename ID NAME | --resume ID | --session-load ID
                                            closed-session tracking (opt-in: [sessions] in config)
@@ -35,6 +37,7 @@ folder. `exclude = [globs]` in config.toml leaves documents out of the library. 
 """
 import argparse
 import atexit
+import datetime
 import fnmatch
 import html
 import json
@@ -43,6 +46,7 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
 
 try:
     import tomllib
@@ -127,6 +131,11 @@ library = "{library}"
 # [sets.myapp]
 # include = ["rust"]
 # docs = ["myapp/roadmap"]
+
+# A local, anonymous usage log (counts and character sums, never titles or paths) feeds
+# `researcher.py --usage`. Nothing is sent anywhere. Switch it off with:
+# [usage]
+# log = false
 """
 
 
@@ -184,7 +193,7 @@ def html_text(raw):
     return "\n".join(line.strip() for line in t.splitlines()).strip()
 
 
-TEXT_VERSION = 1  # bump when to_text() or squeeze() changes: every stored copy is made again
+TEXT_VERSION = 2  # bump when to_text() or squeeze() changes: every stored copy is made again
 INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))  # zero-width, soft hyphen
 PAGE_NUMBER_RE = re.compile(r"(?i)^(page\s+)?\d{1,4}(\s*(/|of)\s*\d{1,4})?$")
 PAGE_WORD_RE = re.compile(r"(?i)\b(page|pagina|blz|seite|p\.)\s*\d")
@@ -248,8 +257,8 @@ def squeeze(text, kind):
     return "\n".join(out).strip()
 
 
-def to_text(path):
-    """Plain text of one document, squeezed. Raises OSError / RuntimeError when unreadable."""
+def convert(path):
+    """(text before squeezing, squeezed text) of one document. Raises OSError / RuntimeError."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         try:
@@ -259,12 +268,18 @@ def to_text(path):
             raise RuntimeError("pdftotext not found (install poppler-utils)")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"pdftotext failed: {e.stderr.strip() or e.returncode}")
-        return squeeze(r.stdout, "pdf")
+        return r.stdout, squeeze(r.stdout, "pdf")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
     if ext in (".html", ".htm"):
-        return squeeze(html_text(raw), "html")
-    return squeeze(raw, "plain")
+        raw = html_text(raw)
+        return raw, squeeze(raw, "html")
+    return raw, squeeze(raw, "plain")
+
+
+def to_text(path):
+    """Plain text of one document, squeezed."""
+    return convert(path)[1]
 
 
 # ---------------------------------------------------------------- sets
@@ -321,6 +336,7 @@ class Texts:
 
     def __init__(self, paths, store=None):
         self.paths, self.store, self.cache, self.errors = paths, store, {}, {}
+        self.raw = {}
         self.index, self.dirty = {}, False
         if store:
             try:
@@ -345,7 +361,11 @@ class Texts:
             pass
         return None
 
-    def _save(self, d, text):
+    def raw_chars(self, d):
+        """Characters of the converted text before squeezing (the whole copy is read once)."""
+        return self.raw.get(d, len(self.cache.get(d, "")))
+
+    def _save(self, d, text, raw):
         os.makedirs(self.store, exist_ok=True)
         fn, st = store_name(d), os.stat(self.paths[d])
         tmp = os.path.join(self.store, fn + ".tmp")
@@ -353,7 +373,7 @@ class Texts:
             f.write(f"SOURCE: {self.paths[d]}\n\n{text}\n")
         os.replace(tmp, os.path.join(self.store, fn))
         self.index[d] = {"file": fn, "src": self.paths[d], "size": st.st_size,
-                         "mtime_ns": st.st_mtime_ns, "v": TEXT_VERSION}
+                         "mtime_ns": st.st_mtime_ns, "raw": raw, "v": TEXT_VERSION}
         self.dirty = True
 
     def __contains__(self, d):
@@ -364,10 +384,11 @@ class Texts:
         try:
             text = self._stored(d) if self.store else None
             if text is None:
-                text = to_text(self.paths[d])
+                raw, text = convert(self.paths[d])
                 if self.store:
-                    self._save(d, text)
+                    self._save(d, text, len(raw))
             self.cache[d] = text
+            self.raw[d] = (self.index.get(d) or {}).get("raw", len(text))
         except (OSError, RuntimeError) as e:
             self.errors[d] = str(e)
             return False
@@ -654,6 +675,138 @@ def write_outputs(out_dir, docs, texts, paths):
     return [os.path.join(out_dir, fn) for fn in written]
 
 
+# ---------------------------------------------------------------- usage log (local, anonymous)
+# One line per load in ~/.local/share/researcher/usage.jsonl: counts and character sums only.
+# Never a title, path, set name or library location. Nothing is ever sent anywhere; the user
+# can look at the file, print totals (--usage) and write an export (--usage-export) to share by hand.
+
+USAGE_SCHEMA = 1
+USAGE_KINDS = ("pdf", "html", "md", "txt")
+
+
+def data_home():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, APP)
+
+
+def usage_file():
+    return os.path.join(data_home(), "usage.jsonl")
+
+
+def usage_enabled(cfg):
+    sec = cfg.get("usage")
+    return not (isinstance(sec, dict) and sec.get("log") is False)
+
+
+def install_id():
+    """A random id for this install, made on first use; delete the file to start a new one."""
+    path = os.path.join(data_home(), "usage-id")
+    try:
+        with open(path, encoding="utf-8") as f:
+            val = f.read().strip()
+        if re.fullmatch(r"[0-9a-f]{16}", val):
+            return val
+    except OSError:
+        pass
+    val = uuid.uuid4().hex[:16]
+    os.makedirs(data_home(), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(val + "\n")
+    return val
+
+
+def format_of(path):
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    return "html" if ext == "htm" else ext if ext in USAGE_KINDS else "txt"
+
+
+def usage_record(docs, texts, paths):
+    """The numbers of one load. Characters, not tokens: the reader applies its own ratio."""
+    fmt = dict.fromkeys(USAGE_KINDS, 0)
+    for d in docs:
+        fmt[format_of(paths[d])] += 1
+    lib = [d for d in paths if d in texts]
+    return {"v": USAGE_SCHEMA, "day": datetime.date.today().isoformat(), "id": install_id(),
+            "docs": len(docs), "fmt": fmt,
+            "src_bytes": sum(os.path.getsize(paths[d]) for d in docs),
+            "raw": sum(texts.raw_chars(d) for d in docs),
+            "chars": sum(len(texts[d]) for d in docs),
+            "lib_docs": len(lib), "lib_chars": sum(len(texts[d]) for d in lib),
+            "tk": CHARS_PER_K}
+
+
+def log_usage(rec):
+    """Append one record. A failure here must never break a load."""
+    try:
+        os.makedirs(data_home(), exist_ok=True)
+        with open(usage_file(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def read_usage():
+    """Records from the log; lines that are not this schema are skipped."""
+    out = []
+    try:
+        with open(usage_file(), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("v") == USAGE_SCHEMA:
+                    out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def usage_summary(recs):
+    """Totals over records. Characters are summed; tokens use each record's own ratio."""
+    def tok(chars, rec):
+        return chars / (rec.get("tk") or CHARS_PER_K) * 1000
+
+    tot = {k: sum(r.get(k, 0) for r in recs) for k in ("docs", "src_bytes", "raw", "chars")}
+    tot["squeezed"] = tot["raw"] - tot["chars"]
+    tot["unticked"] = sum(max(0, r.get("lib_chars", 0) - r.get("chars", 0)) for r in recs)
+    tot["tokens"] = sum(tok(r.get("chars", 0), r) for r in recs)
+    tot["tokens_squeezed"] = sum(tok(r.get("raw", 0) - r.get("chars", 0), r) for r in recs)
+    tot["tokens_unticked"] = sum(tok(max(0, r.get("lib_chars", 0) - r.get("chars", 0)), r)
+                                 for r in recs)
+    tot["loads"] = len(recs)
+    return tot
+
+
+def usage_report(recs):
+    if not recs:
+        return "no usage recorded yet (a log line is written after every load)"
+    t = usage_summary(recs)
+    n = t["loads"]
+    days = sorted({r.get("day", "") for r in recs})
+    pct = 100 * t["squeezed"] // t["raw"] if t["raw"] else 0
+    return "\n".join([
+        f"usage log: {usage_file()}",
+        f"{n} loads on {len(days)} days ({days[0]} to {days[-1]}), {t['docs']} documents loaded",
+        f"loaded:        {t['chars']:>10} chars  (~{t['tokens'] / 1000:.0f}k tokens, "
+        f"{t['tokens'] / n / 1000:.1f}k per load)",
+        f"squeezed away: {t['squeezed']:>10} chars  (~{t['tokens_squeezed'] / 1000:.0f}k tokens, "
+        f"{pct}% of the converted text)",
+        f"left unticked: {t['unticked']:>10} chars  (~{t['tokens_unticked'] / 1000:.0f}k tokens, "
+        "against loading the whole library every time: a ceiling, not a measurement)",
+        "tokens are estimates from characters, not counted by a tokenizer",
+    ])
+
+
+def usage_export(path):
+    """Write the records as one JSON file to look at and send by hand."""
+    recs = read_usage()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"schema": USAGE_SCHEMA, "loads": recs}, f, indent=1, sort_keys=True)
+        f.write("\n")
+    return len(recs)
+
+
 # ---------------------------------------------------------------- sessions (opt-in)
 # Closed Claude Code sessions: a registry keyed by the FULL session id, so a name can never
 # be separated from the id it belongs to. Names are taken from Claude Code's own title or the
@@ -924,12 +1077,28 @@ def main(argv=None):
     ap.add_argument("--library", help="library folder (overrides config and RESEARCHER_LIBRARY)")
     ap.add_argument("--sync", action="store_true",
                     help="make or refresh the plain-text copy of the whole library, load nothing")
+    ap.add_argument("--usage", action="store_true",
+                    help="print the local usage totals (characters and estimated tokens saved)")
+    ap.add_argument("--usage-export", nargs="?", const="researcher-usage.json", metavar="FILE",
+                    help="write the anonymous usage records to FILE (default researcher-usage.json) "
+                         "to look at and send by hand; nothing is sent")
     ap.add_argument("--out", help="the researcher's text folder (default ~/.local/share/researcher/text, "
                                   "or text_dir in the config); session loads go to ~/.cache/researcher")
     args = ap.parse_args(argv)
 
     cfg_path = args.config or os.path.join(config_home(), "config.toml")
     state_path = os.path.join(os.path.dirname(cfg_path), "choices.json")
+
+    if args.usage:
+        print(usage_report(read_usage()))
+        return 0
+    if args.usage_export:
+        n = usage_export(args.usage_export)
+        print(f"wrote {n} records to {os.path.abspath(args.usage_export)}")
+        print("each record: day, random install id, document counts per format, character sums "
+              "(source bytes, converted, squeezed, whole library). No titles, paths or set names. "
+              "Nothing was sent.")
+        return 0
 
     if args.init is not None:
         lib = args.init or os.path.expanduser("~/research")
@@ -1047,6 +1216,11 @@ def main(argv=None):
             if d in chosen and d in texts]
     written = [texts.path(d) for d in docs]
     texts.flush()
+    if docs and usage_enabled(cfg):
+        try:  # the log must never break a load
+            log_usage(usage_record(docs, texts, paths))
+        except OSError:
+            pass
     total = 0
     for d, dst in zip(docs, written):
         total += len(texts[d])

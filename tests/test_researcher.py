@@ -30,6 +30,9 @@ class Env(unittest.TestCase):
         self.addCleanup(os.environ.pop, "RESEARCHER_NO_POPUP", None)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.data = os.path.join(self.tmp.name, "data")  # the usage log must never reach a real home
+        os.environ["XDG_DATA_HOME"] = self.data
+        self.addCleanup(os.environ.pop, "XDG_DATA_HOME", None)
         self.lib = os.path.join(self.tmp.name, "lib")
         self.conf_dir = os.path.join(self.tmp.name, "conf")
         self.out = os.path.join(self.tmp.name, "out")
@@ -87,6 +90,80 @@ class SqueezeTests(unittest.TestCase):
 
     def test_exact_repeat_lines_collapse(self):
         self.assertEqual(R.squeeze("same\nsame\nother", "plain"), "same\nother")
+
+
+class UsageTests(Env):
+    def records(self):
+        with open(R.usage_file(), encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_load_logs_counts_only(self):
+        self.run_main("--no-popup", "rust")
+        (rec,) = self.records()
+        self.assertEqual(rec["docs"], 3)
+        self.assertEqual(rec["fmt"], {"pdf": 0, "html": 1, "md": 1, "txt": 1})
+        self.assertEqual(rec["lib_docs"], 5)
+        self.assertGreater(rec["lib_chars"], rec["chars"])
+        self.assertGreaterEqual(rec["raw"], rec["chars"])
+        self.assertRegex(rec["id"], r"^[0-9a-f]{16}$")
+        self.assertEqual(rec["tk"], R.CHARS_PER_K)
+
+    def test_log_holds_no_names_paths_or_titles(self):
+        self.run_main("--no-popup", "rust")
+        raw = read(R.usage_file()) + read(os.path.join(self.data, "researcher", "usage-id"))
+        for word in ("rust", "linux", "memory", "roadmap", "seo", self.lib, self.tmp.name, "ludalunizz"):
+            self.assertNotIn(word, raw)
+
+    def test_same_install_id_every_load(self):
+        self.run_main("--no-popup", "rust")
+        self.run_main("--no-popup", "rs")
+        a, b = self.records()
+        self.assertEqual(a["id"], b["id"])
+
+    def test_log_can_be_switched_off(self):
+        write(self.cfg, read(self.cfg) + "\n[usage]\nlog = false\n")
+        self.assertEqual(self.run_main("--no-popup", "rust")[0], 0)
+        self.assertFalse(os.path.exists(R.usage_file()))
+        self.assertFalse(os.path.exists(os.path.join(self.data, "researcher", "usage-id")))
+
+    def test_setup_sync_list_and_nothing_loaded_do_not_log(self):
+        self.run_main("--sync")
+        self.run_main("--list")
+        self.run_main("--no-popup", "newproj")  # custom set, nothing chosen
+        self.assertFalse(os.path.exists(R.usage_file()))
+
+    def test_unwritable_log_does_not_break_a_load(self):
+        write(os.path.join(self.data, "researcher"), "a file where the folder should be")
+        self.assertEqual(self.run_main("--no-popup", "rust")[0], 0)
+
+    def test_usage_report_and_export(self):
+        self.run_main("--no-popup", "rust")
+        code, out = self.run_main("--usage")
+        self.assertEqual(code, 0)
+        self.assertIn("1 loads", out)
+        self.assertIn("squeezed away", out)
+        dst = os.path.join(self.tmp.name, "export.json")
+        code, out = self.run_main("--usage-export", dst)
+        self.assertIn("Nothing was sent", out)
+        data = json.loads(read(dst))
+        self.assertEqual(data["schema"], 1)
+        self.assertEqual(len(data["loads"]), 1)
+
+    def test_usage_with_no_log(self):
+        self.assertIn("no usage recorded yet", self.run_main("--usage")[1])
+
+    def test_summary_math(self):
+        recs = [{"v": 1, "docs": 2, "raw": 4600, "chars": 2300, "lib_chars": 23000, "tk": 2300},
+                {"v": 1, "docs": 1, "raw": 1000, "chars": 1000, "lib_chars": 1000, "tk": 2300}]
+        t = R.usage_summary(recs)
+        self.assertEqual(t["squeezed"], 2300)
+        self.assertEqual(t["unticked"], 20700)
+        self.assertAlmostEqual(t["tokens_squeezed"], 1000)
+        self.assertAlmostEqual(t["tokens_unticked"], 9000)
+
+    def test_bad_lines_skipped(self):
+        write(R.usage_file(), 'not json\n{"v": 99}\n{"v": 1, "docs": 1}\n')
+        self.assertEqual(len(R.read_usage()), 1)
 
 
 class ScanTests(Env):
@@ -184,7 +261,9 @@ class MainTests(Env):
         self.assertEqual(code, 0, out)
         self.assertIn("total: 3 docs", out)
         files = sorted(f for f in os.listdir(self.out) if f.endswith(".txt"))
-        self.assertEqual(files, ["rust - linux.txt", "rust - memory-a.txt", "rust - memory-b.txt"])
+        # the usage log sizes the whole library, so every document gets its text copy
+        self.assertEqual(files, ["app - roadmap.txt", "rust - linux.txt", "rust - memory-a.txt",
+                                 "rust - memory-b.txt", "web - seo.txt"])
         with open(os.path.join(self.out, "rust - linux.txt"), encoding="utf-8") as f:
             body = f.read()
         self.assertIn("Linux", body)
@@ -232,7 +311,8 @@ class MainTests(Env):
         code, out = self.run_main("--no-popup", "rust")
         self.assertIn("total: 1 docs", out)
         files = sorted(f for f in os.listdir(self.out) if f.endswith(".txt"))
-        self.assertEqual(files, ["mine.txt", "rust - linux.txt", "rust - memory-a.txt", "rust - memory-b.txt"])
+        self.assertIn("mine.txt", files)
+        self.assertIn("rust - memory-a.txt", files)  # not loaded this time, but kept
         self.assertEqual(read(keep), "mine")
 
     def test_library_is_never_changed(self):
