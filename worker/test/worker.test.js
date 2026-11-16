@@ -203,8 +203,9 @@ test("badges: shields.io endpoint JSON with the two token totals", async () => {
   await post(sent(record({ raw: 69652 + 2300, lib_chars: 69652 }), record({ lib_chars: 69652 + 2_300_000 })), env);
   let res = await worker.fetch(new Request("https://x.test/v1/badge/squeezed"), env);
   assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "public, max-age=300"); // shields.io's minimum
   assert.deepEqual(await res.json(), {
-    schemaVersion: 1, label: "tokens squeezed", message: "1k", color: "brightgreen", cacheSeconds: 3600,
+    schemaVersion: 1, label: "tokens squeezed", message: "1k", color: "brightgreen", cacheSeconds: 300,
   });
   res = await worker.fetch(new Request("https://x.test/v1/badge/not-loaded"), env);
   assert.equal((await res.json()).message, "1M");

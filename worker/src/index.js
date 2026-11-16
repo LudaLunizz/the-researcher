@@ -140,14 +140,18 @@ async function stats(env) {
   return json(await totals(env), 200, { "cache-control": "public, max-age=300" });
 }
 
+// 300 s is the shortest cache shields.io accepts; GitHub's image proxy follows what shields.io
+// sends, so a new load shows on the repo page in about 5 to 10 minutes.
+const BADGE_CACHE_SECONDS = 300;
+
 /** shields.io "endpoint" JSON: https://img.shields.io/endpoint?url=<this URL> */
 async function badge(env, which) {
   const b = BADGES[which];
   const t = await totals(env);
   return json(
-    { schemaVersion: 1, label: b.label, message: short(t[b.key]), color: b.color, cacheSeconds: 3600 },
+    { schemaVersion: 1, label: b.label, message: short(t[b.key]), color: b.color, cacheSeconds: BADGE_CACHE_SECONDS },
     200,
-    { "cache-control": "public, max-age=3600" },
+    { "cache-control": `public, max-age=${BADGE_CACHE_SECONDS}` },
   );
 }
 
