@@ -1,0 +1,10 @@
+{
+  "name": "the-researcher-usage-worker",
+  "private": true,
+  "type": "module",
+  "description": "Receiver for the researcher's opt-in anonymous usage counts (Cloudflare Worker + D1)",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
