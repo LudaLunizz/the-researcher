@@ -20,14 +20,14 @@ The first picture is a set with a saved preset: the documents you ticked last ti
 
 ![Popup for a new set](docs/img/popup-new-set.png)
 
-Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
+The pictures still show the popup of the Python version (GTK 4); the Rust version shows the same parts in an egui window. Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
 
 ## The text copy
 
 Every document of your library gets one plain-text file in the researcher's own folder, `~/.local/share/researcher/text/` (or `text_dir` in `config.toml`). Your own files are only read.
 
 - Made **once** per document, and again only when the source file changes (size or modified time) or the researcher's converter changes. Opening the popup on a library you already converted costs about a tenth of a second instead of a `pdftotext` run per PDF.
-- `researcher.py --sync` makes or refreshes the copy of the whole library and loads nothing.
+- `researcher --sync` makes or refreshes the copy of the whole library and loads nothing.
 - Copies stay when a document leaves the library (a library on an unplugged drive keeps working). Delete the folder any time; it is rebuilt.
 - The text is squeezed for tokens, without dropping content: PDF layout padding and indentation, page numbers and headers/footers that repeat on most pages, lines of rule characters, zero-width characters, runs of blank lines and exact repeated lines. Markdown and text files are only tidied (indentation and code are kept).
 - Measured in characters on 11 sampled PDFs (16 Nov 2026): 394,359 characters from `pdftotext -layout`, 251,104 after squeezing, so **36% fewer**; per document 2% to 48%. The spread follows how much of a PDF is padding. Tokens were not counted for this step. A library that mostly holds HTML gains little, because HTML is already converted to text.
@@ -39,8 +39,8 @@ After every load the researcher appends one line to `~/.local/share/researcher/u
 What a line holds, and nothing else: the day, a random install id (`usage-id` next to the log; delete it to start a new one), how many documents were loaded and in which formats (pdf, html, md, txt), and character sums: source bytes, converted text before and after squeezing, and the whole library after squeezing. It never holds a title, a path, a set name or where your library is. The log is plain JSON lines; read it before you share anything.
 
 ```
-researcher.py --usage                 totals: characters loaded, squeezed away, left unticked, with estimated tokens
-researcher.py --usage-export [FILE]   write the records to FILE (default researcher-usage.json) so you can look at them and send them by hand
+researcher --usage                 totals: characters loaded, squeezed away, left unticked, with estimated tokens
+researcher --usage-export [FILE]   write the records to FILE (default researcher-usage.json) so you can look at them and send them by hand
 ```
 
 - **Squeezed away** is real: converted text before minus after the squeeze, for the documents you loaded.
@@ -70,38 +70,34 @@ Four documents in one language-heavy folder is a small sample, so read the perce
 
 ## Requirements
 
-- Python 3.11 or newer (3.11 for `tomllib`)
-- For the popup: GTK 4 and PyGObject (`python3-gi`, `gir1.2-gtk-4.0` on Debian/Ubuntu, `python3-gobject gtk4` on Fedora/Arch). Without a display it uses your saved defaults.
+- Linux x86_64 with a desktop (Wayland or X11) for the popup. Without a display it uses your saved defaults.
 - For PDFs: `pdftotext` from poppler (`poppler-utils`)
-- Linux. The popup is GTK 4 only for now; a Tk popup for macOS and Windows would be a welcome contribution.
+
+The program is written in Rust (`src/`) and the popup in egui, so nothing else is needed. Windows and macOS builds are checked in CI but not supported yet; on those systems the config and data folders will be the native ones (for example `%APPDATA%\researcher` on Windows).
+
+The original Python version, `skills/researcher/researcher.py`, still works and is kept as a fallback. It needs Python 3.11 or newer, and for its popup GTK 4 and PyGObject (`python3-gi`, `gir1.2-gtk-4.0` on Debian/Ubuntu). Both versions use the same files and write the same text copies (a test checks this byte for byte), so you can switch at any time.
 
 ## Install
 
-```bash
-git clone https://github.com/LudaLunizz/the-researcher.git
-cd the-researcher
-mkdir -p ~/.claude/skills
-cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/researcher" ~/.claude/skills/researcher
+1. The program: download `researcher-<version>-x86_64-linux` and `SHA256SUMS.txt` from the [latest release](https://github.com/LudaLunizz/the-researcher/releases/latest), check and install it:
+   ```bash
+   sha256sum -c SHA256SUMS.txt
+   install -m 755 researcher-*-x86_64-linux ~/.local/bin/researcher     # any folder on your PATH
+   ```
+   Or build it from the clone: `cargo install --locked --path .`
+2. The skill, and a starter config:
+   ```bash
+   git clone https://github.com/LudaLunizz/the-researcher.git
+   cd the-researcher
+   mkdir -p ~/.claude/skills
+   cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/researcher" ~/.claude/skills/researcher
 
-python3 ~/.claude/skills/researcher/researcher.py --init ~/research   # writes ~/.config/researcher/config.toml
-```
+   researcher --init ~/research                     # writes ~/.config/researcher/config.toml
+   ```
 
-Try it first on the made-up documents in [examples/library](examples/library): `researcher.py --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
+The skill runs `researcher` when it is on your PATH, and `researcher.py` otherwise.
 
-## Rust version (preview)
-
-A Rust port of `researcher.py` lives in `src/`. It is one binary with the same command line, exit codes, output and files: config, saved choices, the text copy, the usage log and the session registry. You can switch between the two versions at any time. Both write the same text copies; a test checks this byte for byte against the Python version.
-
-- **The popup is egui** (eframe) instead of GTK 4: pure Rust, nothing to install for it on Linux beyond a running desktop (Wayland or X11).
-- **Linux only for now.** CI also builds it for Windows and macOS so it stays portable, but it is not tested or supported there yet. On those systems the config and data folders will be the native ones (for example `%APPDATA%\researcher` on Windows).
-- PDFs still go through `pdftotext`, which is also available on Windows and macOS (poppler).
-
-```bash
-cargo build --release                  # target/release/researcher
-target/release/researcher --library examples/library rust
-```
-
-The skill still calls `researcher.py`; switching it to the binary is a separate step.
+Try it first on the made-up documents in [examples/library](examples/library): `researcher --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
 ## Configure
 
@@ -128,21 +124,21 @@ A document id is its path inside the library without the extension: `~/research/
 ## Command line
 
 ```
-researcher.py [SET ...]              popup, then convert the ticked documents and print their paths
-researcher.py --setup SET            popup only: change the saved defaults, load nothing
-researcher.py --no-popup SET         use the saved defaults without asking
-researcher.py --list                 sets, document counts, saved defaults
-researcher.py --sync                 make or refresh the text copy of the whole library, load nothing
-researcher.py --usage                local totals of what it saved (see Usage log)
-researcher.py --usage-export [FILE]  write the anonymous usage records to a file; nothing is sent
-researcher.py --init [LIBRARY]       write a starter config
-researcher.py --sessions             list tracked closed sessions (opt-in, see Sessions)
-researcher.py --rename ID NAME       rename a tracked session
-researcher.py --resume ID            print the command that resumes a session
-researcher.py --session-load ID      write a session's conversation as a .txt to load as context
+researcher [SET ...]              popup, then convert the ticked documents and print their paths
+researcher --setup SET            popup only: change the saved defaults, load nothing
+researcher --no-popup SET         use the saved defaults without asking
+researcher --list                 sets, document counts, saved defaults
+researcher --sync                 make or refresh the text copy of the whole library, load nothing
+researcher --usage                local totals of what it saved (see Usage log)
+researcher --usage-export [FILE]  write the anonymous usage records to a file; nothing is sent
+researcher --init [LIBRARY]       write a starter config
+researcher --sessions             list tracked closed sessions (opt-in, see Sessions)
+researcher --rename ID NAME       rename a tracked session
+researcher --resume ID            print the command that resumes a session
+researcher --session-load ID      write a session's conversation as a .txt to load as context
 ```
 
-The script prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
+It prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
 
 Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
 
@@ -157,7 +153,7 @@ enabled = true
 # projects_dir = "~/.claude/projects"
 ```
 
-Then `researcher.py --sessions` lists every closed Claude Code session, newest first: the **full session id** (the one Claude Code prints when you close a session), the last-active time and a name. The name comes from Claude Code's own title if the session has one, otherwise from the first prompt. `--rename ID NAME` replaces it, and a rescan never overwrites a name you set.
+Then `researcher --sessions` lists every closed Claude Code session, newest first: the **full session id** (the one Claude Code prints when you close a session), the last-active time and a name. The name comes from Claude Code's own title if the session has one, otherwise from the first prompt. `--rename ID NAME` replaces it, and a rescan never overwrites a name you set.
 
 Name and id are stored together, keyed by the full id, and every command prints them together (`"name" (id)`), so a name can't drift onto the wrong session. `ID` may be a unique prefix of 4 or more characters. `--resume ID` prints `cd <project folder> && claude --resume <id>` (Claude Code only finds a session from its own folder). `--session-load ID` writes the session's prompts and replies, without tool output, as a `.txt`; the skill reads it like a research document. Sessions longer than 200,000 characters keep their start and their end.
 
