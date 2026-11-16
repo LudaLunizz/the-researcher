@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Researcher for Claude. Copyright (C) 2026 LudaLunizz
+# This program is free software: you can redistribute it and/or modify it under the terms of
+# the GNU Affero General Public License as published by the Free Software Foundation, either
+# version 3 of the License, or (at your option) any later version. It is distributed WITHOUT
+# ANY WARRANTY; see the GNU Affero General Public License (file LICENSE) for details.
 """Researcher for Claude: load saved research documents into a Claude Code session.
 
 Usage: researcher.py [SET ...]             popup, then write the ticked docs as .txt files

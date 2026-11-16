@@ -28,7 +28,7 @@ cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/resear
 python3 ~/.claude/skills/researcher/researcher.py --init ~/research   # writes ~/.config/researcher/config.toml
 ```
 
-Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
+Try it first on the made-up documents in [examples/library](examples/library): `researcher.py --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
 ## Configure
 
@@ -80,4 +80,4 @@ The tests cover the library scan, set expansion, saved defaults, custom sets, an
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later), see [LICENSE](LICENSE). Your own documents and config are never part of this repository and are not covered by it.
