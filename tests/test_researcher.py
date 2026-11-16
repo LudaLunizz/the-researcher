@@ -101,7 +101,13 @@ class UsageTests(Env):
         self.run_main("--no-popup", "rust")
         (rec,) = self.records()
         self.assertEqual(rec["docs"], 3)
-        self.assertEqual(rec["fmt"], {"pdf": 0, "html": 1, "md": 1, "txt": 1})
+        self.assertEqual(rec["v"], 2)
+        self.assertEqual(rec["fmt"], {"pdf": 0, "html": 1, "md": 1, "txt": 1, "chat": 0})
+        # the loaded characters per format add up to the loaded characters
+        self.assertEqual(sum(rec["fmt_chars"].values()), rec["chars"])
+        self.assertEqual(rec["fmt_chars"]["chat"], 0)
+        self.assertTrue(rec["fmt_chars"]["html"] > 0 and rec["fmt_chars"]["md"] > 0
+                        and rec["fmt_chars"]["pdf"] == 0)
         self.assertEqual(rec["lib_docs"], 5)
         self.assertGreater(rec["lib_chars"], rec["chars"])
         self.assertGreaterEqual(rec["raw"], rec["chars"])
@@ -795,3 +801,87 @@ class ContextTests(SessionEnv):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatUsageTests(SessionEnv):
+    """Chats loaded as context are uses too: logged, counted, sent like library loads."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        self.presets = os.path.join(self.conf_dir, "contexts.json")
+        jl(os.path.join(self.proj, "-work-web", SID4 + ".jsonl"),
+           [user("Newest chat, other folder", ts="2026-11-17T09:00:00Z", cwd="/work/web")])
+
+    def records(self):
+        with open(R.usage_file(), encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_a_context_load_is_logged_and_counted(self):
+        write(self.presets, json.dumps({"work": {"selected": [SID2, SID4], "known": []}}))
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.rstrip().endswith(
+            "USAGE SHARING: not decided (researcher --usage-share on|off)"), out)
+        (rec,) = self.records()
+        self.assertEqual(rec["v"], 2)
+        self.assertEqual(rec["docs"], 2)
+        self.assertEqual(rec["fmt"], {"pdf": 0, "html": 0, "md": 0, "txt": 0, "chat": 2})
+        self.assertEqual(rec["fmt_chars"]["chat"], rec["chars"])
+        self.assertEqual(rec["raw"], rec["chars"])  # a chat is read as written: nothing squeezed
+        self.assertGreater(rec["src_bytes"], 0)
+        self.assertEqual(rec["lib_docs"], 4)  # every chat that could have been loaded
+        self.assertGreater(rec["lib_chars"], rec["chars"])
+        raw = read(R.usage_file())
+        for word in ("Second one", "Newest chat", "work", "web", "popup"):
+            self.assertNotIn(word, raw)
+
+    def test_a_session_load_is_logged_and_counted(self):
+        self.run_main("--sessions")
+        code, out = self.run_main("--session-load", SID1[:6])
+        self.assertEqual(code, 0, out)
+        (rec,) = self.records()
+        self.assertEqual((rec["docs"], rec["fmt"]["chat"]), (1, 1))
+        self.assertGreaterEqual(rec["lib_docs"], 2)
+
+    def test_listing_and_setup_load_nothing_so_log_nothing(self):
+        write(self.presets, json.dumps({"work": {"selected": [SID2], "known": []}}))
+        self.run_main("--context", "--list")
+        self.run_main("--sessions")
+        self.run_main("--context", "--setup", "work")
+        self.assertFalse(os.path.exists(R.usage_file()))
+
+    def test_chat_loads_are_sent_like_library_loads(self):
+        url, got, srv = receiver([(200, '{"ok":true,"received":1,"new":1}')])
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        write(self.cfg, read(self.cfg) + f'\n[usage]\nshare = true\nurl = "{url}"\n')
+        write(self.presets, json.dumps({"work": {"selected": [SID2], "known": []}}))
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("USAGE SHARING", out)
+        body = got.get(timeout=20)
+        self.assertEqual(body["schema"], 2)
+        self.assertEqual((body["loads"][0]["v"], body["loads"][0]["fmt"]["chat"]), (2, 1))
+
+
+class ConversionTests(Env):
+    def test_old_version_1_lines_are_still_read_and_sent(self):
+        write(R.usage_file(), REC + "\n")  # REC is a version 1 line
+        out = self.run_main("--usage")[1]
+        self.assertIn("1 loads", out)
+        self.assertIn("0 of 1 loads say their formats", out)
+        self.assertTrue(self.run_main("--usage-send", "--dry-run")[1].startswith("DRY RUN: 1 records"))
+
+    def test_the_conversion_saving_uses_the_measured_ratios(self):
+        # 2400 characters per 1000 tokens: 240000 html chars save 0.73 each, 120000 pdf chars 1.2 each
+        rec = {"chars": 420000, "day": "2026-11-16", "docs": 4,
+               "fmt": {"chat": 0, "html": 2, "md": 1, "pdf": 1, "txt": 0},
+               "fmt_chars": {"chat": 0, "html": 240000, "md": 60000, "pdf": 120000, "txt": 0},
+               "id": "0123456789abcdef", "lib_chars": 420000, "lib_docs": 4, "raw": 420000,
+               "src_bytes": 9, "tk": 2400, "v": 2}
+        write(R.usage_file(), json.dumps(rec) + "\n")
+        out = self.run_main("--usage")[1]
+        # (240000 * 0.73 + 120000 * 1.2) / 2400 = 133 thousand tokens; markdown has no saving
+        self.assertIn("converted:     ~133k tokens", out)
+        self.assertIn("1 of 1 loads say their formats", out)

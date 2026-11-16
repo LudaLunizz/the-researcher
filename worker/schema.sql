@@ -14,7 +14,15 @@ CREATE TABLE IF NOT EXISTS loads (
   chars     INTEGER NOT NULL, -- characters loaded
   lib_docs  INTEGER NOT NULL,
   lib_chars INTEGER NOT NULL,
-  tk        INTEGER NOT NULL  -- characters per 1000 tokens the app assumed
+  tk        INTEGER NOT NULL, -- characters per 1000 tokens the app assumed
+  -- record version 2: chats loaded as context, and the loaded characters per format
+  -- (NULL = a version 1 record that did not say). Same columns as migrations/0002_formats.sql.
+  chat       INTEGER NOT NULL DEFAULT 0,
+  pdf_chars  INTEGER,
+  html_chars INTEGER,
+  md_chars   INTEGER,
+  txt_chars  INTEGER,
+  chat_chars INTEGER
 );
 CREATE INDEX IF NOT EXISTS loads_day ON loads (day);
 CREATE INDEX IF NOT EXISTS loads_id ON loads (id);

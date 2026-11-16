@@ -2,7 +2,7 @@
 //
 //   POST /v1/usage   body = what `researcher --usage-send` sends (schema 2), or the file
 //                    `researcher --usage-export` writes (schema 1)
-//   GET  /v1/stats   public totals: installs, loads, characters, estimated tokens
+//   GET  /v1/stats   public totals: installs, loads, characters, estimated tokens (the parts shown)
 //   GET  /v1/badge/squeezed, /v1/badge/not-loaded   the token totals as shields.io badges
 //
 // Nothing here reads, logs or stores an IP address, a header or a GitHub login. The
@@ -12,14 +12,25 @@
 import { MAX_BODY, parsePayload, rowHash } from "./validate.js";
 
 const INSERT =
-  "INSERT OR IGNORE INTO loads (h, id, day, docs, pdf, html, md, txt, src_bytes, raw, chars, lib_docs, lib_chars, tk) " +
-  "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+  "INSERT OR IGNORE INTO loads (h, id, day, docs, pdf, html, md, txt, src_bytes, raw, chars, lib_docs, lib_chars, tk, " +
+  "chat, pdf_chars, html_chars, md_chars, txt_chars, chat_chars) " +
+  "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)";
+// Reading the converted text instead of the original costs fewer tokens. Measured with
+// count_tokens on 85 reports (README, "What it saves"): raw HTML = 1.73x its converted text,
+// a PDF read as a document = 2.2x. So per converted character, HTML saves 0.73 and PDF 1.2.
+// Markdown, text and chats are read as they are: no conversion saving.
+export const SAVED_PER_CHAR = { html: 0.73, pdf: 1.2 };
 // Tokens are estimated per record with the characters-per-1000-tokens the app assumed (tk).
+const SQUEEZE = "COALESCE(SUM(MAX(raw - chars, 0) * 1000.0 / tk), 0)";
+// version 1 records have NULL characters per format: they add nothing here
+const CONVERT =
+  `COALESCE(SUM((COALESCE(html_chars, 0) * ${SAVED_PER_CHAR.html} + COALESCE(pdf_chars, 0) * ${SAVED_PER_CHAR.pdf}) * 1000.0 / tk), 0)`;
 const STATS =
   "SELECT COUNT(DISTINCT id) AS installs, COUNT(*) AS loads, COALESCE(SUM(docs), 0) AS docs, " +
   "COALESCE(SUM(raw), 0) AS raw_chars, COALESCE(SUM(chars), 0) AS chars, " +
-  "COALESCE(SUM(MAX(raw - chars, 0) * 1000.0 / tk), 0) AS tokens_squeezed, " +
-  "COALESCE(SUM(MAX(lib_chars - chars, 0) * 1000.0 / tk), 0) AS tokens_not_loaded FROM loads";
+  `${SQUEEZE} AS tokens_from_squeeze, ${CONVERT} AS tokens_from_conversion, ` +
+  "COALESCE(SUM(MAX(lib_chars - chars, 0) * 1000.0 / tk), 0) AS tokens_not_loaded, " +
+  "COALESCE(SUM(chat > 0), 0) AS chat_loads, COUNT(pdf_chars) AS loads_with_formats FROM loads";
 const BADGES = {
   squeezed: { label: "tokens squeezed", key: "tokens_squeezed", color: "brightgreen" },
   "not-loaded": { label: "tokens not loaded", key: "tokens_not_loaded", color: "blue" },
@@ -93,7 +104,10 @@ async function receive(request, env) {
   for (const r of rows) {
     const h = await rowHash(r);
     statements.push(
-      env.DB.prepare(INSERT).bind(h, r.id, r.day, r.docs, r.pdf, r.html, r.md, r.txt, r.src_bytes, r.raw, r.chars, r.lib_docs, r.lib_chars, r.tk),
+      env.DB.prepare(INSERT).bind(
+        h, r.id, r.day, r.docs, r.pdf, r.html, r.md, r.txt, r.src_bytes, r.raw, r.chars, r.lib_docs, r.lib_chars, r.tk,
+        r.chat, r.pdf_chars, r.html_chars, r.md_chars, r.txt_chars, r.chat_chars,
+      ),
     );
   }
   let added = 0;
@@ -112,8 +126,13 @@ async function totals(env) {
     documents: row.docs,
     raw_chars: row.raw_chars,
     chars: row.chars,
-    tokens_squeezed: Math.round(row.tokens_squeezed),
+    // tokens squeezed = the squeeze itself + reading text instead of the HTML/PDF original
+    tokens_squeezed: Math.round(row.tokens_from_squeeze + row.tokens_from_conversion),
+    tokens_from_squeeze: Math.round(row.tokens_from_squeeze),
+    tokens_from_conversion: Math.round(row.tokens_from_conversion),
     tokens_not_loaded: Math.round(row.tokens_not_loaded),
+    chat_loads: row.chat_loads,
+    loads_with_formats: row.loads_with_formats, // loads that say which format their characters are
   };
 }
 

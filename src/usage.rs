@@ -16,7 +16,19 @@ use serde_json::{Value, json};
 use crate::text::Texts;
 use crate::util;
 
-pub const USAGE_SCHEMA: i64 = 1;
+/// The file `--usage-export` writes is request schema 1; each record inside has its own version.
+pub const EXPORT_SCHEMA: i64 = 1;
+/// Record versions: 1 had counts per format (pdf, html, md, txt); 2 adds chats loaded as context
+/// to `fmt` and `fmt_chars`, the loaded characters per format. Both are read and sent.
+const RECORD_VERSION: i64 = 2;
+fn known_version(r: &Value) -> bool {
+    r.is_object() && matches!(r.get("v").and_then(Value::as_i64), Some(1 | 2))
+}
+/// Reading the converted text instead of the original costs fewer tokens: measured with
+/// count_tokens on 85 reports (README, "What it saves"), raw HTML = 1.73x its text and a PDF
+/// read as a document = 2.2x. So per converted character HTML saves 0.73 and PDF 1.2 (markdown,
+/// text and chats are read as they are). Keep these equal to SAVED_PER_CHAR in worker/src/index.js.
+const SAVED_PER_CHAR: [(&str, f64); 2] = [("html", 0.73), ("pdf", 1.2)];
 /// The request shape `--usage-send` posts: the records plus `seq`, their line number in the log.
 pub const SEND_SCHEMA: i64 = 2;
 /// The project's receiver (worker/ in the repo); `[usage] url` points elsewhere.
@@ -25,6 +37,8 @@ pub const DEFAULT_URL: &str = "https://the-researcher-usage.ludalunizz.workers.d
 const SEND_BATCH: usize = 200;
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const USAGE_KINDS: [&str; 4] = ["pdf", "html", "md", "txt"];
+/// What a record counts per format: the four file formats and chats loaded as context.
+const FORMS: [&str; 5] = ["pdf", "html", "md", "txt", "chat"];
 /// ~2.4 characters per token, measured with count_tokens (see README).
 pub const CHARS_PER_K: usize = 2400;
 
@@ -114,31 +128,68 @@ fn format_of(path: &str) -> &'static str {
     USAGE_KINDS.iter().find(|k| **k == ext).copied().unwrap_or("txt")
 }
 
-/// The numbers of one load. Characters, not tokens: the reader applies its own ratio.
+/// One load as numbers. Characters, not tokens: the reader applies its own ratio.
+fn build(
+    counts: &BTreeMap<&str, (usize, usize)>,
+    src_bytes: u64,
+    raw: usize,
+    lib: (usize, usize),
+) -> std::io::Result<Value> {
+    let get = |k: &str| counts.get(k).copied().unwrap_or((0, 0));
+    let fmt: BTreeMap<&str, usize> = FORMS.iter().map(|k| (*k, get(k).0)).collect();
+    let fmt_chars: BTreeMap<&str, usize> = FORMS.iter().map(|k| (*k, get(k).1)).collect();
+    Ok(json!({
+        "v": RECORD_VERSION,
+        "day": chrono::Local::now().format("%Y-%m-%d").to_string(),
+        "id": install_id()?,
+        "docs": fmt.values().sum::<usize>(),
+        "fmt": fmt,
+        "fmt_chars": fmt_chars,
+        "src_bytes": src_bytes,
+        "raw": raw,
+        "chars": fmt_chars.values().sum::<usize>(),
+        "lib_docs": lib.0,
+        "lib_chars": lib.1,
+        "tk": CHARS_PER_K,
+    }))
+}
+
+/// The record of one library load.
 pub fn record(docs: &[String], texts: &mut Texts, paths: &BTreeMap<String, String>) -> std::io::Result<Value> {
-    let mut fmt: BTreeMap<&str, usize> = USAGE_KINDS.iter().map(|k| (*k, 0)).collect();
+    let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut src_bytes = 0u64;
     for d in docs {
-        *fmt.entry(format_of(&paths[d])).or_default() += 1;
+        let c = counts.entry(format_of(&paths[d])).or_default();
+        c.0 += 1;
+        c.1 += texts.len(d);
+        src_bytes += fs::metadata(&paths[d])?.len();
     }
     let lib: Vec<&String> = paths.keys().filter(|d| texts.has(d)).collect();
     let lib_chars: usize = lib.iter().map(|d| texts.len(d)).sum();
-    let mut src_bytes = 0u64;
-    for d in docs {
-        src_bytes += fs::metadata(&paths[d])?.len();
+    build(&counts, src_bytes, docs.iter().map(|d| texts.raw_chars(d)).sum(), (lib.len(), lib_chars))
+}
+
+/// The record of earlier Claude Code chats loaded as context: `chats` = (characters, transcript
+/// bytes) of each chat loaded; `lib` = (chats, characters) of every chat that could have been.
+/// A chat is read as it is written, so nothing is squeezed (raw = chars).
+pub fn chat_record(chats: &[(usize, u64)], lib: (usize, usize)) -> std::io::Result<Value> {
+    let chars: usize = chats.iter().map(|c| c.0).sum();
+    let counts = BTreeMap::from([("chat", (chats.len(), chars))]);
+    build(&counts, chats.iter().map(|c| c.1).sum(), chars, lib)
+}
+
+/// Log the record of a finished load and, when the user said yes, send it in the background.
+/// Returns the one line to print when sharing is not decided yet. Never breaks a load.
+pub fn finish(cfg: &toml::Table, cfg_path: &str, rec: &Value) -> Option<&'static str> {
+    log(rec);
+    match share(cfg) {
+        Share::On => {
+            send_in_background(cfg_path);
+            None
+        }
+        Share::Off => None,
+        Share::Undecided => Some("USAGE SHARING: not decided (researcher --usage-share on|off)"),
     }
-    Ok(json!({
-        "v": USAGE_SCHEMA,
-        "day": chrono::Local::now().format("%Y-%m-%d").to_string(),
-        "id": install_id()?,
-        "docs": docs.len(),
-        "fmt": fmt,
-        "src_bytes": src_bytes,
-        "raw": docs.iter().map(|d| texts.raw_chars(d)).sum::<usize>(),
-        "chars": docs.iter().map(|d| texts.len(d)).sum::<usize>(),
-        "lib_docs": lib.len(),
-        "lib_chars": lib_chars,
-        "tk": CHARS_PER_K,
-    }))
 }
 
 /// Append one record. A failure here must never break a load.
@@ -153,10 +204,7 @@ pub fn log(rec: &Value) {
 /// Records from the log; lines that are not this schema are skipped.
 pub fn read() -> Vec<Value> {
     let Ok(text) = fs::read_to_string(usage_file()) else { return Vec::new() };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|r| r.is_object() && r.get("v").and_then(Value::as_i64) == Some(USAGE_SCHEMA))
-        .collect()
+    text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(known_version).collect()
 }
 
 fn num(r: &Value, k: &str) -> f64 {
@@ -173,6 +221,10 @@ pub struct Summary {
     pub unticked: f64,
     pub tokens: f64,
     pub tokens_squeezed: f64,
+    /// reading text instead of the HTML/PDF originals (records that say their formats only)
+    pub tokens_converted: f64,
+    /// how many records say their formats (version 2)
+    pub loads_with_formats: usize,
     pub tokens_unticked: f64,
 }
 
@@ -192,6 +244,12 @@ pub fn summary(recs: &[Value]) -> Summary {
         t.tokens += tok(chars, r);
         t.tokens_squeezed += tok(raw - chars, r);
         t.tokens_unticked += tok((lib - chars).max(0.0), r);
+        if let Some(fc) = r.get("fmt_chars").and_then(Value::as_object) {
+            t.loads_with_formats += 1;
+            let saved: f64 =
+                SAVED_PER_CHAR.iter().map(|(k, per)| per * fc.get(*k).and_then(Value::as_f64).unwrap_or(0.0)).sum();
+            t.tokens_converted += tok(saved, r);
+        }
     }
     t.squeezed = t.raw - t.chars;
     t
@@ -230,6 +288,12 @@ pub fn report(recs: &[Value]) -> String {
             pct as i64
         ),
         format!(
+            "converted:     ~{:.0}k tokens saved by reading text instead of the HTML/PDF originals (from measured ratios, {} of {} loads say their formats)",
+            t.tokens_converted / 1000.0,
+            t.loads_with_formats,
+            t.loads
+        ),
+        format!(
             "left unticked: {:>10} chars  (~{:.0}k tokens, against loading the whole library every time: a ceiling, not a measurement)",
             t.unticked as i64,
             t.tokens_unticked / 1000.0
@@ -253,7 +317,7 @@ pub fn pending() -> Vec<Value> {
     let mut out = Vec::new();
     for (i, line) in lines.iter().enumerate().skip(done) {
         let Ok(mut rec) = serde_json::from_str::<Value>(line) else { continue };
-        if rec.is_object() && rec.get("v").and_then(Value::as_i64) == Some(USAGE_SCHEMA) {
+        if known_version(&rec) {
             rec["seq"] = json!(i + 1);
             out.push(util::sorted(&rec));
         }
@@ -363,7 +427,7 @@ pub fn share_line(share: Share, waiting: usize) -> String {
 /// Write the records as one JSON file to look at. Returns how many.
 pub fn export(path: &str) -> std::io::Result<usize> {
     let recs = read();
-    let body = util::json_indent1(&util::sorted(&json!({"schema": USAGE_SCHEMA, "loads": recs})));
+    let body = util::json_indent1(&util::sorted(&json!({"schema": EXPORT_SCHEMA, "loads": recs})));
     fs::write(path, format!("{body}\n"))?;
     Ok(recs.len())
 }

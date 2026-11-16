@@ -21,6 +21,11 @@ main README. No dependencies: plain JavaScript, a D1 database, nothing else.
 ]}
 ```
 
+Records come in two versions (`v`): 1 has counts per format (pdf, html, md, txt); 2 also has
+`chat` (earlier Claude Code chats loaded as context) in `fmt`, and `fmt_chars`, the loaded
+characters per format, which must add up to `chars`. Both are accepted; old rows keep NULL
+characters per format.
+
 Validation is a strict whitelist (`src/validate.js`): any other field, any string that
 is not a 16-hex id or a plausible date, any out-of-range number, or a `fmt` that does
 not add up to `docs` rejects the **whole** request and stores nothing. Free text
@@ -30,8 +35,12 @@ A record that is sent twice is stored once (primary key = hash of its numbers an
 schema 2, its `seq`), so the app can resend its queue safely, while two identical loads on
 one day (different `seq`) are two rows. Schema 1 rows hash as they always did.
 
-`GET /v1/stats` returns public totals only: installs, loads, documents, characters, and two
-token estimates (`tokens_squeezed`, `tokens_not_loaded`; per record, characters / `tk` × 1000).
+`GET /v1/stats` returns public totals only: installs, loads, documents, characters, chat loads,
+and the token estimates (per record, characters / `tk` × 1000): `tokens_not_loaded`, and
+`tokens_squeezed` = `tokens_from_squeeze` (raw minus loaded characters) + `tokens_from_conversion`
+(0.73 per loaded HTML character and 1.2 per PDF character: reading text instead of the original,
+from the ratios in the main README; only records that carry `fmt_chars` add to it, and
+`loads_with_formats` says how many do).
 `GET /v1/badge/squeezed` and `GET /v1/badge/not-loaded` give the same two numbers in the
 shields.io endpoint format, for the README badges
 (`https://img.shields.io/endpoint?url=<worker>/v1/badge/squeezed`).
@@ -44,6 +53,18 @@ Not kept: IP address, headers, user agent, titles, paths, GitHub login. The code
 reads them (the optional rate limiter uses the IP only as its key), and
 `observability` is off in `wrangler.toml`, so Cloudflare keeps no request logs for this
 Worker. Cloudflare itself still sees connections as any host does.
+
+## Upgrade an existing database
+
+A database made before record version 2 needs one migration (new nullable columns; old rows keep
+their data), then redeploy:
+
+```sh
+npx wrangler d1 execute researcher-usage --remote --file migrations/0002_formats.sql
+npx wrangler deploy
+```
+
+Run the migration once: a second run fails on the first `ALTER` and changes nothing.
 
 ## Deploy
 

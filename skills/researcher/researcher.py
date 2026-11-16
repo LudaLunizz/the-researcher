@@ -765,12 +765,21 @@ def write_outputs(out_dir, docs, texts, paths):
 # said yes (`[usage] share = true`, set with --usage-share on): --usage-send sends the ones not
 # sent yet, and after a load that happens in the background.
 
-USAGE_SCHEMA = 1
+EXPORT_SCHEMA = 1  # the file --usage-export writes; each record inside has its own version
+# Record versions: 1 had counts per format (pdf, html, md, txt); 2 adds chats loaded as context to
+# `fmt` and `fmt_chars`, the loaded characters per format. Both are read and sent.
+RECORD_VERSION = 2
+# Reading the converted text instead of the original costs fewer tokens: measured with count_tokens
+# on 85 reports (README, "What it saves"), raw HTML = 1.73x its text and a PDF read as a document
+# = 2.2x. So per converted character HTML saves 0.73 and PDF 1.2 (markdown, text and chats are read
+# as they are). Keep these equal to SAVED_PER_CHAR in worker/src/index.js.
+SAVED_PER_CHAR = {"html": 0.73, "pdf": 1.2}
 SEND_SCHEMA = 2  # the request --usage-send posts: the records plus `seq`, their log line number
 DEFAULT_URL = "https://the-researcher-usage.ludalunizz.workers.dev/v1/usage"  # worker/ in the repo
 SEND_BATCH = 200  # records per request (the receiver takes up to 200)
 SEND_TIMEOUT = 15  # seconds
 USAGE_KINDS = ("pdf", "html", "md", "txt")
+FORMS = USAGE_KINDS + ("chat",)  # what a record counts per format
 
 
 def data_home():
@@ -836,19 +845,68 @@ def format_of(path):
     return "html" if ext == "htm" else ext if ext in USAGE_KINDS else "txt"
 
 
+def known_version(rec):
+    return isinstance(rec, dict) and rec.get("v") in (1, 2)
+
+
+def usage_build(counts, src_bytes, raw, lib):
+    """One load as numbers. counts = {format: (documents, characters)}; lib = (documents, characters)
+    of everything that could have been loaded. Characters, not tokens: the reader applies its ratio."""
+    fmt = {k: counts.get(k, (0, 0))[0] for k in FORMS}
+    fmt_chars = {k: counts.get(k, (0, 0))[1] for k in FORMS}
+    return {"v": RECORD_VERSION, "day": datetime.date.today().isoformat(), "id": install_id(),
+            "docs": sum(fmt.values()), "fmt": fmt, "fmt_chars": fmt_chars,
+            "src_bytes": src_bytes, "raw": raw, "chars": sum(fmt_chars.values()),
+            "lib_docs": lib[0], "lib_chars": lib[1], "tk": CHARS_PER_K}
+
+
 def usage_record(docs, texts, paths):
-    """The numbers of one load. Characters, not tokens: the reader applies its own ratio."""
-    fmt = dict.fromkeys(USAGE_KINDS, 0)
+    """The record of one library load."""
+    counts, src_bytes = {}, 0
     for d in docs:
-        fmt[format_of(paths[d])] += 1
+        n, c = counts.get(format_of(paths[d]), (0, 0))
+        counts[format_of(paths[d])] = (n + 1, c + len(texts[d]))
+        src_bytes += os.path.getsize(paths[d])
     lib = [d for d in paths if d in texts]
-    return {"v": USAGE_SCHEMA, "day": datetime.date.today().isoformat(), "id": install_id(),
-            "docs": len(docs), "fmt": fmt,
-            "src_bytes": sum(os.path.getsize(paths[d]) for d in docs),
-            "raw": sum(texts.raw_chars(d) for d in docs),
-            "chars": sum(len(texts[d]) for d in docs),
-            "lib_docs": len(lib), "lib_chars": sum(len(texts[d]) for d in lib),
-            "tk": CHARS_PER_K}
+    return usage_build(counts, src_bytes, sum(texts.raw_chars(d) for d in docs),
+                       (len(lib), sum(len(texts[d]) for d in lib)))
+
+
+def file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0  # a transcript that vanished must not break a load
+
+
+def chat_usage_record(loaded, lib):
+    """The record of earlier Claude Code chats loaded as context: loaded = [(characters, transcript
+    bytes)] of each chat loaded; lib = (chats, characters) of every chat that could have been. A chat
+    is read as it is written, so nothing is squeezed (raw = chars)."""
+    chars = sum(c for c, _ in loaded)
+    return usage_build({"chat": (len(loaded), chars)}, sum(b for _, b in loaded), chars, lib)
+
+
+def finish_usage(cfg, cfg_path, rec):
+    """Log the record of a finished load and, when the user said yes, send it in the background.
+    Returns the one line to print when sharing is not decided yet. Never breaks a load."""
+    log_usage(rec)
+    share = usage_share(cfg)
+    if share == "on":
+        send_in_background(cfg_path)
+    elif share == "not decided":
+        return "USAGE SHARING: not decided (researcher --usage-share on|off)"
+    return None
+
+
+def usage_of_chats(cfg, cfg_path, loaded, lib):
+    """Log a chat load (and send it when sharing is on). Returns the sharing note, if any."""
+    if not loaded or not usage_enabled(cfg):
+        return None
+    try:
+        return finish_usage(cfg, cfg_path, chat_usage_record(loaded, lib))
+    except OSError:
+        return None
 
 
 def log_usage(rec):
@@ -871,7 +929,7 @@ def read_usage():
                     rec = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(rec, dict) and rec.get("v") == USAGE_SCHEMA:
+                if known_version(rec):
                     out.append(rec)
     except OSError:
         pass
@@ -891,6 +949,12 @@ def usage_summary(recs):
     tot["tokens_unticked"] = sum(tok(max(0, r.get("lib_chars", 0) - r.get("chars", 0)), r)
                                  for r in recs)
     tot["loads"] = len(recs)
+    # reading text instead of the HTML/PDF originals (records that say their formats only)
+    with_formats = [r for r in recs if isinstance(r.get("fmt_chars"), dict)]
+    tot["loads_with_formats"] = len(with_formats)
+    tot["tokens_converted"] = sum(
+        tok(sum(per * r["fmt_chars"].get(k, 0) for k, per in SAVED_PER_CHAR.items()), r)
+        for r in with_formats)
     return tot
 
 
@@ -908,6 +972,9 @@ def usage_report(recs):
         f"{t['tokens'] / n / 1000:.1f}k per load)",
         f"squeezed away: {t['squeezed']:>10} chars  (~{t['tokens_squeezed'] / 1000:.0f}k tokens, "
         f"{pct}% of the converted text)",
+        f"converted:     ~{t['tokens_converted'] / 1000:.0f}k tokens saved by reading text instead of "
+        f"the HTML/PDF originals (from measured ratios, {t['loads_with_formats']} of {n} loads say "
+        "their formats)",
         f"left unticked: {t['unticked']:>10} chars  (~{t['tokens_unticked'] / 1000:.0f}k tokens, "
         "against loading the whole library every time: a ceiling, not a measurement)",
         "tokens are estimates from characters, not counted by a tokenizer",
@@ -938,7 +1005,7 @@ def usage_pending():
             rec = json.loads(line)
         except ValueError:
             continue
-        if isinstance(rec, dict) and rec.get("v") == USAGE_SCHEMA:
+        if known_version(rec):
             rec["seq"] = i
             out.append(rec)
     return out
@@ -1098,7 +1165,7 @@ def usage_export(path):
     """Write the records as one JSON file to look at."""
     recs = read_usage()
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"schema": USAGE_SCHEMA, "loads": recs}, f, indent=1, sort_keys=True)
+        json.dump({"schema": EXPORT_SCHEMA, "loads": recs}, f, indent=1, sort_keys=True)
         f.write("\n")
     return len(recs)
 
@@ -1308,7 +1375,7 @@ def session_text(sid, rec, entries=None):
     return body
 
 
-def sessions_main(args, cfg, reg_path, out_dir):
+def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
     settings = sessions_settings(cfg)
     if settings is None:
         print("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to track "
@@ -1343,6 +1410,12 @@ def sessions_main(args, cfg, reg_path, out_dir):
             print(f"SESSION {session_label(sid, rec)}")
             print(f"{len(text):>7} chars  {written[0]}")
             print(f"total: 1 session, {len(text)} chars (~{len(text) // CHARS_PER_K}k tokens)")
+            # one chat, against every chat that could have been loaded
+            every = [r.get("chars") or 0 for r in reg["sessions"].values()]
+            note = usage_of_chats(cfg, cfg_path, [(len(text), file_size(rec["file"]))],
+                                  (len(every), sum(every)))
+            if note:
+                print(note)
             return 0
     except ConfigError as e:
         print(f"SESSION ERROR: {e}")
@@ -1423,7 +1496,7 @@ def chat_sections(names, catalog, presets, setup):
     return out
 
 
-def context_main(args, cfg, reg_path, presets_path, out_dir):
+def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
     """--context [PRESET ...]: pick earlier chats (all folders) in the popup and write each as a
     .txt to load as context. Presets are saved like custom sets, in their own file."""
     settings = sessions_settings(cfg)
@@ -1516,6 +1589,13 @@ def context_main(args, cfg, reg_path, presets_path, out_dir):
     for sid in gone:
         print(f"MISSING  chat {sid} (its transcript is gone)")
     print(f"total: {len(docs)} chats, {total} chars (~{total // CHARS_PER_K}k tokens)")
+    # every chat that could have been loaded is the "whole library" of this load
+    note = usage_of_chats(cfg, cfg_path,
+                          [(len(texts[doc]), file_size(recs[sid]["file"]))
+                           for sid, doc in zip(sids, docs)],
+                          (len(catalog), sum(recs[sid].get("chars") or 0 for sid in catalog)))
+    if note:
+        print(note)
     return 0
 
 
@@ -1610,7 +1690,7 @@ def main(argv=None):
             print(f"CONFIG ERROR: {e}")
             return 6
         conf_dir = os.path.dirname(cfg_path)
-        return context_main(args, cfg, os.path.join(conf_dir, "sessions.json"),
+        return context_main(args, cfg, cfg_path, os.path.join(conf_dir, "sessions.json"),
                             os.path.join(conf_dir, "contexts.json"), args.out or cache_home())
 
     if args.sessions or args.rename or args.resume or args.session_load:
@@ -1619,7 +1699,8 @@ def main(argv=None):
         except ConfigError as e:
             print(f"CONFIG ERROR: {e}")
             return 6
-        return sessions_main(args, cfg, os.path.join(os.path.dirname(cfg_path), "sessions.json"),
+        return sessions_main(args, cfg, cfg_path,
+                             os.path.join(os.path.dirname(cfg_path), "sessions.json"),
                              args.out or cache_home())
 
     try:
@@ -1728,15 +1809,9 @@ def main(argv=None):
     share_note = None
     if docs and usage_enabled(cfg):
         try:  # the log must never break a load
-            log_usage(usage_record(docs, texts, paths))
+            share_note = finish_usage(cfg, cfg_path, usage_record(docs, texts, paths))
         except OSError:
             pass
-        else:
-            share = usage_share(cfg)
-            if share == "on":
-                send_in_background(cfg_path)
-            elif share == "not decided":
-                share_note = "USAGE SHARING: not decided (researcher --usage-share on|off)"
     total = 0
     for d, dst in zip(docs, written):
         total += len(texts[d])

@@ -130,7 +130,13 @@ fn load_logs_counts_only() {
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
     assert_eq!(r["docs"], 3);
-    assert_eq!(r["fmt"], serde_json::json!({"pdf": 0, "html": 1, "md": 1, "txt": 1}));
+    assert_eq!(r["v"], 2);
+    assert_eq!(r["fmt"], serde_json::json!({"pdf": 0, "html": 1, "md": 1, "txt": 1, "chat": 0}));
+    // the loaded characters per format add up to the loaded characters
+    let fc = r["fmt_chars"].as_object().unwrap();
+    assert_eq!(fc.values().map(|v| v.as_u64().unwrap()).sum::<u64>(), r["chars"].as_u64().unwrap());
+    assert_eq!(fc["chat"], 0);
+    assert!(fc["html"].as_u64() > Some(0) && fc["md"].as_u64() > Some(0) && fc["pdf"] == 0);
     assert_eq!(r["lib_docs"], 5);
     assert!(r["lib_chars"].as_u64() > r["chars"].as_u64());
     assert!(r["raw"].as_u64() >= r["chars"].as_u64());
@@ -1118,6 +1124,55 @@ fn same_config_edits_and_requests_as_python() {
     assert_eq!(a, String::from_utf8_lossy(&b.stdout), "the dry runs differ");
 }
 
+/// The same load gives the same record in both versions (only the random install id differs),
+/// the same `--usage` report, and a chat load too.
+#[test]
+fn same_usage_records_as_python() {
+    let py = repo().join("skills/researcher/researcher.py");
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("python3 not found: parity check skipped");
+        return;
+    }
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[SID2, SID4]);
+    let py_data = s.e.tmp.join("py-data");
+    let py_run = |args: &[&str]| {
+        let o = Command::new("python3")
+            .arg("-I")
+            .arg(&py)
+            .arg("--config")
+            .arg(&s.e.cfg)
+            .arg("--out")
+            .arg(s.e.tmp.join("py-out"))
+            .args(args)
+            .env("RESEARCHER_NO_POPUP", "1")
+            .env("XDG_DATA_HOME", &py_data)
+            .env("XDG_CACHE_HOME", s.e.tmp.join("py-cache"))
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    for args in [&["--no-popup", "rust"][..], &["--no-popup", "app"], &["--context", "work"], &["--sessions"]] {
+        s.e.run(args);
+        py_run(args);
+    }
+    s.e.run(&["--session-load", &SID1[..6]]);
+    py_run(&["--session-load", &SID1[..6]]);
+    let rs: Vec<Value> = s.e.records();
+    let pyr: Vec<Value> =
+        read(&py_data.join("researcher/usage.jsonl")).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rs.len(), 4, "rust: {rs:?}"); // 2 library loads, a context load, a session load
+    let strip = |v: &Value| {
+        let mut v = v.clone();
+        v["id"] = Value::Null;
+        v
+    };
+    assert_eq!(rs.iter().map(strip).collect::<Vec<_>>(), pyr.iter().map(strip).collect::<Vec<_>>());
+    let report = |o: String| o.lines().filter(|l| !l.starts_with("usage log:")).collect::<Vec<_>>().join("\n");
+    assert_eq!(report(s.e.run(&["--usage"]).1), report(py_run(&["--usage"])));
+}
+
 // ---------------------------------------------------------------- first use
 
 #[test]
@@ -1160,4 +1215,98 @@ fn empty_library_says_so() {
     assert!(out.contains("EMPTY LIBRARY"), "{out}");
     let (code, out) = e.run(&["--library", empty.to_str().unwrap(), "--list"]);
     assert_eq!(code, 0, "{out}");
+}
+
+// ---------------------------------------------------------------- chats count as uses too
+
+#[test]
+fn a_context_load_is_logged_and_counted() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[SID2, SID4]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.trim_end().ends_with("USAGE SHARING: not decided (researcher --usage-share on|off)"), "{out}");
+    let recs = s.e.records();
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    assert_eq!(r["v"], 2);
+    assert_eq!(r["docs"], 2);
+    assert_eq!(r["fmt"], serde_json::json!({"pdf": 0, "html": 0, "md": 0, "txt": 0, "chat": 2}));
+    assert_eq!(r["fmt_chars"]["chat"], r["chars"]);
+    assert_eq!(r["raw"], r["chars"]); // a chat is read as written: nothing squeezed
+    assert!(r["src_bytes"].as_u64() > Some(0));
+    // every chat that could have been loaded is the library of this load: 4 chats here
+    assert_eq!(r["lib_docs"], 4);
+    assert!(r["lib_chars"].as_u64() > r["chars"].as_u64());
+    // no chat text, name or folder in the log
+    let raw = read(&s.e.usage_file());
+    for word in ["Second one", "Newest chat", "work", "web", "popup"] {
+        assert!(!raw.contains(word), "{word} in the log");
+    }
+    assert!(e_usage_report(&s.e).contains("1 loads"));
+}
+
+fn e_usage_report(e: &Env) -> String {
+    e.run(&["--usage"]).1
+}
+
+#[test]
+fn a_session_load_is_logged_and_counted() {
+    let s = sessions_env();
+    s.e.run(&["--sessions"]);
+    let (code, out) = s.e.run(&["--session-load", &SID1[..6]]);
+    assert_eq!(code, 0, "{out}");
+    let recs = s.e.records();
+    assert_eq!(recs.len(), 1, "{out}");
+    assert_eq!(recs[0]["fmt"]["chat"], 1);
+    assert_eq!(recs[0]["docs"], 1);
+    assert!(recs[0]["lib_docs"].as_u64() >= Some(2));
+}
+
+#[test]
+fn listing_and_cancelled_chats_load_nothing_so_log_nothing() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[SID2]);
+    s.e.run(&["--context", "--list"]);
+    s.e.run(&["--sessions"]);
+    s.e.run(&["--context", "--setup", "work"]);
+    assert!(!s.e.usage_file().exists());
+}
+
+#[test]
+fn chat_loads_are_sent_like_library_loads() {
+    let (s, presets) = context_env();
+    let (url, got) = receiver(vec![(200, r#"{"ok":true,"received":1,"new":1}"#)]);
+    s.e.share_on(&url);
+    save_preset(&presets, "work", &[SID2]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("USAGE SHARING"), "{out}");
+    let body = got.recv_timeout(Duration::from_secs(20)).expect("the background send arrives");
+    assert_eq!(body["schema"], 2);
+    assert_eq!(body["loads"][0]["v"], 2);
+    assert_eq!(body["loads"][0]["fmt"]["chat"], 1);
+}
+
+#[test]
+fn old_version_1_lines_are_still_read_and_sent() {
+    let e = Env::new();
+    e.log_lines(1); // REC is a version 1 line
+    let (_, out) = e.run(&["--usage"]);
+    assert!(out.contains("1 loads"), "{out}");
+    assert!(out.contains("0 of 1 loads say their formats"), "{out}");
+    let (_, out) = e.run(&["--usage-send", "--dry-run"]);
+    assert!(out.starts_with("DRY RUN: 1 records"), "{out}");
+}
+
+#[test]
+fn the_conversion_saving_uses_the_measured_ratios() {
+    let e = Env::new();
+    // 2400 characters per 1000 tokens: 240000 html chars save 0.73 each, 120000 pdf chars 1.2 each
+    let rec = r#"{"chars":420000,"day":"2026-11-16","docs":4,"fmt":{"chat":0,"html":2,"md":1,"pdf":1,"txt":0},"fmt_chars":{"chat":0,"html":240000,"md":60000,"pdf":120000,"txt":0},"id":"0123456789abcdef","lib_chars":420000,"lib_docs":4,"raw":420000,"src_bytes":9,"tk":2400,"v":2}"#;
+    write(&e.usage_file(), &format!("{rec}\n"));
+    let (_, out) = e.run(&["--usage"]);
+    // (240000 * 0.73 + 120000 * 1.2) / 2400 = 133 thousand tokens; markdown has no saving
+    assert!(out.contains("converted:     ~133k tokens"), "{out}");
+    assert!(out.contains("1 of 1 loads say their formats"), "{out}");
 }
