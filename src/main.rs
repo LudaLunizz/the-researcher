@@ -20,13 +20,14 @@ mod usage;
 mod util;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::ExitCode;
+use std::io::Write;
+use std::process::{Command, ExitCode};
 
 use clap::Parser;
 use serde_json::{Value, json};
 
 use library::{ConfigError, SetKind};
-use popup::{Outcome, POPUP_TIMEOUT};
+use popup::{FirstUse, Outcome, POPUP_TIMEOUT};
 use text::Texts;
 use usage::CHARS_PER_K;
 
@@ -155,6 +156,76 @@ fn init_config(path: &str, library: &str) -> i32 {
     }
 }
 
+/// First use (no library in the config): ask for the research folder, save it, then start
+/// again so the chooser opens (a process can open only one window loop).
+fn first_use(cfg_path: &str) -> i32 {
+    match popup::first_use(&util::expanduser("~/research"), cfg_path) {
+        Err(e) => {
+            println!(
+                "NO LIBRARY: set `library` in {cfg_path} (or run --init, or set RESEARCHER_LIBRARY); \
+                 no window to ask ({e}); nothing loaded"
+            );
+            6
+        }
+        Ok(FirstUse::Cancelled) => {
+            println!("CANCELLED: no research folder chosen, nothing loaded");
+            3
+        }
+        Ok(FirstUse::Timeout) => {
+            println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
+            4
+        }
+        Ok(FirstUse::Folder(dir)) => {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                println!("NO LIBRARY: could not make {dir}: {e}; nothing loaded");
+                return 6;
+            }
+            if let Err(e) = set_library(cfg_path, &dir) {
+                println!("CONFIG ERROR: could not save `library` in {cfg_path}: {e}");
+                return 6;
+            }
+            println!("LIBRARY SET: {dir} (saved as `library` in {cfg_path})");
+            let _ = std::io::stdout().flush();
+            let me = std::env::current_exe();
+            let status = me.and_then(|exe| {
+                Command::new(exe).args(std::env::args_os().skip(1)).env("RESEARCHER_FIRST_USE_DONE", "1").status()
+            });
+            match status {
+                Ok(st) => st.code().unwrap_or(1),
+                Err(e) => {
+                    println!("could not start the chooser ({e}); run the same command again");
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// Put `library = "DIR"` into the config: a starter config when there is none, otherwise the
+/// existing `library` line is replaced or a new one goes on top (comments are kept).
+fn set_library(cfg_path: &str, dir: &str) -> Result<(), String> {
+    let line = format!("library = \"{}\"", dir.replace('\\', "\\\\").replace('"', "\\\""));
+    let body = match std::fs::read_to_string(cfg_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => STARTER.replace("library = \"{library}\"", &line),
+        Err(e) => return Err(e.to_string()),
+        Ok(old) => {
+            let re = regex::Regex::new(r"(?m)^[ \t]*library[ \t]*=.*$").expect("valid");
+            let top_level = old.parse::<library::Config>().is_ok_and(|c| c.contains_key("library"));
+            if top_level && re.is_match(&old) {
+                re.replace(&old, regex::NoExpand(&line)).into_owned()
+            } else {
+                format!("{line}\n{old}")
+            }
+        }
+    };
+    let parsed: library::Config = body.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    if parsed.get("library").and_then(toml::Value::as_str) != Some(dir) {
+        return Err("the config would not read back the same folder".into());
+    }
+    util::make_parent(cfg_path).map_err(|e| e.to_string())?;
+    util::write_atomic(cfg_path, body.as_bytes()).map_err(|e| e.to_string())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let code = run(args);
@@ -232,7 +303,12 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
         Some(l) => Some(l),
         None => library::cfg_str(&cfg, "library")?.filter(|s| !s.is_empty()).map(str::to_string),
     };
+    let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
     let Some(lib) = lib_setting.map(|l| util::user_path(&l)) else {
+        let asked = std::env::var_os("RESEARCHER_FIRST_USE_DONE").is_some();
+        if !(args.list || args.sync || no_popup || asked) {
+            return Ok(first_use(cfg_path));
+        }
         println!("NO LIBRARY: set `library` in {cfg_path} (or run --init, or set RESEARCHER_LIBRARY); nothing loaded");
         return Ok(6);
     };
@@ -293,6 +369,13 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
         return Ok(0);
     }
 
+    if paths.is_empty() {
+        println!(
+            "EMPTY LIBRARY: {lib} has no documents yet (.html, .md, .txt, .pdf); save or copy research into it; \
+             nothing loaded"
+        );
+        return Ok(6);
+    }
     if names.is_empty() {
         println!("NO SET: name a set, or set `default_set` in the config; known: {}", sets.order.join(", "));
         return Ok(2);
@@ -320,7 +403,6 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     }
     let secs = library::sections_for(&names, &sets, &conf, &mut texts, args.setup);
 
-    let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
     let mut picks: Option<Vec<(String, BTreeSet<String>, bool)>> = None;
     if !no_popup {
         let mut sizes = BTreeMap::new();
@@ -410,4 +492,49 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     }
     println!("total: {} docs, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_library;
+
+    fn tmp(name: &str) -> String {
+        let d = std::env::temp_dir().join(format!("researcher-unit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("config.toml").to_string_lossy().into_owned()
+    }
+
+    fn lib_of(path: &str) -> String {
+        let c: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        c["library"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn new_config_is_the_starter() {
+        let p = tmp("new");
+        set_library(&p, "/r/my \"odd\" \\ dir").unwrap();
+        assert_eq!(lib_of(&p), "/r/my \"odd\" \\ dir");
+        assert!(std::fs::read_to_string(&p).unwrap().contains("# [sets.rust]"));
+    }
+
+    #[test]
+    fn existing_config_keeps_its_comments_and_sets() {
+        let p = tmp("keep");
+        std::fs::write(&p, "# mine\ndefault_set = \"a\"\n[sets.a]\ndocs = [\"x\"]\nlibrary = \"in a table\"\n")
+            .unwrap();
+        set_library(&p, "/r").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.starts_with("library = \"/r\"\n# mine"));
+        assert!(body.contains("library = \"in a table\""));
+        assert_eq!(lib_of(&p), "/r");
+    }
+
+    #[test]
+    fn empty_library_line_is_replaced() {
+        let p = tmp("empty");
+        std::fs::write(&p, "library = \"\"\ndefault_set = \"a\"\n").unwrap();
+        set_library(&p, "/r").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "library = \"/r\"\ndefault_set = \"a\"\n");
+    }
 }

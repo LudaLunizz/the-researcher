@@ -115,6 +115,21 @@ pub fn abspath(p: &str) -> String {
     out.to_string_lossy().into_owned()
 }
 
+/// A path for people to read: the home folder shown as `~`.
+pub fn tilde(p: &str) -> String {
+    if let Some(home) = dirs::home_dir().map(|h| h.to_string_lossy().into_owned()).filter(|h| h.len() > 1) {
+        if p == home {
+            return "~".into();
+        }
+        for sep in ['/', std::path::MAIN_SEPARATOR] {
+            if let Some(rest) = p.strip_prefix(&format!("{home}{sep}")) {
+                return format!("~{sep}{rest}");
+            }
+        }
+    }
+    p.to_string()
+}
+
 /// `os.path.abspath(os.path.expanduser(p))`.
 pub fn user_path(p: &str) -> String {
     abspath(&expanduser(p))

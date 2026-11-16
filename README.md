@@ -20,7 +20,11 @@ The first picture is a set with a saved preset: the documents you ticked last ti
 
 ![Popup for a new set](docs/img/popup-new-set.png)
 
-The pictures still show the popup of the Python version (GTK 4); the Rust version shows the same parts in an egui window. Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
+The first time you load research, before a library is set, a smaller window asks where your research is: the folder that holds it, or the folder where you will make or copy it from now on. Type a path or press **Choose folder…** for the system folder dialog. A folder that does not exist yet is made. The choice is saved as `library` in `config.toml`, and the chooser opens right after.
+
+![First use: choose the research folder](docs/img/first-use.png)
+
+All pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.sh` makes them again: it opens the windows three times for about a second each, needs a display, and runs with a throwaway home folder, so none of your own files, settings or paths are touched or shown.
 
 ## The text copy
 
@@ -92,10 +96,10 @@ The original Python version, `skills/researcher/researcher.py`, still works and 
    mkdir -p ~/.claude/skills
    cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/researcher" ~/.claude/skills/researcher
 
-   researcher --init ~/research                     # writes ~/.config/researcher/config.toml
+   researcher --init ~/research                     # optional: writes ~/.config/researcher/config.toml
    ```
 
-The skill runs `researcher` when it is on your PATH, and `researcher.py` otherwise.
+The skill runs `researcher` when it is on your PATH, and `researcher.py` otherwise. You can skip `--init`: on the first load the Rust version asks for your research folder in a window and writes the config itself.
 
 Try it first on the made-up documents in [examples/library](examples/library): `researcher --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
