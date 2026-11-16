@@ -719,3 +719,47 @@ fn same_text_copies_as_python() {
         assert_eq!(rs_idx, py_idx, "the indexes differ");
     }
 }
+
+// ---------------------------------------------------------------- first use
+
+#[test]
+fn no_library_without_window_asks_nothing() {
+    // with RESEARCHER_NO_POPUP the first-use window must not open; the old message stays
+    let e = Env::new();
+    write(&e.cfg, "default_set = \"x\"\n");
+    let (code, out) = e.run(&["x"]);
+    assert_eq!(code, 6);
+    assert!(out.contains("NO LIBRARY"), "{out}");
+    assert_eq!(read(&e.cfg), "default_set = \"x\"\n"); // config untouched
+}
+
+#[test]
+fn no_display_falls_back_to_the_message() {
+    let e = Env::new();
+    write(&e.cfg, "");
+    let o = e
+        .cmd()
+        .env_remove("RESEARCHER_NO_POPUP")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .arg("--config")
+        .arg(&e.cfg)
+        .arg("rust")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(6), "{out}");
+    assert!(out.contains("NO LIBRARY") && out.contains("no window to ask"), "{out}");
+}
+
+#[test]
+fn empty_library_says_so() {
+    let e = Env::new();
+    let empty = e.tmp.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let (code, out) = e.run(&["--library", empty.to_str().unwrap(), "--no-popup", "rust"]);
+    assert_eq!(code, 6);
+    assert!(out.contains("EMPTY LIBRARY"), "{out}");
+    let (code, out) = e.run(&["--library", empty.to_str().unwrap(), "--list"]);
+    assert_eq!(code, 0, "{out}");
+}

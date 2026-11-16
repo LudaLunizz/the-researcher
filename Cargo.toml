@@ -18,7 +18,9 @@ dirs = "7"
 eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 getrandom = "0.4"
 htmlize = { version = "1.1", features = ["unescape"] }
+png = "0.18"
 regex = "1.13"
+rfd = "0.18"
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = { version = "1.2", features = ["preserve_order"] }

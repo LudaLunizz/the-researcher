@@ -16,6 +16,8 @@ Load research sets from the user's library (a folder of .html, .md, .txt and .pd
    - `researcher --list` shows the sets, their size and saved defaults. Run it when the user's wording does not match a set name.
    - `CANCELLED` or `TIMEOUT` in the output → nothing was loaded; say so in one line and stop (don't re-run unasked).
    - `NO POPUP` (no display, or for the Python version no GTK 4) → it loaded the saved defaults; mention it. `--no-popup` does the same on purpose (only when the user asks not to be asked).
+   - First use (no library set yet): a window asks for the research folder first. `LIBRARY SET: PATH` → the user chose it and it is saved in the config; the chooser follows in the same run, handle its output as usual.
+   - `EMPTY LIBRARY` → the folder has no documents yet; tell the user to save or copy research (.html, .md, .txt, .pdf) into it, and stop.
    - `NO LIBRARY` or `CONFIG ERROR` → say what the message says; the fix is in `~/.config/researcher/config.toml` (`researcher --init PATH` writes a starter).
    - A name that is not a configured set (and not `all`) is a **custom set**: the first call opens the popup with the whole library, nothing ticked; what the user ticks is saved as that set. With no display and no saved choice it prints `NO POPUP ... nothing loaded` (exit 5): say so.
    - Nothing named → the config's `default_set`. Several sets at once are fine; duplicates are loaded once. `all` is the whole library: ask before loading it.
