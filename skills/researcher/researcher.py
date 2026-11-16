@@ -8,6 +8,7 @@ Usage: researcher.py [SET ...]             popup, then write the ticked docs as 
        researcher.py --setup SET [...]     popup only, to change the saved defaults
        researcher.py --no-popup SET [...]  use the saved defaults, ask nothing
        researcher.py --list                show sets, saved defaults, library size
+       researcher.py --sync                make/refresh the plain-text copy of the whole library
        researcher.py --init [LIBRARY]      write a starter config.toml
        researcher.py --sessions | --rename ID NAME | --resume ID | --session-load ID
                                            closed-session tracking (opt-in: [sessions] in config)
@@ -15,8 +16,9 @@ Usage: researcher.py [SET ...]             popup, then write the ticked docs as 
 A "library" is a folder of documents (.html, .md, .txt, .pdf). A "set" is a named list
 of documents from it, defined in config.toml. A GTK 4 popup lets the user tick what to
 load, so no tokens are spent on documents that are not needed. The ticked documents are
-converted to plain text in a cache folder and their paths are printed, so the skill can
-Read them in full. Nothing in the library is ever changed.
+read from a plain-text copy in the researcher's own folder (made once per document, redone
+when the source changes; PDF and HTML are squeezed for tokens) and their paths are printed,
+so the skill can Read them in full. Nothing in the library is ever changed or moved.
 
 Sets:
 - defined sets: `[sets.NAME]` in config.toml with `docs` (ids or globs like "rust/*")
@@ -32,6 +34,7 @@ folder that holds an `index.html` / `index.md` counts as one document named afte
 folder. `exclude = [globs]` in config.toml leaves documents out of the library. When `x.html` and `x.pdf` both exist, the HTML one is used.
 """
 import argparse
+import atexit
 import fnmatch
 import html
 import json
@@ -71,6 +74,12 @@ def cache_home():
     return os.path.join(base, APP)
 
 
+def text_home():
+    """The researcher's own folder: a plain-text copy of every library document."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, APP, "text")
+
+
 def load_config(path):
     """config.toml as a dict; {} when the file does not exist."""
     try:
@@ -95,6 +104,10 @@ STARTER = """\
 # The Researcher: config
 # The folder that holds your research documents (.html, .md, .txt, .pdf).
 library = "{library}"
+
+# Where the plain-text copy of your library is kept (default ~/.local/share/researcher/text).
+# Your own files are only read, never changed; Claude reads these copies instead.
+# text_dir = "~/.local/share/researcher/text"
 
 # Documents to leave out of the library entirely (id globs).
 # exclude = ["scratch/*", "drafts/*"]
@@ -171,8 +184,72 @@ def html_text(raw):
     return "\n".join(line.strip() for line in t.splitlines()).strip()
 
 
+TEXT_VERSION = 1  # bump when to_text() or squeeze() changes: every stored copy is made again
+INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))  # zero-width, soft hyphen
+PAGE_NUMBER_RE = re.compile(r"(?i)^(page\s+)?\d{1,4}(\s*(/|of)\s*\d{1,4})?$")
+PAGE_WORD_RE = re.compile(r"(?i)\b(page|pagina|blz|seite|p\.)\s*\d")
+RULE_RE = re.compile(r"^[\s|_=*~.\u00b7\u2022\u2500-\u257f-]{3,}$")  # lines of only decoration
+
+
+def furniture_key(line):
+    """Page-numbered lines ("Report | page 3 of 9") match across pages; others only exactly."""
+    k = line.strip()
+    return re.sub(r"\d+", "#", k) if PAGE_WORD_RE.search(k) else k
+
+
+def drop_page_furniture(pages):
+    """Remove page numbers and headers/footers that repeat on most pages of a PDF."""
+    cands = []  # per page: indexes of the first/last three non-empty lines
+    for lines in pages:
+        idx = [i for i, ln in enumerate(lines) if ln.strip()]
+        cands.append(set(idx[:3] + idx[-3:]))
+    seen = {}
+    for lines, cand in zip(pages, cands):
+        for key in {furniture_key(lines[i]) for i in cand}:
+            seen[key] = seen.get(key, 0) + 1
+    need = max(3, int(len(pages) * 0.4))
+    out = []
+    for lines, cand in zip(pages, cands):
+        keep = []
+        for i, ln in enumerate(lines):
+            k = ln.strip()
+            if i in cand and k and (PAGE_NUMBER_RE.match(k) or seen[furniture_key(k)] >= need):
+                continue
+            keep.append(ln)
+        out.append(keep)
+    return out
+
+
+def squeeze(text, kind):
+    """Fewer tokens, same content. kind: 'pdf', 'html' or 'plain' (md/txt are only tidied)."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ").translate(INVISIBLE)
+    if kind == "pdf":
+        pages = [pg.split("\n") for pg in text.split("\f")]
+        text = "\n".join("\n".join(pg) for pg in (drop_page_furniture(pages) if len(pages) >= 3 else pages))
+    out, blank = [], True
+    for ln in text.split("\n"):
+        ln = ln.rstrip()
+        if kind != "plain":  # layout whitespace means nothing here; markdown/text may use it
+            ln = re.sub(r" {3,}", " | ", ln.strip())
+            ln = re.sub(r"[ \t]{2,}", " ", ln)
+            if RULE_RE.match(ln):
+                ln = ""
+        elif re.fullmatch(r"([-_=*~])\1{4,}", ln.strip()):
+            ln = ""
+        if not ln.strip():
+            if not blank:
+                out.append("")
+            blank = True
+            continue
+        if out and ln == out[-1]:  # an exact repeat of the line above
+            continue
+        out.append(ln)
+        blank = False
+    return "\n".join(out).strip()
+
+
 def to_text(path):
-    """Plain text of one document. Raises OSError / RuntimeError when unreadable."""
+    """Plain text of one document, squeezed. Raises OSError / RuntimeError when unreadable."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         try:
@@ -182,10 +259,12 @@ def to_text(path):
             raise RuntimeError("pdftotext not found (install poppler-utils)")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"pdftotext failed: {e.stderr.strip() or e.returncode}")
-        return r.stdout
+        return squeeze(r.stdout, "pdf")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
-    return html_text(raw) if ext in (".html", ".htm") else raw
+    if ext in (".html", ".htm"):
+        return squeeze(html_text(raw), "html")
+    return squeeze(raw, "plain")
 
 
 # ---------------------------------------------------------------- sets
@@ -228,11 +307,54 @@ def build_sets(cfg, catalog, conf, names):
     return sets, kinds
 
 
-class Texts:
-    """Lazy {doc id: plain text}. `d in texts` is False for documents that cannot be read."""
+def store_name(d):
+    return d.replace("/", " - ") + ".txt"
 
-    def __init__(self, paths):
-        self.paths, self.cache, self.errors = paths, {}, {}
+
+class Texts:
+    """Lazy {doc id: plain text}, kept as a persistent copy in the researcher's own folder.
+
+    A document is converted once and again only when its source file changed (size, mtime) or
+    TEXT_VERSION went up. The library itself is only ever read. `d in texts` is False for
+    documents that cannot be read; copies of documents that left the library stay.
+    """
+
+    def __init__(self, paths, store=None):
+        self.paths, self.store, self.cache, self.errors = paths, store, {}, {}
+        self.index, self.dirty = {}, False
+        if store:
+            try:
+                with open(os.path.join(store, ".index.json"), encoding="utf-8") as f:
+                    self.index = json.load(f)
+            except (OSError, ValueError):
+                self.index = {}
+            if not isinstance(self.index, dict):
+                self.index = {}
+
+    def _stored(self, d):
+        """Text of a fresh stored copy, or None."""
+        rec = self.index.get(d)
+        try:
+            st = os.stat(self.paths[d])
+            if (isinstance(rec, dict) and rec.get("v") == TEXT_VERSION
+                    and rec.get("src") == self.paths[d] and rec.get("size") == st.st_size
+                    and rec.get("mtime_ns") == st.st_mtime_ns):
+                with open(os.path.join(self.store, rec["file"]), encoding="utf-8") as f:
+                    return f.read().split("\n\n", 1)[1].removesuffix("\n")
+        except (OSError, KeyError, IndexError, TypeError):
+            pass
+        return None
+
+    def _save(self, d, text):
+        os.makedirs(self.store, exist_ok=True)
+        fn, st = store_name(d), os.stat(self.paths[d])
+        tmp = os.path.join(self.store, fn + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(f"SOURCE: {self.paths[d]}\n\n{text}\n")
+        os.replace(tmp, os.path.join(self.store, fn))
+        self.index[d] = {"file": fn, "src": self.paths[d], "size": st.st_size,
+                         "mtime_ns": st.st_mtime_ns, "v": TEXT_VERSION}
+        self.dirty = True
 
     def __contains__(self, d):
         if d in self.cache:
@@ -240,7 +362,12 @@ class Texts:
         if d not in self.paths or d in self.errors:
             return False
         try:
-            self.cache[d] = to_text(self.paths[d])
+            text = self._stored(d) if self.store else None
+            if text is None:
+                text = to_text(self.paths[d])
+                if self.store:
+                    self._save(d, text)
+            self.cache[d] = text
         except (OSError, RuntimeError) as e:
             self.errors[d] = str(e)
             return False
@@ -253,6 +380,21 @@ class Texts:
 
     def get(self, d, default=""):
         return self.cache[d] if d in self else default
+
+    def path(self, d):
+        """The stored .txt of a readable document."""
+        return os.path.join(self.store, self.index[d]["file"])
+
+    def flush(self):
+        if self.store and self.dirty:
+            tmp = os.path.join(self.store, ".index.json.tmp")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.index, f, indent=1, sort_keys=True)
+                os.replace(tmp, os.path.join(self.store, ".index.json"))
+            except OSError:
+                return  # the copies are still valid; the next run just checks them again
+            self.dirty = False
 
 
 def sections_for(names, sets, kinds, conf, texts, setup):
@@ -780,7 +922,10 @@ def main(argv=None):
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
     ap.add_argument("--library", help="library folder (overrides config and RESEARCHER_LIBRARY)")
-    ap.add_argument("--out", help="folder for the converted .txt files (default ~/.cache/researcher)")
+    ap.add_argument("--sync", action="store_true",
+                    help="make or refresh the plain-text copy of the whole library, load nothing")
+    ap.add_argument("--out", help="the researcher's text folder (default ~/.local/share/researcher/text, "
+                                  "or text_dir in the config); session loads go to ~/.cache/researcher")
     args = ap.parse_args(argv)
 
     cfg_path = args.config or os.path.join(config_home(), "config.toml")
@@ -817,6 +962,20 @@ def main(argv=None):
         print(f"CONFIG ERROR: {e}")
         return 6
 
+    store = os.path.abspath(os.path.expanduser(args.out or cfg.get("text_dir") or text_home()))
+
+    if args.sync:
+        texts = Texts(paths, store)
+        ok = [d for d in paths if d in texts]
+        texts.flush()
+        chars = sum(len(texts[d]) for d in ok)
+        for d in paths:
+            if d not in texts:
+                print(f"UNREADABLE  {paths[d]} ({texts.errors[d]})")
+        print(f"text copy: {len(ok)} of {len(paths)} docs in {store}, {chars} chars "
+              f"(~{chars // CHARS_PER_K}k tokens)")
+        return 0
+
     if args.list:
         print(f"library: {library} ({len(paths)} documents)")
         for n, docs in sets.items():
@@ -839,7 +998,8 @@ def main(argv=None):
         return 2
 
     alldocs = list(dict.fromkeys(d for n in names for d in sets[n]))
-    texts = Texts(paths)
+    texts = Texts(paths, store)
+    atexit.register(texts.flush)
     missing = []
     for d in alldocs:
         if d not in paths:
@@ -885,7 +1045,8 @@ def main(argv=None):
     chosen = {d for t, _ in picks.values() for d in t}
     docs = [d for d in dict.fromkeys(alldocs + [d for s in secs for d in s["main"] + s["other"]])
             if d in chosen and d in texts]
-    written = write_outputs(args.out or cache_home(), docs, texts, paths)
+    written = [texts.path(d) for d in docs]
+    texts.flush()
     total = 0
     for d, dst in zip(docs, written):
         total += len(texts[d])

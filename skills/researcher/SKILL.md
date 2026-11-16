@@ -27,7 +27,7 @@ Load research sets from the user's library (a folder of .html, .md, .txt and .pd
 Notes
 - The files are snapshots read from disk; if the user says a document was just updated elsewhere, read the live one instead.
 - A new document in the library shows up as NEW in the next popup of every set that globs it; to add it to a set by name, put its id in `config.toml`.
-- Saved choices live in `~/.config/researcher/choices.json`, converted text in `~/.cache/researcher/`.
+- Saved choices live in `~/.config/researcher/choices.json`, the plain-text copy of the library in `~/.local/share/researcher/text/` (made once per document, redone when the source changes; your own files are never touched). `researcher.py --sync` refreshes the whole copy.
 
 Sessions (optional; only when `[sessions] enabled = true` in the config, otherwise the script prints `SESSIONS OFF` and exit 7: say so and stop)
 - "list my sessions" → `python3 -I ~/.claude/skills/researcher/researcher.py --sessions` and show the lines as they are: full id and name always together, never shorten or retype an id.

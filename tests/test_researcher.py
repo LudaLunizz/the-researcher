@@ -59,6 +59,36 @@ docs = ["app/roadmap", "app/ghost"]
         return code, buf.getvalue()
 
 
+class SqueezeTests(unittest.TestCase):
+    def test_pdf_layout_padding_and_blank_runs(self):
+        raw = "Title\n\n\n\n      Indented  line  here\nName          Value          Unit\n"
+        out = R.squeeze(raw, "pdf")
+        self.assertEqual(out, "Title\n\nIndented line here\nName | Value | Unit")
+
+    def test_pdf_page_furniture_removed_content_kept(self):
+        pages = [f"Report 2026 - page {i}\nreal text {i}\nSecret Report\n" for i in range(1, 6)]
+        out = R.squeeze("\f".join(pages), "pdf")
+        self.assertNotIn("Report 2026", out)
+        self.assertNotIn("Secret Report", out)
+        for i in range(1, 6):
+            self.assertIn(f"real text {i}", out)
+
+    def test_pdf_short_document_keeps_its_header(self):
+        self.assertIn("Report", R.squeeze("Report\nbody\f\nReport\nmore\n", "pdf"))
+
+    def test_rules_and_invisible_characters_go(self):
+        out = R.squeeze("a\u200bb\u00a0c\n\u2500\u2500\u2500\u2500\n----------\nd", "html")
+        self.assertEqual(out, "ab c\n\nd")
+
+    def test_markdown_keeps_indentation_and_short_rules(self):
+        raw = "- a\n    - nested\n\n```\n  code\n```\n---\n"
+        self.assertEqual(R.squeeze(raw, "plain"), raw.strip())
+        self.assertEqual(R.squeeze("x\n==========\ny", "plain"), "x\n\ny")
+
+    def test_exact_repeat_lines_collapse(self):
+        self.assertEqual(R.squeeze("same\nsame\nother", "plain"), "same\nother")
+
+
 class ScanTests(Env):
     def test_scan_ids(self):
         ids = list(R.scan(self.lib))
@@ -193,15 +223,67 @@ class MainTests(Env):
         write(self.cfg, "library = [")
         self.assertEqual(self.run_main("--no-popup", "x")[0], 6)
 
-    def test_old_outputs_removed_but_foreign_files_kept(self):
+    def test_text_copies_persist_and_foreign_files_kept(self):
         self.run_main("--no-popup", "rust")
         keep = os.path.join(self.out, "mine.txt")
         write(keep, "mine")
         write(self.cfg, read(self.cfg).replace(
             'docs = ["rust/linux", "rust/memory-*"]', 'docs = ["rust/linux"]'))
-        self.run_main("--no-popup", "rust")
+        code, out = self.run_main("--no-popup", "rust")
+        self.assertIn("total: 1 docs", out)
         files = sorted(f for f in os.listdir(self.out) if f.endswith(".txt"))
-        self.assertEqual(files, ["mine.txt", "rust - linux.txt"])
+        self.assertEqual(files, ["mine.txt", "rust - linux.txt", "rust - memory-a.txt", "rust - memory-b.txt"])
+        self.assertEqual(read(keep), "mine")
+
+    def test_library_is_never_changed(self):
+        before = {}
+        for root, _, fs in os.walk(self.lib):
+            for fn in fs:
+                p = os.path.join(root, fn)
+                before[p] = (read(p), os.stat(p).st_mtime_ns)
+        self.run_main("--no-popup", "rust")
+        self.run_main("--sync")
+        after = {}
+        for root, _, fs in os.walk(self.lib):
+            for fn in fs:
+                p = os.path.join(root, fn)
+                after[p] = (read(p), os.stat(p).st_mtime_ns)
+        self.assertEqual(before, after)
+
+    def test_copy_reused_until_source_changes(self):
+        self.run_main("--no-popup", "rust")
+        copy = os.path.join(self.out, "rust - memory-a.txt")
+        write(copy, "SOURCE: x\n\nEDITED COPY\n")  # an unchanged source must not be converted again
+        _, out = self.run_main("--no-popup", "rust")
+        self.assertIn("EDITED COPY", read(copy))
+        write(os.path.join(self.lib, "rust", "memory-a.md"), "# A changed")
+        self.run_main("--no-popup", "rust")
+        self.assertIn("A changed", read(copy))
+        self.assertNotIn("EDITED", read(copy))
+
+    def test_copy_remade_when_converter_version_changes(self):
+        self.run_main("--no-popup", "rust")
+        copy = os.path.join(self.out, "rust - memory-a.txt")
+        write(copy, "SOURCE: x\n\nOLD FORMAT\n")
+        old, R.TEXT_VERSION = R.TEXT_VERSION, R.TEXT_VERSION + 1
+        self.addCleanup(setattr, R, "TEXT_VERSION", old)
+        self.run_main("--no-popup", "rust")
+        self.assertNotIn("OLD FORMAT", read(copy))
+
+    def test_sync_copies_whole_library_and_loads_nothing(self):
+        code, out = self.run_main("--sync")
+        self.assertEqual(code, 0, out)
+        self.assertIn("text copy: 5 of 5 docs", out)
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "web - seo.txt")))
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "app - roadmap.txt")))
+
+    def test_text_dir_in_config(self):
+        elsewhere = os.path.join(self.tmp.name, "mytext")
+        write(self.cfg, f'text_dir = "{elsewhere}"\n' + read(self.cfg))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            R.main(["--config", self.cfg, "--no-popup", "rust"])
+        self.assertTrue(os.path.isfile(os.path.join(elsewhere, "rust - linux.txt")))
 
     def test_saved_default_respected(self):
         write(os.path.join(self.conf_dir, "choices.json"), json.dumps(
