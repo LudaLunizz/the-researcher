@@ -24,7 +24,7 @@ Sets:
 
 A document id is its path inside the library without the extension (`rust/memory`). A
 folder that holds an `index.html` / `index.md` counts as one document named after the
-folder. When `x.html` and `x.pdf` both exist, the HTML one is used.
+folder. `exclude = [globs]` in config.toml leaves documents out of the library. When `x.html` and `x.pdf` both exist, the HTML one is used.
 """
 import argparse
 import fnmatch
@@ -90,6 +90,9 @@ STARTER = """\
 # The folder that holds your research documents (.html, .md, .txt, .pdf).
 library = "{library}"
 
+# Documents to leave out of the library entirely (id globs).
+# exclude = ["scratch/*", "drafts/*"]
+
 # Used when /researcher is run without a set name.
 # default_set = "main"
 
@@ -121,8 +124,8 @@ def init_config(path, library):
 
 # ---------------------------------------------------------------- the library
 
-def scan(library):
-    """{doc id: file path} for every document under `library`."""
+def scan(library, exclude=()):
+    """{doc id: file path} for every document under `library`, minus ids matching `exclude` globs."""
     found = {}  # id -> (preference, path)
 
     def offer(doc_id, path, ext):
@@ -146,7 +149,8 @@ def scan(library):
             path = os.path.join(root, fn)
             if os.path.isfile(path):
                 offer(f"{rel}/{stem}" if rel else stem, path, ext.lower())
-    return {k: v[1] for k, v in sorted(found.items())}
+    return {k: v[1] for k, v in sorted(found.items())
+            if not any(fnmatch.fnmatchcase(k, pat) for pat in exclude)}
 
 
 def html_text(raw):
@@ -535,7 +539,7 @@ def main(argv=None):
         if not os.path.isdir(library):
             print(f"NO LIBRARY: {library} is not a folder; nothing loaded")
             return 6
-        paths = scan(library)
+        paths = scan(library, cfg.get("exclude", []))
         conf = load_conf(state_path)
         names = resolve_names(args.sets, cfg)
         sets, kinds = build_sets(cfg, list(paths), conf, names)

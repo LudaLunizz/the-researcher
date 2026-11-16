@@ -64,6 +64,10 @@ class ScanTests(Env):
         ids = list(R.scan(self.lib))
         self.assertEqual(ids, ["app/roadmap", "rust/linux", "rust/memory-a", "rust/memory-b", "web/seo"])
 
+    def test_exclude_globs(self):
+        ids = list(R.scan(self.lib, ["web/*", "app/*"]))
+        self.assertEqual(ids, ["rust/linux", "rust/memory-a", "rust/memory-b"])
+
     def test_html_preferred_over_pdf(self):
         write(os.path.join(self.lib, "web", "seo.html"), "<p>h</p>")
         write(os.path.join(self.lib, "web", "seo.pdf"), "%PDF")

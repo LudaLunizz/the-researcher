@@ -8,6 +8,7 @@
 
 library = "~/research"
 default_set = "rust"
+exclude = ["scratch/*"]
 
 [aliases]
 rs = "rust"

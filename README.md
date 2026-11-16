@@ -35,6 +35,7 @@ Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](example
 ```toml
 library = "~/research"        # folder with your documents
 default_set = "rust"          # used when you name no set
+exclude = ["scratch/*"]       # ids left out of the library (globs)
 
 [aliases]
 rs = "rust"
