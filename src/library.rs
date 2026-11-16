@@ -346,17 +346,24 @@ pub fn resolve_names(argv: &[String], cfg: &Config) -> Vec<String> {
         }
         _ => BTreeMap::new(),
     };
+    // config set names keep their own case: `[sets.MyRust]` is reached by `myrust` too
+    let defined: BTreeMap<String, String> = match cfg.get("sets") {
+        Some(toml::Value::Table(t)) => t.keys().rev().map(|k| (k.to_lowercase(), k.clone())).collect(),
+        _ => BTreeMap::new(),
+    };
+    let is_set = |n: &str| matches!(cfg.get("sets"), Some(toml::Value::Table(t)) if t.contains_key(n));
+    let canon = |n: String| if is_set(&n) { n } else { defined.get(&n.to_lowercase()).cloned().unwrap_or(n) };
     let mut names: Vec<String> = argv
         .iter()
         .map(|n| {
             let low = n.to_lowercase();
-            aliases.get(&low).cloned().unwrap_or(low)
+            canon(aliases.get(&low).cloned().unwrap_or(low))
         })
         .collect();
     if names.is_empty()
         && let Some(d) = cfg.get("default_set").and_then(toml::Value::as_str).filter(|d| !d.is_empty())
     {
-        names.push(d.to_string());
+        names.push(canon(d.to_string()));
     }
     dedupe(names)
 }
@@ -460,6 +467,20 @@ mod tests {
         assert!(expand("a", &defs, &[], &[]).unwrap_err().0.contains("loop"));
         let defs: toml::Table = "[a]\ninclude=[\"zz\"]\n".parse().unwrap();
         assert!(expand("a", &defs, &[], &[]).unwrap_err().0.contains("unknown set"));
+    }
+
+    #[test]
+    fn set_names_keep_their_case() {
+        let cfg: Config =
+            "default_set = \"myrust\"\n[aliases]\nmr = \"MYRUST\"\n[sets.MyRust]\ndocs = []\n[sets.Web]\n\
+                           docs = []\n[sets.web]\ndocs = []\n"
+                .parse()
+                .unwrap();
+        let names = |a: &[&str]| resolve_names(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &cfg);
+        assert_eq!(names(&["MyRust", "mr"]), vec!["MyRust"]);
+        assert_eq!(names(&[]), vec!["MyRust"]);
+        assert_eq!(names(&["web"]), vec!["web"]); // an exact name wins
+        assert_eq!(names(&["other"]), vec!["other"]);
     }
 
     #[test]

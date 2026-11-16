@@ -404,7 +404,8 @@ fn copy_reused_until_source_changes() {
     let e = Env::new();
     e.run(&["--no-popup", "rust"]);
     let copy = e.out.join("rust - memory-a.txt");
-    write(&copy, "SOURCE: x\n\nEDITED COPY\n"); // an unchanged source must not be converted again
+    let head = read(&copy).lines().next().unwrap().to_string(); // the SOURCE line must stay
+    write(&copy, &format!("{head}\n\nEDITED COPY\n")); // an unchanged source must not be converted again
     e.run(&["--no-popup", "rust"]);
     assert!(read(&copy).contains("EDITED COPY"));
     std::thread::sleep(Duration::from_millis(20));
@@ -448,6 +449,29 @@ fn saved_default_respected() {
     let (_, out) = e.run(&["--no-popup", "rust"]);
     assert!(out.contains("total: 1 docs"), "{out}");
     assert!(out.contains("left out by choice (2)"), "{out}");
+}
+
+#[test]
+fn long_left_out_list_is_only_counted() {
+    let e = Env::new();
+    for i in 0..25 {
+        write(&e.lib.join(format!("many/d{i:02}.md")), &format!("doc {i}"));
+    }
+    write(&e.conf_dir.join("choices.json"), r#"{"mine": {"selected": ["web/seo"], "known": [], "custom": true}}"#);
+    let (code, out) = e.run(&["--no-popup", "mine"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("left out by choice (29): not named (more than 20)"), "{out}");
+    assert!(!out.contains("many/d00"), "{out}");
+}
+
+#[test]
+fn set_names_keep_their_case() {
+    let e = Env::new();
+    let cfg = read(&e.cfg);
+    write(&e.cfg, &format!("{cfg}[sets.MyRust]\ndocs = [\"rust/linux\"]\n"));
+    let (code, out) = e.run(&["--no-popup", "MyRust"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("total: 1 docs"), "{out}");
 }
 
 #[test]

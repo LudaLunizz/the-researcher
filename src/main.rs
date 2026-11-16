@@ -32,6 +32,8 @@ use text::Texts;
 use usage::CHARS_PER_K;
 
 pub const APP: &str = "researcher";
+/// Up to this many left-out documents are named in the output; more are only counted.
+const SKIPPED_NAMED: usize = 20;
 
 #[derive(Parser)]
 #[command(name = "researcher", version, about = "Load saved research documents into Claude Code.")]
@@ -487,7 +489,10 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     }
     let skipped: Vec<&str> =
         alldocs.iter().filter(|d| !chosen.contains(d) && texts.has(d)).map(String::as_str).collect();
-    if !skipped.is_empty() {
+    if skipped.len() > SKIPPED_NAMED {
+        // a custom set or `all` leaves out most of the library: naming it all costs tokens
+        println!("left out by choice ({}): not named (more than {SKIPPED_NAMED})", skipped.len());
+    } else if !skipped.is_empty() {
         println!("left out by choice ({}): {}", skipped.len(), skipped.join("; "));
     }
     println!("total: {} docs, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
