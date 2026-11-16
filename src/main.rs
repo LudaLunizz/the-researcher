@@ -79,9 +79,18 @@ struct Args {
     /// print the local usage totals (characters and estimated tokens saved)
     #[arg(long)]
     usage: bool,
-    /// write the anonymous usage records to FILE to look at and send by hand; nothing is sent
+    /// write the anonymous usage records to FILE to look at; nothing is sent
     #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "researcher-usage.json")]
     usage_export: Option<String>,
+    /// share the anonymous usage counts with the project (on) or not (off); saved in the config
+    #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+    usage_share: Option<String>,
+    /// send the usage records not sent yet (only when sharing is on)
+    #[arg(long)]
+    usage_send: bool,
+    /// with --usage-send: print what would be sent, send nothing
+    #[arg(long, requires = "usage_send")]
+    dry_run: bool,
     /// the researcher's text folder (default <data dir>/researcher/text, or text_dir in the
     /// config); session loads go to <cache dir>/researcher
     #[arg(long)]
@@ -134,9 +143,11 @@ library = "{library}"
 # docs = ["myapp/roadmap"]
 
 # A local, anonymous usage log (counts and character sums, never titles or paths) feeds
-# `researcher --usage`. Nothing is sent anywhere. Switch it off with:
+# `researcher --usage`. `share = true` (or `researcher --usage-share on`) also sends those
+# counts to the project; nothing is sent unless you set it. Switch the log off with:
 # [usage]
 # log = false
+# share = false
 "#;
 
 fn init_config(path: &str, library: &str) -> i32 {
@@ -228,6 +239,95 @@ fn set_library(cfg_path: &str, dir: &str) -> Result<(), String> {
     util::write_atomic(cfg_path, body.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// Put `share = true|false` under `[usage]` in the config (comments and everything else kept).
+fn set_share(cfg_path: &str, on: bool) -> Result<(), String> {
+    let line = format!("share = {on}");
+    let body = match std::fs::read_to_string(cfg_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("[usage]\n{line}\n"),
+        Err(e) => return Err(e.to_string()),
+        Ok(old) => {
+            let header = regex::Regex::new(r"(?m)^[ \t]*\[usage\][ \t]*(#[^\r\n]*)?\r?$").expect("valid");
+            match header.find(&old) {
+                // no [usage] table yet: a new one at the end, after a blank line
+                None if old.trim().is_empty() => format!("[usage]\n{line}\n"),
+                None => {
+                    format!("{}\n[usage]\n{line}\n", if old.ends_with('\n') { old.clone() } else { old.clone() + "\n" })
+                }
+                Some(h) => {
+                    let start = old[h.end()..].find('\n').map_or(old.len(), |i| h.end() + i + 1);
+                    let next = regex::Regex::new(r"(?m)^[ \t]*\[").expect("valid");
+                    let end = next.find(&old[start..]).map_or(old.len(), |m| start + m.start());
+                    let key = regex::Regex::new(r"(?m)^[ \t]*share[ \t]*=.*$").expect("valid");
+                    let section = &old[start..end];
+                    let section = if key.is_match(section) {
+                        key.replace(section, regex::NoExpand(&line)).into_owned()
+                    } else {
+                        format!("{line}\n{section}")
+                    };
+                    // the header can be the last line, without a newline
+                    let head = if old[..start].ends_with('\n') {
+                        old[..start].to_string()
+                    } else {
+                        format!("{}\n", &old[..start])
+                    };
+                    format!("{head}{section}{}", &old[end..])
+                }
+            }
+        }
+    };
+    let parsed: library::Config = body.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    if usage::share(&parsed) != if on { usage::Share::On } else { usage::Share::Off } {
+        return Err("the config would not read back the same answer".into());
+    }
+    util::make_parent(cfg_path).map_err(|e| e.to_string())?;
+    util::write_atomic(cfg_path, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// `--usage-send`: send the records not sent yet. Exit 9 when sharing is not on.
+fn usage_send(cfg: &toml::Table, dry_run: bool) -> i32 {
+    let share = usage::share(cfg);
+    let url = usage::url(cfg);
+    let recs = usage::pending();
+    if dry_run {
+        println!(
+            "DRY RUN: {} records would be sent to {url} (sharing: {}); nothing was sent",
+            recs.len(),
+            share.label()
+        );
+        if !recs.is_empty() {
+            println!("{}", util::json_indent1(&usage::payload(&recs)));
+        }
+        return 0;
+    }
+    if share != usage::Share::On {
+        println!("USAGE SHARING: {}; nothing sent (turn it on with: researcher --usage-share on)", share.label());
+        return 9;
+    }
+    if recs.is_empty() {
+        println!("NOTHING TO SEND: every usage record was sent already");
+        return 0;
+    }
+    match usage::send(&url, &recs) {
+        Ok(d) => {
+            let refused = if d.refused > 0 {
+                format!(", {} refused by the receiver and skipped", d.refused)
+            } else {
+                String::new()
+            };
+            println!("SENT: {} records to {url} ({} new there{refused})", d.sent, d.new);
+            0
+        }
+        Err((d, why)) => {
+            println!(
+                "SEND FAILED: {why}; {} records sent before that, {} stay queued for the next try",
+                d.sent,
+                recs.len() - d.sent - d.refused
+            );
+            1
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     let code = run(args);
@@ -239,8 +339,42 @@ fn run(args: Args) -> i32 {
     let cfg_dir = util::dirname(&cfg_path);
     let state_path = util::join(&cfg_dir, "choices.json");
 
-    if args.usage {
+    if args.usage || args.usage_send || args.usage_share.is_some() {
+        let cfg = match library::load_config(&cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("CONFIG ERROR: {e}");
+                return 6;
+            }
+        };
+        if let Some(answer) = &args.usage_share {
+            let on = answer == "on";
+            return match set_share(&cfg_path, on) {
+                Ok(()) if on => {
+                    println!(
+                        "USAGE SHARING: on (saved as `share = true` under [usage] in {cfg_path}); the anonymous \
+                         counts are sent to {} after each load. Undo: researcher --usage-share off",
+                        usage::url(&cfg)
+                    );
+                    0
+                }
+                Ok(()) => {
+                    println!(
+                        "USAGE SHARING: off (saved as `share = false` under [usage] in {cfg_path}); nothing is sent"
+                    );
+                    0
+                }
+                Err(e) => {
+                    println!("CONFIG ERROR: could not save `share` under [usage] in {cfg_path}: {e}");
+                    6
+                }
+            };
+        }
+        if args.usage_send {
+            return usage_send(&cfg, args.dry_run);
+        }
         println!("{}", usage::report(&usage::read()));
+        println!("{}", usage::share_line(usage::share(&cfg), usage::pending().len()));
         return 0;
     }
     if let Some(dst) = &args.usage_export {
@@ -472,11 +606,19 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
         .collect();
     let written: Vec<String> = docs.iter().map(|d| texts.path(d)).collect();
     texts.flush();
+    let mut share_note = None;
     if !docs.is_empty()
         && usage::enabled(&cfg)
         && let Ok(rec) = usage::record(&docs, &mut texts, &paths)
     {
         usage::log(&rec); // the log must never break a load
+        match usage::share(&cfg) {
+            usage::Share::On => usage::send_in_background(cfg_path),
+            usage::Share::Off => {}
+            usage::Share::Undecided => {
+                share_note = Some("USAGE SHARING: not decided (researcher --usage-share on|off)");
+            }
+        }
     }
     let mut total = 0;
     for (d, dst) in docs.iter().zip(&written) {
@@ -496,6 +638,9 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
         println!("left out by choice ({}): {}", skipped.len(), skipped.join("; "));
     }
     println!("total: {} docs, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
+    if let Some(note) = share_note {
+        println!("{note}");
+    }
     Ok(0)
 }
 

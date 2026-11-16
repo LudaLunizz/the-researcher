@@ -1,13 +1,16 @@
 # Usage receiver (Cloudflare Worker)
 
-The receiving end for the researcher's **opt-in, anonymous** usage counts. The app
-never sends anything today; this is the place it will send to once sending is added
-(see the issue tracker). No dependencies: plain JavaScript, a D1 database, nothing else.
+The receiving end for the researcher's **opt-in, anonymous** usage counts. The app only
+sends here after the user said yes (`researcher --usage-share on`); see "Sharing" in the
+main README. No dependencies: plain JavaScript, a D1 database, nothing else.
 
 ## What it accepts
 
-`POST /v1/usage` with `Content-Type: application/json` and exactly the file
-`researcher --usage-export` writes:
+`POST /v1/usage` with `Content-Type: application/json`. Two shapes:
+
+- **schema 2**, what `researcher --usage-send` sends: every record also has `seq`, its line
+  number in the user's log (`researcher --usage-send --dry-run` prints the exact body);
+- **schema 1**, exactly the file `researcher --usage-export` writes (no `seq`):
 
 ```json
 {"schema": 1, "loads": [
@@ -23,8 +26,9 @@ is not a 16-hex id or a plausible date, any out-of-range number, or a `fmt` that
 not add up to `docs` rejects the **whole** request and stores nothing. Free text
 (titles, paths, names) cannot get in. Limits: 200 records and 256 KB per request.
 
-A record that is sent twice is stored once (primary key = hash of its numbers), so the
-app can resend its queue safely.
+A record that is sent twice is stored once (primary key = hash of its numbers and, in
+schema 2, its `seq`), so the app can resend its queue safely, while two identical loads on
+one day (different `seq`) are two rows. Schema 1 rows hash as they always did.
 
 `GET /v1/stats` returns public totals only: installs, loads, documents, characters.
 
@@ -46,6 +50,11 @@ npx wrangler d1 create researcher-usage      # prints database_id -> put it in w
 npx wrangler d1 execute researcher-usage --remote --file schema.sql
 npx wrangler deploy                          # prints https://the-researcher-usage.<you>.workers.dev
 ```
+
+To keep your account's ids out of git, copy `wrangler.toml` to a file git ignores (for
+example `wrangler.local.toml`, listed in `.git/info/exclude`), put the id there, and add
+`--config wrangler.local.toml` to every wrangler command. An app that should send to your
+own copy gets `[usage] url = "https://.../v1/usage"` in its config.
 
 Read the numbers yourself:
 

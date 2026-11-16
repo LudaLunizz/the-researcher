@@ -1,6 +1,7 @@
 // The researcher's opt-in, anonymous usage receiver (Cloudflare Worker + D1).
 //
-//   POST /v1/usage   body = the file `researcher --usage-export` writes
+//   POST /v1/usage   body = what `researcher --usage-send` sends (schema 2), or the file
+//                    `researcher --usage-export` writes (schema 1)
 //   GET  /v1/stats   public totals: installs, loads, characters
 //
 // Nothing here reads, logs or stores an IP address, a header or a GitHub login. The

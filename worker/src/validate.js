@@ -1,14 +1,22 @@
-// Strict validation of the anonymous usage records the researcher writes
-// (`researcher --usage-export`). Only these numbers are accepted; any other key,
-// any string that is not the expected shape, and any out-of-range number makes the
-// whole request fail, so free text (titles, paths, names) can never be stored.
+// Strict validation of the anonymous usage records the researcher writes. Only these
+// numbers are accepted; any other key, any string that is not the expected shape, and any
+// out-of-range number makes the whole request fail, so free text (titles, paths, names)
+// can never be stored.
+//
+// Two request shapes:
+//   schema 1: the file `researcher --usage-export` writes (records as logged);
+//   schema 2: what `researcher --usage-send` sends: every record also has `seq`, its line
+//             number in the user's log, so two identical loads on one day are both kept.
 
-export const SCHEMA = 1;
+export const SCHEMA = 1; // record version (`v`)
+export const SCHEMAS = [1, 2]; // request versions (`schema`)
+const SEQ_MAX = 1_000_000_000;
 export const MAX_LOADS = 200; // records per request
 export const MAX_BODY = 262144; // bytes per request
 
 const KINDS = ["pdf", "html", "md", "txt"];
 const LOAD_KEYS = ["chars", "day", "docs", "fmt", "id", "lib_chars", "lib_docs", "raw", "src_bytes", "tk", "v"];
+const SEQ_KEYS = [...LOAD_KEYS, "seq"].sort();
 const COUNT_MAX = 1_000_000; // documents
 const SIZE_MAX = 10_000_000_000; // characters or bytes
 const DAY_FIRST = Date.UTC(2026, 0, 1);
@@ -28,10 +36,11 @@ function validDay(s, now) {
   return t >= DAY_FIRST && t <= now + DAY_SLACK;
 }
 
-/** One record -> error text, or null when it is fine. */
-export function recordError(rec, now = Date.now()) {
-  if (!isObject(rec) || !sameKeys(rec, LOAD_KEYS)) return "unexpected fields";
+/** One record -> error text, or null when it is fine. `withSeq`: request schema 2. */
+export function recordError(rec, now = Date.now(), withSeq = false) {
+  if (!isObject(rec) || !sameKeys(rec, withSeq ? SEQ_KEYS : LOAD_KEYS)) return "unexpected fields";
   if (rec.v !== SCHEMA) return "unsupported record version";
+  if (withSeq && (!Number.isSafeInteger(rec.seq) || rec.seq < 1 || rec.seq > SEQ_MAX)) return "bad seq";
   if (typeof rec.id !== "string" || !/^[0-9a-f]{16}$/.test(rec.id)) return "bad id";
   if (!validDay(rec.day, now)) return "bad day";
   if (!isInt(rec.docs, COUNT_MAX) || !isInt(rec.lib_docs, COUNT_MAX)) return "bad document count";
@@ -52,12 +61,13 @@ export function recordError(rec, now = Date.now()) {
 /** The request body (parsed JSON) -> {rows} or {error}. */
 export function parsePayload(body, now = Date.now()) {
   if (!isObject(body) || !sameKeys(body, ["loads", "schema"])) return { error: "unexpected fields" };
-  if (body.schema !== SCHEMA) return { error: "unsupported schema" };
+  if (!SCHEMAS.includes(body.schema)) return { error: "unsupported schema" };
+  const withSeq = body.schema === 2;
   if (!Array.isArray(body.loads) || body.loads.length === 0) return { error: "no records" };
   if (body.loads.length > MAX_LOADS) return { error: `more than ${MAX_LOADS} records` };
   const rows = [];
   for (const [i, rec] of body.loads.entries()) {
-    const err = recordError(rec, now);
+    const err = recordError(rec, now, withSeq);
     if (err) return { error: `record ${i}: ${err}` };
     rows.push({
       id: rec.id,
@@ -73,17 +83,24 @@ export function parsePayload(body, now = Date.now()) {
       lib_docs: rec.lib_docs,
       lib_chars: rec.lib_chars,
       tk: rec.tk,
+      seq: withSeq ? rec.seq : null,
     });
   }
   return { rows };
 }
 
-/** A hash of the record's numbers: sending the same record again changes nothing. */
+/**
+ * A hash of the record's numbers: sending the same record again changes nothing. With a
+ * `seq` (schema 2) it is part of the hash, so two identical loads on one day are two rows;
+ * without one (schema 1) the hash is the same as before seq existed.
+ */
 export async function rowHash(row) {
-  const text = [
+  const parts = [
     row.id, row.day, row.docs, row.pdf, row.html, row.md, row.txt,
     row.src_bytes, row.raw, row.chars, row.lib_docs, row.lib_chars, row.tk,
-  ].join("|");
+  ];
+  if (row.seq != null) parts.push(`seq${row.seq}`);
+  const text = parts.join("|");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

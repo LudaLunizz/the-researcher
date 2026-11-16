@@ -11,6 +11,8 @@ Usage: researcher.py [SET ...]             popup, then write the ticked docs as 
        researcher.py --sync                make/refresh the plain-text copy of the whole library
        researcher.py --usage               local totals: characters and tokens saved
        researcher.py --usage-export [FILE] write the anonymous usage records to a file (not sent)
+       researcher.py --usage-share on|off  share the anonymous usage counts with the project or not
+       researcher.py --usage-send [--dry-run]  send the records not sent yet (only when sharing is on)
        researcher.py --init [LIBRARY]      write a starter config.toml
        researcher.py --sessions | --rename ID NAME | --resume ID | --session-load ID
                                            closed-session tracking (opt-in: [sessions] in config)
@@ -46,6 +48,8 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 import uuid
 
 try:
@@ -134,9 +138,11 @@ library = "{library}"
 # docs = ["myapp/roadmap"]
 
 # A local, anonymous usage log (counts and character sums, never titles or paths) feeds
-# `researcher.py --usage`. Nothing is sent anywhere. Switch it off with:
+# `researcher.py --usage`. `share = true` (or `researcher.py --usage-share on`) also sends those
+# counts to the project; nothing is sent unless you set it. Switch the log off with:
 # [usage]
 # log = false
+# share = false
 """
 
 
@@ -705,10 +711,16 @@ def write_outputs(out_dir, docs, texts, paths):
 
 # ---------------------------------------------------------------- usage log (local, anonymous)
 # One line per load in ~/.local/share/researcher/usage.jsonl: counts and character sums only.
-# Never a title, path, set name or library location. Nothing is ever sent anywhere; the user
-# can look at the file, print totals (--usage) and write an export (--usage-export) to share by hand.
+# Never a title, path, set name or library location. The user can look at the file, print
+# totals (--usage) and write an export (--usage-export). Records are only sent when the user
+# said yes (`[usage] share = true`, set with --usage-share on): --usage-send sends the ones not
+# sent yet, and after a load that happens in the background.
 
 USAGE_SCHEMA = 1
+SEND_SCHEMA = 2  # the request --usage-send posts: the records plus `seq`, their log line number
+DEFAULT_URL = "https://the-researcher-usage.ludalunizz.workers.dev/v1/usage"  # worker/ in the repo
+SEND_BATCH = 200  # records per request (the receiver takes up to 200)
+SEND_TIMEOUT = 15  # seconds
 USAGE_KINDS = ("pdf", "html", "md", "txt")
 
 
@@ -721,9 +733,36 @@ def usage_file():
     return os.path.join(data_home(), "usage.jsonl")
 
 
-def usage_enabled(cfg):
+def sent_file():
+    return os.path.join(data_home(), "usage-sent")
+
+
+def write_atomic(path, text):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:  # line endings exactly as given
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def usage_section(cfg):
     sec = cfg.get("usage")
-    return not (isinstance(sec, dict) and sec.get("log") is False)
+    return sec if isinstance(sec, dict) else {}
+
+
+def usage_enabled(cfg):
+    return usage_section(cfg).get("log") is not False
+
+
+def usage_share(cfg):
+    """The user's answer to "share the anonymous usage counts?": "on", "off" or "not decided"."""
+    val = usage_section(cfg).get("share")
+    return "on" if val is True else "off" if val is False else "not decided"
+
+
+def usage_url(cfg):
+    """Where records are sent: `[usage] url`, or the project's receiver."""
+    val = usage_section(cfg).get("url")
+    return val if isinstance(val, str) and val else DEFAULT_URL
 
 
 def install_id():
@@ -826,8 +865,188 @@ def usage_report(recs):
     ])
 
 
+def usage_pending():
+    """The records not sent yet, oldest first, each with `seq` = its line number in the log. The
+    line number tells two identical loads on one day apart, and it stays the same when a record
+    is sent again, so a resend is stored once."""
+    try:
+        with open(usage_file(), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return []
+    if lines and lines[-1] == "":
+        lines.pop()  # the newline after the last record
+    try:
+        with open(sent_file(), encoding="utf-8") as f:
+            done = int(f.read().strip())
+    except (OSError, ValueError):
+        done = 0
+    if not 0 <= done <= len(lines):
+        done = 0  # the log was deleted or cut: start again
+    out = []
+    for i, line in enumerate(lines[done:], done + 1):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("v") == USAGE_SCHEMA:
+            rec["seq"] = i
+            out.append(rec)
+    return out
+
+
+def usage_payload(recs):
+    """The body --usage-send posts for these records."""
+    return {"schema": SEND_SCHEMA, "loads": recs}
+
+
+def post_json(url, body):
+    """One POST: (HTTP status, body text). OSError when there was no answer."""
+    req = urllib.request.Request(url, data=json.dumps(body, sort_keys=True).encode("utf-8"),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "the-researcher (python)"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=SEND_TIMEOUT) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "replace")
+        finally:
+            e.close()
+    except (urllib.error.URLError, ValueError) as e:
+        raise OSError(str(getattr(e, "reason", e)))
+
+
+def usage_send(url, recs):
+    """Send in batches -> (done, error or None); done = {"sent", "new", "refused"}. After each
+    batch the sent marker moves on, so a later failure never sends the earlier ones twice (and
+    if it did, the receiver stores them once). A record the receiver refuses is skipped, so one
+    bad line can never block the rest."""
+    done = {"sent": 0, "new": 0, "refused": 0}
+    for start in range(0, len(recs), SEND_BATCH):
+        batch = recs[start:start + SEND_BATCH]
+        left = list(batch)
+        while left:
+            try:
+                status, text = post_json(url, usage_payload(left))
+            except OSError as e:
+                return done, str(e)
+            try:
+                reply = json.loads(text)
+            except ValueError:
+                reply = None
+            reply = reply if isinstance(reply, dict) else {}
+            if status == 200 and reply.get("ok") is True:
+                done["sent"] += len(left)
+                new = reply.get("new")
+                done["new"] += new if isinstance(new, int) and new >= 0 else 0
+                break
+            err = reply.get("error") if isinstance(reply.get("error"), str) else ""
+            m = re.match(r"record (\d+):", err)
+            if status == 400 and m and int(m.group(1)) < len(left):
+                # the receiver names the one record it refused: skip it, send the rest
+                del left[int(m.group(1))]
+                done["refused"] += 1
+                continue
+            return done, f"HTTP {status}: {err or text.strip()[:200]}"
+        try:
+            os.makedirs(data_home(), exist_ok=True)
+            write_atomic(sent_file(), f"{batch[-1]['seq']}\n")
+        except OSError:
+            pass
+    return done, None
+
+
+def send_in_background(cfg_path):
+    """Start --usage-send on its own and return at once: a load never waits on the network,
+    and the sender outlives the load (its own session on POSIX)."""
+    kw = {"start_new_session": True} if os.name == "posix" else {}
+    try:
+        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__), "--usage-send",
+                          "--config", os.path.abspath(cfg_path)], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except OSError:
+        pass
+
+
+def share_line(share, waiting):
+    """The last line of --usage: is anything sent, and how much is waiting."""
+    if share == "on":
+        return (f"sharing: on, {waiting} records waiting to be sent "
+                "(researcher --usage-send sends them now)")
+    return f"sharing: {share}, nothing is sent (researcher --usage-share on|off)"
+
+
+def set_share(cfg_path, on):
+    """Put `share = true|false` under [usage] in the config (comments and the rest kept)."""
+    line = f"share = {'true' if on else 'false'}"
+    try:
+        with open(cfg_path, encoding="utf-8", newline="") as f:  # keep the file's line endings
+            old = f.read()
+    except FileNotFoundError:
+        old = None
+    if old is None:
+        body = f"[usage]\n{line}\n"
+    else:
+        h = re.search(r"(?m)^[ \t]*\[usage\][ \t]*(#[^\r\n]*)?\r?$", old)
+        if not h and not old.strip():
+            body = f"[usage]\n{line}\n"
+        elif not h:  # no [usage] table yet: a new one at the end, after a blank line
+            body = (old if old.endswith("\n") else old + "\n") + f"\n[usage]\n{line}\n"
+        else:
+            nl = old.find("\n", h.end())
+            start = len(old) if nl < 0 else nl + 1
+            nxt = re.search(r"(?m)^[ \t]*\[", old[start:])
+            end = start + nxt.start() if nxt else len(old)
+            section = old[start:end]
+            key = re.compile(r"(?m)^[ \t]*share[ \t]*=.*$")
+            if key.search(section):
+                section = key.sub(lambda _: line, section, count=1)
+            else:
+                section = f"{line}\n{section}"
+            head = old[:start] if old[:start].endswith("\n") else old[:start] + "\n"
+            body = head + section + old[end:]
+    if tomllib is None:
+        raise ConfigError("Python 3.11 or newer is needed to read config.toml")
+    try:
+        parsed = tomllib.loads(body)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(str(e))
+    if usage_share(parsed) != ("on" if on else "off"):
+        raise ConfigError("the config would not read back the same answer")
+    os.makedirs(os.path.dirname(os.path.abspath(cfg_path)), exist_ok=True)
+    write_atomic(cfg_path, body)
+
+
+def usage_send_main(cfg, dry_run):
+    """--usage-send: send the records not sent yet. Exit 9 when sharing is not on."""
+    share, url, recs = usage_share(cfg), usage_url(cfg), usage_pending()
+    if dry_run:
+        print(f"DRY RUN: {len(recs)} records would be sent to {url} (sharing: {share}); "
+              "nothing was sent")
+        if recs:
+            print(json.dumps(usage_payload(recs), indent=1, sort_keys=True))
+        return 0
+    if share != "on":
+        print(f"USAGE SHARING: {share}; nothing sent (turn it on with: researcher --usage-share on)")
+        return 9
+    if not recs:
+        print("NOTHING TO SEND: every usage record was sent already")
+        return 0
+    done, err = usage_send(url, recs)
+    if err is None:
+        refused = (f", {done['refused']} refused by the receiver and skipped"
+                   if done["refused"] else "")
+        print(f"SENT: {done['sent']} records to {url} ({done['new']} new there{refused})")
+        return 0
+    print(f"SEND FAILED: {err}; {done['sent']} records sent before that, "
+          f"{len(recs) - done['sent'] - done['refused']} stay queued for the next try")
+    return 1
+
+
 def usage_export(path):
-    """Write the records as one JSON file to look at and send by hand."""
+    """Write the records as one JSON file to look at."""
     recs = read_usage()
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"schema": USAGE_SCHEMA, "loads": recs}, f, indent=1, sort_keys=True)
@@ -1109,16 +1328,48 @@ def main(argv=None):
                     help="print the local usage totals (characters and estimated tokens saved)")
     ap.add_argument("--usage-export", nargs="?", const="researcher-usage.json", metavar="FILE",
                     help="write the anonymous usage records to FILE (default researcher-usage.json) "
-                         "to look at and send by hand; nothing is sent")
+                         "to look at; nothing is sent")
+    ap.add_argument("--usage-share", choices=("on", "off"),
+                    help="share the anonymous usage counts with the project (on) or not (off); "
+                         "saved in the config")
+    ap.add_argument("--usage-send", action="store_true",
+                    help="send the usage records not sent yet (only when sharing is on)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --usage-send: print what would be sent, send nothing")
     ap.add_argument("--out", help="the researcher's text folder (default ~/.local/share/researcher/text, "
                                   "or text_dir in the config); session loads go to ~/.cache/researcher")
     args = ap.parse_args(argv)
+    if args.dry_run and not args.usage_send:
+        ap.error("--dry-run goes with --usage-send")
 
     cfg_path = args.config or os.path.join(config_home(), "config.toml")
     state_path = os.path.join(os.path.dirname(cfg_path), "choices.json")
 
-    if args.usage:
+    if args.usage or args.usage_send or args.usage_share:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as e:
+            print(f"CONFIG ERROR: {e}")
+            return 6
+        if args.usage_share:
+            on = args.usage_share == "on"
+            try:
+                set_share(cfg_path, on)
+            except (ConfigError, OSError) as e:
+                print(f"CONFIG ERROR: could not save `share` under [usage] in {cfg_path}: {e}")
+                return 6
+            if on:
+                print(f"USAGE SHARING: on (saved as `share = true` under [usage] in {cfg_path}); "
+                      f"the anonymous counts are sent to {usage_url(cfg)} after each load. "
+                      "Undo: researcher --usage-share off")
+            else:
+                print(f"USAGE SHARING: off (saved as `share = false` under [usage] in {cfg_path}); "
+                      "nothing is sent")
+            return 0
+        if args.usage_send:
+            return usage_send_main(cfg, args.dry_run)
         print(usage_report(read_usage()))
+        print(share_line(usage_share(cfg), len(usage_pending())))
         return 0
     if args.usage_export:
         n = usage_export(args.usage_export)
@@ -1244,11 +1495,18 @@ def main(argv=None):
             if d in chosen and d in texts]
     written = [texts.path(d) for d in docs]
     texts.flush()
+    share_note = None
     if docs and usage_enabled(cfg):
         try:  # the log must never break a load
             log_usage(usage_record(docs, texts, paths))
         except OSError:
             pass
+        else:
+            share = usage_share(cfg)
+            if share == "on":
+                send_in_background(cfg_path)
+            elif share == "not decided":
+                share_note = "USAGE SHARING: not decided (researcher --usage-share on|off)"
     total = 0
     for d, dst in zip(docs, written):
         total += len(texts[d])
@@ -1261,6 +1519,8 @@ def main(argv=None):
     elif skipped:
         print(f"left out by choice ({len(skipped)}): " + "; ".join(skipped))
     print(f"total: {len(docs)} docs, {total} chars (~{total // CHARS_PER_K}k tokens)")
+    if share_note:
+        print(share_note)
     return 0
 
 

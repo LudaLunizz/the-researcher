@@ -206,6 +206,209 @@ fn bad_usage_lines_skipped() {
     assert!(e.run(&["--usage"]).1.contains("1 loads on 1 days"));
 }
 
+// ---------------------------------------------------------------- sharing (opt-in sending)
+
+/// A one-off local receiver: answers each request with the next (status, body) and hands the
+/// request bodies back. Tests never reach the real receiver.
+fn receiver(replies: Vec<(u16, &'static str)>) -> (String, std::sync::mpsc::Receiver<Value>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/usage", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for (status, body) in replies {
+            let Ok((mut s, _)) = listener.accept() else { return };
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut len = 0;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+            }
+            let mut buf = vec![0; len];
+            r.read_exact(&mut buf).unwrap();
+            let _ = tx.send(serde_json::from_slice(&buf).unwrap_or(Value::Null));
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(reply.as_bytes()).unwrap();
+        }
+    });
+    (url, rx)
+}
+
+const REC: &str = r#"{"chars":5,"day":"2026-11-16","docs":1,"fmt":{"html":0,"md":1,"pdf":0,"txt":0},"id":"0123456789abcdef","lib_chars":9,"lib_docs":2,"raw":5,"src_bytes":5,"tk":2400,"v":1}"#;
+
+impl Env {
+    fn share_on(&self, url: &str) {
+        self.append_cfg(&format!("\n[usage]\nshare = true\nurl = \"{url}\"\n"));
+    }
+
+    fn log_lines(&self, n: usize) {
+        write(&self.usage_file(), &format!("{REC}\n").repeat(n));
+    }
+
+    fn sent_marker(&self) -> Option<String> {
+        fs::read_to_string(self.data.join("researcher/usage-sent")).ok()
+    }
+}
+
+fn seqs(body: &Value) -> Vec<u64> {
+    body["loads"].as_array().unwrap().iter().map(|r| r["seq"].as_u64().unwrap()).collect()
+}
+
+#[test]
+fn nothing_is_sent_until_the_user_says_yes() {
+    let e = Env::new();
+    let (code, out) = e.run(&["--no-popup", "rust"]);
+    assert_eq!(code, 0);
+    assert!(out.trim_end().ends_with("USAGE SHARING: not decided (researcher --usage-share on|off)"), "{out}");
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!(code, 9, "{out}");
+    assert!(out.contains("not decided; nothing sent"), "{out}");
+    assert!(e.run(&["--usage"]).1.contains("sharing: not decided, nothing is sent"));
+    assert!(e.sent_marker().is_none());
+
+    e.run(&["--usage-share", "off"]);
+    let (code, out) = e.run(&["--no-popup", "rust"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("USAGE SHARING"), "{out}");
+    assert_eq!(e.run(&["--usage-send"]).0, 9);
+}
+
+#[test]
+fn usage_share_writes_one_line_and_keeps_the_rest() {
+    let e = Env::new();
+    e.append_cfg("# my note\n[usage] # counts\nlog = true\n[sets.web]\ndocs = [\"web/*\"]\n");
+    let (code, out) = e.run(&["--usage-share", "on"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("USAGE SHARING: on"), "{out}");
+    let body = read(&e.cfg);
+    assert!(body.contains("# my note\n[usage] # counts\nshare = true\nlog = true\n[sets.web]"), "{body}");
+    e.run(&["--usage-share", "off"]);
+    let body = read(&e.cfg);
+    assert_eq!(body.matches("share =").count(), 1, "{body}");
+    assert!(body.contains("share = false\nlog = true\n"), "{body}");
+    assert_eq!(e.run(&["--list"]).0, 0); // the config still reads, sets and all
+
+    let fresh = e.tmp.join("none/config.toml");
+    let o = e.cmd().arg("--config").arg(&fresh).args(["--usage-share", "on"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(read(&fresh), "[usage]\nshare = true\n");
+}
+
+#[test]
+fn dry_run_prints_the_exact_request_and_sends_nothing() {
+    let e = Env::new();
+    e.run(&["--no-popup", "rust"]);
+    e.run(&["--no-popup", "rust"]); // the same load twice: two records with their own seq
+    let (code, out) = e.run(&["--usage-send", "--dry-run"]);
+    assert_eq!(code, 0, "{out}");
+    let (first, json) = out.split_once('\n').unwrap();
+    assert!(first.starts_with("DRY RUN: 2 records would be sent to https://"), "{first}");
+    assert!(first.contains("(sharing: not decided); nothing was sent"), "{first}");
+    let body: Value = serde_json::from_str(json).unwrap();
+    assert_eq!(body["schema"], 2);
+    assert_eq!(seqs(&body), [1, 2]);
+    let mut a = body["loads"][0].clone();
+    a["seq"] = Value::Null;
+    let mut b = body["loads"][1].clone();
+    b["seq"] = Value::Null;
+    assert_eq!(a, b);
+    assert!(e.sent_marker().is_none());
+}
+
+#[test]
+fn send_posts_only_what_is_new() {
+    let e = Env::new();
+    let ok = r#"{"ok":true,"received":3,"new":3}"#;
+    let (url, got) = receiver(vec![(200, ok), (200, r#"{"ok":true,"received":1,"new":1}"#)]);
+    e.share_on(&url);
+    e.log_lines(3);
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with(&format!("SENT: 3 records to {url} (3 new there)")), "{out}");
+    let body = got.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(body["schema"], 2);
+    assert_eq!(seqs(&body), [1, 2, 3]);
+    assert_eq!(e.sent_marker().as_deref(), Some("3\n"));
+
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!((code, out.trim()), (0, "NOTHING TO SEND: every usage record was sent already"));
+    write(&e.usage_file(), &(read(&e.usage_file()) + "not json\n" + REC + "\n"));
+    assert!(e.run(&["--usage"]).1.contains("sharing: on, 1 records waiting"));
+    assert_eq!(e.run(&["--usage-send"]).0, 0);
+    assert_eq!(seqs(&got.recv_timeout(Duration::from_secs(5)).unwrap()), [5]);
+    assert_eq!(e.sent_marker().as_deref(), Some("5\n"));
+}
+
+#[test]
+fn a_refused_record_is_skipped_not_stuck() {
+    let e = Env::new();
+    let (url, got) = receiver(vec![
+        (400, r#"{"ok":false,"error":"record 1: bad day"}"#),
+        (200, r#"{"ok":true,"received":2,"new":2}"#),
+    ]);
+    e.share_on(&url);
+    e.log_lines(3);
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("SENT: 2 records") && out.contains("1 refused by the receiver and skipped"), "{out}");
+    assert_eq!(seqs(&got.recv_timeout(Duration::from_secs(5)).unwrap()), [1, 2, 3]);
+    assert_eq!(seqs(&got.recv_timeout(Duration::from_secs(5)).unwrap()), [1, 3]);
+    assert_eq!(e.sent_marker().as_deref(), Some("3\n"));
+}
+
+#[test]
+fn a_failed_send_keeps_the_queue() {
+    let e = Env::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    e.share_on(&format!("http://127.0.0.1:{port}/v1/usage")); // nothing listens there
+    e.log_lines(2);
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.starts_with("SEND FAILED: ") && out.contains("0 records sent before that, 2 stay queued"), "{out}");
+    assert!(e.sent_marker().is_none());
+
+    let (url, _got) = receiver(vec![(500, "oops")]);
+    write(
+        &e.cfg,
+        &read(&e.cfg)
+            .replace(&format!("127.0.0.1:{port}"), url.trim_start_matches("http://").trim_end_matches("/v1/usage")),
+    );
+    let (code, out) = e.run(&["--usage-send"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("HTTP 500: oops"), "{out}");
+    assert!(e.sent_marker().is_none());
+}
+
+#[test]
+fn a_cut_log_starts_counting_again() {
+    let e = Env::new();
+    e.log_lines(2);
+    write(&e.data.join("researcher/usage-sent"), "10\n");
+    let (_, out) = e.run(&["--usage-send", "--dry-run"]);
+    assert!(out.starts_with("DRY RUN: 2 records"), "{out}");
+}
+
+#[test]
+fn a_load_sends_in_the_background_when_sharing_is_on() {
+    let e = Env::new();
+    let (url, got) = receiver(vec![(200, r#"{"ok":true,"received":1,"new":1}"#)]);
+    e.share_on(&url);
+    let (code, out) = e.run(&["--no-popup", "rust"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("USAGE SHARING"), "{out}");
+    let body = got.recv_timeout(Duration::from_secs(20)).expect("the background send arrives");
+    assert_eq!(seqs(&body), [1]);
+    assert_eq!(body["loads"][0]["docs"], 3);
+}
+
 // ---------------------------------------------------------------- library, sets, main flow
 
 #[test]
@@ -742,6 +945,60 @@ fn same_text_copies_as_python() {
         let py_idx: Value = serde_json::from_str(&read(&py_out.join(".index.json"))).unwrap();
         assert_eq!(rs_idx, py_idx, "the indexes differ");
     }
+}
+
+/// `--usage-share` edits the user's config by hand-written text rules: both versions must
+/// write the same file, and the same dry-run request.
+#[test]
+fn same_config_edits_and_requests_as_python() {
+    let py = repo().join("skills/researcher/researcher.py");
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("python3 not found: parity check skipped");
+        return;
+    }
+    let e = Env::new();
+    let cases = [
+        "",
+        "library = \"/r\"",
+        "library = \"/r\"\n",
+        "library = \"/r\"\n[usage]",
+        "[usage] # mine\r\nlog = true\r\n[sets.a]\r\ndocs = [\"x\"]\r\n",
+        "# [usage]\n# share = true\n[aliases]\na = \"b\"\n",
+        "[usage]\nshare = false # old\nurl = \"http://x\"\n\n[sets.share]\ndocs = []\n",
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        for answer in ["on", "off"] {
+            let (rs, pyc) = (e.tmp.join(format!("rs{i}{answer}.toml")), e.tmp.join(format!("py{i}{answer}.toml")));
+            write(&rs, case);
+            write(&pyc, case);
+            let a = e.cmd().arg("--config").arg(&rs).args(["--usage-share", answer]).output().unwrap();
+            let b = Command::new("python3")
+                .arg("-I")
+                .arg(&py)
+                .arg("--config")
+                .arg(&pyc)
+                .args(["--usage-share", answer])
+                .env("XDG_DATA_HOME", &e.data)
+                .output()
+                .unwrap();
+            assert_eq!(a.status.code(), Some(0), "case {i}: {}", String::from_utf8_lossy(&a.stdout));
+            assert_eq!(b.status.code(), Some(0), "case {i}: {}", String::from_utf8_lossy(&b.stdout));
+            assert_eq!(read(&rs), read(&pyc), "case {i} {answer}: the configs differ");
+        }
+    }
+
+    write(&e.usage_file(), &format!("{REC}\nnot json\n{REC}\n"));
+    let a = e.run(&["--usage-send", "--dry-run"]).1;
+    let b = Command::new("python3")
+        .arg("-I")
+        .arg(&py)
+        .arg("--config")
+        .arg(&e.cfg)
+        .args(["--usage-send", "--dry-run"])
+        .env("XDG_DATA_HOME", &e.data)
+        .output()
+        .unwrap();
+    assert_eq!(a, String::from_utf8_lossy(&b.stdout), "the dry runs differ");
 }
 
 // ---------------------------------------------------------------- first use

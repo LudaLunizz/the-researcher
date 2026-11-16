@@ -166,6 +166,172 @@ class UsageTests(Env):
         self.assertEqual(len(R.read_usage()), 1)
 
 
+REC = ('{"chars": 5, "day": "2026-11-16", "docs": 1, "fmt": {"html": 0, "md": 1, "pdf": 0, "txt": 0}, '
+       '"id": "0123456789abcdef", "lib_chars": 9, "lib_docs": 2, "raw": 5, "src_bytes": 5, "tk": 2400, "v": 1}')
+
+
+def receiver(replies):
+    """A one-off local receiver: answers each request with the next (status, body) and puts the
+    request bodies in a queue. Tests never reach the real receiver."""
+    import http.server
+    import queue
+    import threading
+    got, todo = queue.Queue(), list(replies)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            got.put(json.loads(body))
+            status, text = todo.pop(0)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(text)))
+            self.end_headers()
+            self.wfile.write(text.encode())
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}/v1/usage", got, srv
+
+
+class SharingTests(Env):
+    def share_on(self, url):
+        write(self.cfg, read(self.cfg) + f'\n[usage]\nshare = true\nurl = "{url}"\n')
+
+    def log_lines(self, n):
+        write(R.usage_file(), (REC + "\n") * n)
+
+    def marker(self):
+        path = os.path.join(self.data, "researcher", "usage-sent")
+        return read(path) if os.path.exists(path) else None
+
+    def serve(self, replies):
+        url, got, srv = receiver(replies)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return url, got
+
+    @staticmethod
+    def seqs(body):
+        return [r["seq"] for r in body["loads"]]
+
+    def test_nothing_is_sent_until_the_user_says_yes(self):
+        code, out = self.run_main("--no-popup", "rust")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.rstrip().endswith(
+            "USAGE SHARING: not decided (researcher --usage-share on|off)"), out)
+        code, out = self.run_main("--usage-send")
+        self.assertEqual(code, 9)
+        self.assertIn("not decided; nothing sent", out)
+        self.assertIn("sharing: not decided, nothing is sent", self.run_main("--usage")[1])
+        self.assertIsNone(self.marker())
+        self.run_main("--usage-share", "off")
+        code, out = self.run_main("--no-popup", "rust")
+        self.assertNotIn("USAGE SHARING", out)
+        self.assertEqual(self.run_main("--usage-send")[0], 9)
+
+    def test_usage_share_writes_one_line_and_keeps_the_rest(self):
+        write(self.cfg, read(self.cfg) + '# my note\n[usage] # counts\nlog = true\n[sets.web]\ndocs = ["web/*"]\n')
+        code, out = self.run_main("--usage-share", "on")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.startswith("USAGE SHARING: on"), out)
+        self.assertIn("# my note\n[usage] # counts\nshare = true\nlog = true\n[sets.web]", read(self.cfg))
+        self.run_main("--usage-share", "off")
+        body = read(self.cfg)
+        self.assertEqual(body.count("share ="), 1)
+        self.assertIn("share = false\nlog = true\n", body)
+        self.assertEqual(self.run_main("--list")[0], 0)
+        fresh = os.path.join(self.tmp.name, "none", "config.toml")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(R.main(["--config", fresh, "--usage-share", "on"]), 0)
+        self.assertEqual(read(fresh), "[usage]\nshare = true\n")
+
+    def test_dry_run_prints_the_exact_request_and_sends_nothing(self):
+        self.run_main("--no-popup", "rust")
+        self.run_main("--no-popup", "rust")  # the same load twice: two records, their own seq
+        code, out = self.run_main("--usage-send", "--dry-run")
+        self.assertEqual(code, 0)
+        first, body = out.split("\n", 1)
+        self.assertTrue(first.startswith("DRY RUN: 2 records would be sent to https://"), first)
+        self.assertIn("(sharing: not decided); nothing was sent", first)
+        body = json.loads(body)
+        self.assertEqual(body["schema"], 2)
+        self.assertEqual(self.seqs(body), [1, 2])
+        a, b = ({k: v for k, v in r.items() if k != "seq"} for r in body["loads"])
+        self.assertEqual(a, b)
+        self.assertIsNone(self.marker())
+
+    def test_send_posts_only_what_is_new(self):
+        url, got = self.serve([(200, '{"ok":true,"received":3,"new":3}'),
+                               (200, '{"ok":true,"received":1,"new":1}')])
+        self.share_on(url)
+        self.log_lines(3)
+        code, out = self.run_main("--usage-send")
+        self.assertEqual(code, 0, out)
+        self.assertTrue(out.startswith(f"SENT: 3 records to {url} (3 new there)"), out)
+        body = got.get(timeout=5)
+        self.assertEqual(body["schema"], 2)
+        self.assertEqual(self.seqs(body), [1, 2, 3])
+        self.assertEqual(self.marker(), "3\n")
+        self.assertEqual(self.run_main("--usage-send"),
+                         (0, "NOTHING TO SEND: every usage record was sent already\n"))
+        write(R.usage_file(), read(R.usage_file()) + "not json\n" + REC + "\n")
+        self.assertIn("sharing: on, 1 records waiting", self.run_main("--usage")[1])
+        self.assertEqual(self.run_main("--usage-send")[0], 0)
+        self.assertEqual(self.seqs(got.get(timeout=5)), [5])
+        self.assertEqual(self.marker(), "5\n")
+
+    def test_a_refused_record_is_skipped_not_stuck(self):
+        url, got = self.serve([(400, '{"ok":false,"error":"record 1: bad day"}'),
+                               (200, '{"ok":true,"received":2,"new":2}')])
+        self.share_on(url)
+        self.log_lines(3)
+        code, out = self.run_main("--usage-send")
+        self.assertEqual(code, 0, out)
+        self.assertIn("SENT: 2 records", out)
+        self.assertIn("1 refused by the receiver and skipped", out)
+        self.assertEqual(self.seqs(got.get(timeout=5)), [1, 2, 3])
+        self.assertEqual(self.seqs(got.get(timeout=5)), [1, 3])
+        self.assertEqual(self.marker(), "3\n")
+
+    def test_a_failed_send_keeps_the_queue(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self.share_on(f"http://127.0.0.1:{port}/v1/usage")  # nothing listens there
+        self.log_lines(2)
+        code, out = self.run_main("--usage-send")
+        self.assertEqual(code, 1, out)
+        self.assertTrue(out.startswith("SEND FAILED: "), out)
+        self.assertIn("0 records sent before that, 2 stay queued", out)
+        self.assertIsNone(self.marker())
+        url, _ = self.serve([(500, "oops")])
+        write(self.cfg, read(self.cfg).replace(f"http://127.0.0.1:{port}/v1/usage", url))
+        code, out = self.run_main("--usage-send")
+        self.assertEqual(code, 1, out)
+        self.assertIn("HTTP 500: oops", out)
+        self.assertIsNone(self.marker())
+
+    def test_a_cut_log_starts_counting_again(self):
+        self.log_lines(2)
+        write(os.path.join(self.data, "researcher", "usage-sent"), "10\n")
+        self.assertTrue(self.run_main("--usage-send", "--dry-run")[1].startswith("DRY RUN: 2 records"))
+
+    def test_a_load_sends_in_the_background_when_sharing_is_on(self):
+        url, got = self.serve([(200, '{"ok":true,"received":1,"new":1}')])
+        self.share_on(url)
+        code, out = self.run_main("--no-popup", "rust")
+        self.assertEqual(code, 0)
+        self.assertNotIn("USAGE SHARING", out)
+        body = got.get(timeout=20)
+        self.assertEqual(self.seqs(body), [1])
+        self.assertEqual(body["loads"][0]["docs"], 3)
+
+
 class ScanTests(Env):
     def test_scan_ids(self):
         ids = list(R.scan(self.lib))

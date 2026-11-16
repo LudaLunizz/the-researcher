@@ -38,20 +38,36 @@ Every document of your library gets one plain-text file in the researcher's own 
 
 ## Usage log
 
-After every load the researcher appends one line to `~/.local/share/researcher/usage.jsonl`, so you can see what it saves on **your** library. It is local and anonymous, and **nothing is sent anywhere**.
+After every load the researcher appends one line to `~/.local/share/researcher/usage.jsonl`, so you can see what it saves on **your** library. It is local and anonymous, and **nothing is sent unless you say yes** (see Sharing below).
 
 What a line holds, and nothing else: the day, a random install id (`usage-id` next to the log; delete it to start a new one), how many documents were loaded and in which formats (pdf, html, md, txt), and character sums: source bytes, converted text before and after squeezing, and the whole library after squeezing. It never holds a title, a path, a set name or where your library is. The log is plain JSON lines; read it before you share anything.
 
 ```
 researcher --usage                 totals: characters loaded, squeezed away, left unticked, with estimated tokens
-researcher --usage-export [FILE]   write the records to FILE (default researcher-usage.json) so you can look at them and send them by hand
+researcher --usage-export [FILE]   write the records to FILE (default researcher-usage.json) so you can look at them
 ```
 
 - **Squeezed away** is real: converted text before minus after the squeeze, for the documents you loaded.
 - **Left unticked** compares each load with loading your whole library; it is a ceiling, not a measurement, because nobody would load everything.
 - Tokens are estimated from characters (2.4 per token, see below), not counted by a tokenizer.
 - Switch the log off with `[usage]` `log = false` in `config.toml`; then no log and no install id are written.
-- Sharing the numbers is a separate choice and is **off**. There is no upload in the tool; the export is a file you send yourself, if you want to.
+
+### Sharing (opt-in)
+
+You can send the same anonymous lines to the project, so it can see what the researcher saves across installs. It is **off until you say yes**: while you have not decided, a load ends with `USAGE SHARING: not decided` and the skill asks you once.
+
+```
+researcher --usage-share on        send the lines (saved as `share = true` under [usage] in config.toml)
+researcher --usage-share off       never send (`share = false`)
+researcher --usage-send --dry-run  print exactly what would be sent, send nothing
+researcher --usage-send            send the lines not sent yet, now
+```
+
+- With sharing on, each load starts a sender in the background: the load never waits on the network, and a failed send is tried again after the next load.
+- What is sent is the log lines as they are, plus `seq`: the line's number in your log, so two identical loads on one day both count and a line sent twice is stored once. Nothing else: no title, path, set name, library location, GitHub login or account. The receiver ([`worker/`](worker/)) refuses any other field and keeps no IP address, headers or request logs (Cloudflare still sees the connection, as any host does).
+- `researcher --usage` ends with the sharing state and how many lines wait. `usage-sent` next to the log holds how far the log was sent.
+- `[usage] url = "..."` sends to your own receiver instead (the same `worker/` deployed on your account).
+- To have your lines removed from the project's receiver, open an issue with your install id (the `usage-id` file); then delete `usage-id` to start a new one.
 
 ## What it saves
 
@@ -135,6 +151,8 @@ researcher --list                 sets, document counts, saved defaults
 researcher --sync                 make or refresh the text copy of the whole library, load nothing
 researcher --usage                local totals of what it saved (see Usage log)
 researcher --usage-export [FILE]  write the anonymous usage records to a file; nothing is sent
+researcher --usage-share on|off   share the anonymous usage counts with the project, or not
+researcher --usage-send [--dry-run]  send the usage records not sent yet (only with sharing on)
 researcher --init [LIBRARY]       write a starter config
 researcher --sessions             list tracked closed sessions (opt-in, see Sessions)
 researcher --rename ID NAME       rename a tracked session
@@ -142,9 +160,9 @@ researcher --resume ID            print the command that resumes a session
 researcher --session-load ID      write a session's conversation as a .txt to load as context
 ```
 
-It prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
+It prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous, 9 usage sharing not switched on (`--usage-send`), 1 a send failed (the records stay queued).
 
-Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
+Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`, `usage-sent`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
 
 ## Sessions (optional)
 
