@@ -1,0 +1,29 @@
+[package]
+name = "the-researcher"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A research loader for Claude: load saved research into a Claude Code session"
+repository = "https://github.com/LudaLunizz/the-researcher"
+publish = false
+
+[[bin]]
+name = "researcher"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+dirs = "7"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+getrandom = "0.4"
+htmlize = { version = "1.1", features = ["unescape"] }
+regex = "1.13"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "1.2", features = ["preserve_order"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
