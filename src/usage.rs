@@ -15,8 +15,8 @@ use crate::util;
 
 pub const USAGE_SCHEMA: i64 = 1;
 const USAGE_KINDS: [&str; 4] = ["pdf", "html", "md", "txt"];
-/// ~2.3 characters per token, measured with count_tokens (see README).
-pub const CHARS_PER_K: usize = 2300;
+/// ~2.4 characters per token, measured with count_tokens (see README).
+pub const CHARS_PER_K: usize = 2400;
 
 pub fn data_home() -> String {
     let base = dirs::data_dir()

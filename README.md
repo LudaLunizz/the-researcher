@@ -49,7 +49,7 @@ researcher --usage-export [FILE]   write the records to FILE (default researcher
 
 - **Squeezed away** is real: converted text before minus after the squeeze, for the documents you loaded.
 - **Left unticked** compares each load with loading your whole library; it is a ceiling, not a measurement, because nobody would load everything.
-- Tokens are estimated from characters (2.3 per token, see below), not counted by a tokenizer.
+- Tokens are estimated from characters (2.4 per token, see below), not counted by a tokenizer.
 - Switch the log off with `[usage]` `log = false` in `config.toml`; then no log and no install id are written.
 - Sharing the numbers is a separate choice and is **off**. There is no upload in the tool; the export is a file you send yourself, if you want to.
 
@@ -66,7 +66,7 @@ Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16
 - Converting HTML to text cuts the load to **58.7%** of the raw HTML (41% saved). Per document it ranged from 42% to 83% (median 58%): pages heavy in markup, tables and inline CSS gain most.
 - A PDF read as a document costs **2.2x** the converted text (1.9x to 2.8x per document, median 2.3x), because the page images are counted as well.
 - The researcher still reads every ticked document in full. The larger saving is what you leave unticked, which costs nothing. It also replaces the search-and-read turns of "read my notes on X" with one call.
-- The converted text came to **2.4 characters per token** over the 50 documents (2.0 to 3.0 per document, token-weighted 2.39). The popup sizes and the usage log assume **2.3**, so they run a little high, which is the safe side. An earlier flat 4 characters per token understated the real cost by roughly 1.7x. The ratio varies with the content: code, tables and non-English text tokenize denser than prose (the six Dutch documents averaged 2.0, the others 2.5), so treat popup sizes as close, not exact.
+- The converted text came to **2.4 characters per token** over the 50 documents (2.0 to 3.0 per document, token-weighted 2.39). The popup sizes and the usage log assume **2.4**. An earlier flat 4 characters per token understated the real cost by roughly 1.7x. The ratio varies with the content: code, tables and non-English text tokenize denser than prose (the six Dutch documents averaged 2.0, the others 2.5), so treat popup sizes as close, not exact.
 
 Fifty documents from one person's library is still a sample of one topic mix, so read the percentages as indicative.
 

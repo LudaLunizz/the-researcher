@@ -14,7 +14,7 @@ never sends anything today; this is the place it will send to once sending is ad
   {"v": 1, "day": "2026-11-16", "id": "7d75b3c23f2e4970", "docs": 7,
    "fmt": {"html": 4, "md": 3, "pdf": 0, "txt": 0},
    "src_bytes": 113432, "raw": 69655, "chars": 69652,
-   "lib_docs": 114, "lib_chars": 2239282, "tk": 2300}
+   "lib_docs": 114, "lib_chars": 2239282, "tk": 2400}
 ]}
 ```
 

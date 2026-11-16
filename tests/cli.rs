@@ -128,7 +128,7 @@ fn load_logs_counts_only() {
     assert!(r["raw"].as_u64() >= r["chars"].as_u64());
     let id = r["id"].as_str().unwrap();
     assert!(id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-    assert_eq!(r["tk"], 2300);
+    assert_eq!(r["tk"], 2400);
 }
 
 #[test]
