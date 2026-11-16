@@ -10,6 +10,16 @@ If you keep research notes, reports, or saved articles on disk and keep telling 
 - **Formats**: `.html`, `.md`, `.txt`, and `.pdf` (through `pdftotext`). Folders with an `index.html` count as one document.
 - **Read-only**: your library is never changed. Converted text goes to a cache folder.
 
+## How it looks
+
+The first picture is a set with a saved preset: the documents you ticked last time are ticked, a document added since is marked **NEW**, and the rest of your library is folded under "Add other research". The second is a set you have never used: your whole library, grouped by folder, with nothing ticked. **Cancel (load nothing)** always leaves without sending anything.
+
+![Popup with a saved preset](docs/img/popup-saved-preset.png)
+
+![Popup for a new set](docs/img/popup-new-set.png)
+
+Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
+
 ## Requirements
 
 - Python 3.11 or newer (3.11 for `tomllib`)

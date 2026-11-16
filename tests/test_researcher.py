@@ -229,7 +229,7 @@ class MainTests(Env):
         lib = os.path.join(HERE, "..", "examples", "library")
         code, out = self.run_main("--library", lib, "--no-popup", "all")
         self.assertEqual(code, 0, out)
-        self.assertIn("total: 4 docs", out)
+        self.assertIn("total: 8 docs", out)
 
     def test_example_config_parses(self):
         cfg = R.load_config(os.path.join(HERE, "..", "examples", "config.toml"))
