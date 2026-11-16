@@ -10,7 +10,7 @@ If you keep research notes, reports, or saved articles on disk and keep telling 
 - **Saved defaults** per set: next time your last choice is pre-ticked, and documents added since are marked **NEW**.
 - **Custom sets**: name a set you never defined (`/researcher side-project`) and the first call shows your whole library; what you tick becomes that set.
 - **Formats**: `.html`, `.md`, `.txt`, and `.pdf` (through `pdftotext`). Folders with an `index.html` count as one document.
-- **Read-only**: your library is never changed. Converted text goes to a cache folder.
+- **Read-only**: your library is never changed or moved. Claude reads a plain-text copy kept in the researcher's own folder (see [The text copy](#the-text-copy)).
 
 ## How it looks
 
@@ -21,6 +21,16 @@ The first picture is a set with a saved preset: the documents you ticked last ti
 ![Popup for a new set](docs/img/popup-new-set.png)
 
 Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
+
+## The text copy
+
+Every document of your library gets one plain-text file in the researcher's own folder, `~/.local/share/researcher/text/` (or `text_dir` in `config.toml`). Your own files are only read.
+
+- Made **once** per document, and again only when the source file changes (size or modified time) or the researcher's converter changes. Opening the popup on a library you already converted costs about a tenth of a second instead of a `pdftotext` run per PDF.
+- `researcher.py --sync` makes or refreshes the copy of the whole library and loads nothing.
+- Copies stay when a document leaves the library (a library on an unplugged drive keeps working). Delete the folder any time; it is rebuilt.
+- The text is squeezed for tokens, without dropping content: PDF layout padding and indentation, page numbers and headers/footers that repeat on most pages, lines of rule characters, zero-width characters, runs of blank lines and exact repeated lines. Markdown and text files are only tidied (indentation and code are kept).
+- Measured in characters on 11 sampled PDFs (16 Nov 2026): 394,359 characters from `pdftotext -layout`, 251,104 after squeezing, so **36% fewer**; per document 2% to 48%. The spread follows how much of a PDF is padding. Tokens were not counted for this step. A library that mostly holds HTML gains little, because HTML is already converted to text.
 
 ## What it saves
 
@@ -90,6 +100,7 @@ researcher.py [SET ...]              popup, then convert the ticked documents an
 researcher.py --setup SET            popup only: change the saved defaults, load nothing
 researcher.py --no-popup SET         use the saved defaults without asking
 researcher.py --list                 sets, document counts, saved defaults
+researcher.py --sync                 make or refresh the text copy of the whole library, load nothing
 researcher.py --init [LIBRARY]       write a starter config
 researcher.py --sessions             list tracked closed sessions (opt-in, see Sessions)
 researcher.py --rename ID NAME       rename a tracked session
@@ -99,7 +110,7 @@ researcher.py --session-load ID      write a session's conversation as a .txt to
 
 The script prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
 
-Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), converted text in `~/.cache/researcher/`.
+Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), and session loads in `~/.cache/researcher/`.
 
 ## Sessions (optional)
 
