@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: MIT
 # The Researcher. Copyright (c) 2026 LudaLunizz
 #
-# Make the README screenshots of the popup from the made-up example library.
+# Make the README screenshots of the popup from the made-up example library and the made-up
+# chats below (for /load-context).
 #
 # Usage: tools/screenshots.sh [OUTPUT_DIR]      (default docs/img)
 #
-# Needs a display: it opens the real windows three times for about a second each. The program
+# Needs a display: it opens the real windows five times for about a second each. The program
 # saves each window as a PNG from inside egui (RESEARCHER_SCREENSHOT; no screenshot tool, no
 # desktop in the picture) and closes it as Cancel. It runs with a throwaway HOME, config and
-# saved choices and only reads examples/library, so none of your own research, settings or
+# saved choices and only reads examples/library and the made-up chats it writes into that throwaway home, so none of your own research, settings or
 # paths is touched or shown.
 set -euo pipefail
 
@@ -48,3 +49,30 @@ cat > "$conf/choices.json" <<'JSON'
 JSON
 shoot popup-saved-preset.png rust
 shoot popup-new-set.png side-project
+
+# --- /load-context: made-up earlier chats in two made-up project folders -----------------------
+projects="$home/.claude/projects"
+chat() { # FOLDER ID DAY FIRST-PROMPT REPLY
+    local dir="$projects/$1"
+    mkdir -p "$dir"
+    printf '%s\n%s\n' \
+        "{\"type\":\"user\",\"cwd\":\"/home/you/$1\",\"timestamp\":\"$3T10:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"$4\"}}" \
+        "{\"type\":\"assistant\",\"timestamp\":\"$3T10:05:00.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"$5\"}]}}" \
+        > "$dir/$2.jsonl"
+}
+filler=$(printf 'The plan is to read the code first, change one thing at a time and run the tests after every step. %.0s' $(seq 1 40))
+chat myapp 11111111-1111-4111-8111-111111111111 2026-11-14 "Why does the login page flash before it redirects?" "$filler"
+chat myapp 22222222-2222-4222-8222-222222222222 2026-11-12 "Add a dark mode switch to the settings page" "$filler"
+chat myapp 33333333-3333-4333-8333-333333333333 2026-11-09 "Review the database migration before we release" "$filler$filler"
+chat notes-cli 44444444-4444-4444-8444-444444444444 2026-11-13 "Make the search command faster on big folders" "$filler$filler$filler"
+chat notes-cli 55555555-5555-4555-8555-555555555555 2026-11-10 "Write a man page for the export command" "$filler"
+printf '[sessions]\nenabled = true\n' >> "$conf/config.toml"
+
+# a preset saved before two of the chats existed, so those show as NEW
+cat > "$conf/contexts.json" <<'JSON'
+{"default": {"selected": ["11111111-1111-4111-8111-111111111111", "44444444-4444-4444-8444-444444444444"],
+             "known": ["11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333",
+                       "44444444-4444-4444-8444-444444444444"]}}
+JSON
+shoot context-saved-preset.png --context
+shoot context-new-preset.png --context another-job
