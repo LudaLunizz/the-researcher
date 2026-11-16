@@ -32,6 +32,23 @@ Every document of your library gets one plain-text file in the researcher's own 
 - The text is squeezed for tokens, without dropping content: PDF layout padding and indentation, page numbers and headers/footers that repeat on most pages, lines of rule characters, zero-width characters, runs of blank lines and exact repeated lines. Markdown and text files are only tidied (indentation and code are kept).
 - Measured in characters on 11 sampled PDFs (16 Nov 2026): 394,359 characters from `pdftotext -layout`, 251,104 after squeezing, so **36% fewer**; per document 2% to 48%. The spread follows how much of a PDF is padding. Tokens were not counted for this step. A library that mostly holds HTML gains little, because HTML is already converted to text.
 
+## Usage log
+
+After every load the researcher appends one line to `~/.local/share/researcher/usage.jsonl`, so you can see what it saves on **your** library. It is local and anonymous, and **nothing is sent anywhere**.
+
+What a line holds, and nothing else: the day, a random install id (`usage-id` next to the log; delete it to start a new one), how many documents were loaded and in which formats (pdf, html, md, txt), and character sums: source bytes, converted text before and after squeezing, and the whole library after squeezing. It never holds a title, a path, a set name or where your library is. The log is plain JSON lines; read it before you share anything.
+
+```
+researcher.py --usage                 totals: characters loaded, squeezed away, left unticked, with estimated tokens
+researcher.py --usage-export [FILE]   write the records to FILE (default researcher-usage.json) so you can look at them and send them by hand
+```
+
+- **Squeezed away** is real: converted text before minus after the squeeze, for the documents you loaded.
+- **Left unticked** compares each load with loading your whole library; it is a ceiling, not a measurement, because nobody would load everything.
+- Tokens are estimated from characters (2.3 per token, see below), not counted by a tokenizer.
+- Switch the log off with `[usage]` `log = false` in `config.toml`; then no log and no install id are written.
+- Sharing the numbers is a separate choice and is **off**. There is no upload in the tool; the export is a file you send yourself, if you want to.
+
 ## What it saves
 
 Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16 Nov 2026) on four reports that exist as HTML and as PDF, about 91 KB of HTML in total. Each was counted three ways: as the raw HTML, as the text the researcher converts it to, and as the PDF.
@@ -101,6 +118,8 @@ researcher.py --setup SET            popup only: change the saved defaults, load
 researcher.py --no-popup SET         use the saved defaults without asking
 researcher.py --list                 sets, document counts, saved defaults
 researcher.py --sync                 make or refresh the text copy of the whole library, load nothing
+researcher.py --usage                local totals of what it saved (see Usage log)
+researcher.py --usage-export [FILE]  write the anonymous usage records to a file; nothing is sent
 researcher.py --init [LIBRARY]       write a starter config
 researcher.py --sessions             list tracked closed sessions (opt-in, see Sessions)
 researcher.py --rename ID NAME       rename a tracked session
@@ -110,7 +129,7 @@ researcher.py --session-load ID      write a session's conversation as a .txt to
 
 The script prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
 
-Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), and session loads in `~/.cache/researcher/`.
+Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
 
 ## Sessions (optional)
 

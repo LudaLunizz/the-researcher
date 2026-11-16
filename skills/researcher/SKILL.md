@@ -26,6 +26,7 @@ Load research sets from the user's library (a folder of .html, .md, .txt and .pd
 
 Notes
 - The files are snapshots read from disk; if the user says a document was just updated elsewhere, read the live one instead.
+- Every load appends an anonymous line (counts and character sums, no titles or paths) to `~/.local/share/researcher/usage.jsonl`; nothing is sent. "how much did it save" / "usage" → `researcher.py --usage` (show the lines as they are); "export the usage" → `researcher.py --usage-export FILE`, then say where the file is and that nothing was sent. `[usage] log = false` in the config turns the log off.
 - A new document in the library shows up as NEW in the next popup of every set that globs it; to add it to a set by name, put its id in `config.toml`.
 - Saved choices live in `~/.config/researcher/choices.json`, the plain-text copy of the library in `~/.local/share/researcher/text/` (made once per document, redone when the source changes; your own files are never touched). `researcher.py --sync` refreshes the whole copy.
 
