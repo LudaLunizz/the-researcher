@@ -55,7 +55,7 @@ researcher --usage-export [FILE]   write the records to FILE (default researcher
 
 ## What it saves
 
-Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16 Nov 2026) on 85 reports from one library, about 1.29M tokens of HTML in total. Each was counted as the raw HTML and as the text the researcher converts it to. For the first 50 (the ones that also exist as PDF) the PDF was counted too. The 85 are every report of the library that has an HTML version, spread from the smallest to the largest (nine of them Dutch).
+Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16 Nov 2026) on 85 reports from one library, about 1.29M tokens of HTML in total. Each was counted as the raw HTML and as the text the researcher converts it to. For the first 50 (the ones that also exist as PDF) the PDF was counted too. The 85 are the library's reports that have an HTML version, apart from duplicate copies of the same title and a layout test page (nine of them Dutch).
 
 | | Raw HTML | Converted text | PDF (first 50 only) |
 |---|---:|---:|---:|
