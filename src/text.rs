@@ -229,6 +229,19 @@ pub fn store_name(d: &str) -> String {
     format!("{}.txt", d.replace('/', " - "))
 }
 
+/// FNV-1a (32 bit) of the id's UTF-8 bytes; the same number in the Python version.
+fn id_hash(d: &str) -> u32 {
+    d.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
+}
+
+/// `store_name`, unless another document already uses that file (`a/b` and `a - b`): then the
+/// id's hash goes into the name, so two documents never share one copy.
+fn free_store_name(d: &str, index: &Map<String, Value>) -> String {
+    let file = store_name(d);
+    let taken = index.iter().any(|(id, r)| id != d && r.get("file").and_then(Value::as_str) == Some(file.as_str()));
+    if taken { format!("{} ({:08x}).txt", d.replace('/', " - "), id_hash(d)) } else { file }
+}
+
 /// Lazy {doc id: plain text}, kept as a persistent copy in the researcher's own folder.
 ///
 /// A document is converted once and again only when its source file changed (size, mtime) or
@@ -279,18 +292,23 @@ impl Texts {
         }
         let file = rec.get("file")?.as_str()?;
         let body = fs::read_to_string(util::join(&self.store, file)).ok()?;
-        let (_, text) = body.split_once("\n\n")?;
+        let (head, text) = body.split_once("\n\n")?;
+        if head != format!("SOURCE: {src}") {
+            return None; // the file holds another document's copy
+        }
         Some(text.strip_suffix('\n').unwrap_or(text).to_string())
     }
 
-    fn save(&mut self, d: &str, text: &str, raw: usize) -> std::io::Result<()> {
+    /// `st` is the source as it was *before* converting: if it changes meanwhile, the next run
+    /// sees a different size or mtime and converts it again.
+    fn save(&mut self, d: &str, text: &str, raw: usize, st: &fs::Metadata) -> std::io::Result<()> {
         fs::create_dir_all(&self.store)?;
         let src = self.paths[d].clone();
-        let (file, st) = (store_name(d), fs::metadata(&src)?);
+        let file = free_store_name(d, &self.index);
         util::write_atomic(&util::join(&self.store, &file), format!("SOURCE: {src}\n\n{text}\n").as_bytes())?;
         self.index.insert(
             d.to_string(),
-            json!({"file": file, "src": src, "size": st.len(), "mtime_ns": util::mtime_ns(&st),
+            json!({"file": file, "src": src, "size": st.len(), "mtime_ns": util::mtime_ns(st),
                    "raw": raw, "v": TEXT_VERSION}),
         );
         self.dirty = true;
@@ -308,8 +326,10 @@ impl Texts {
         let text = match self.stored(d) {
             Some(t) => t,
             None => {
-                let res = convert(&self.paths[d]).and_then(|(raw, text)| {
-                    self.save(d, &text, chars(&raw)).map_err(|e| e.to_string())?;
+                let src = self.paths[d].clone();
+                let res = fs::metadata(&src).map_err(|e| e.to_string()).and_then(|st| {
+                    let (raw, text) = convert(&src)?;
+                    self.save(d, &text, chars(&raw), &st).map_err(|e| e.to_string())?;
                     Ok(text)
                 });
                 match res {
@@ -415,6 +435,27 @@ mod tests {
     #[test]
     fn exact_repeat_lines_collapse() {
         assert_eq!(squeeze("same\nsame\nother", Kind::Plain), "same\nother");
+    }
+
+    #[test]
+    fn two_ids_with_one_store_name_get_two_copies() {
+        let base = std::env::temp_dir().join(format!("researcher-unit-{}-names", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("lib/a")).unwrap();
+        let p = |s: &str| base.join(s).to_string_lossy().into_owned();
+        fs::write(p("lib/a/b.md"), "one").unwrap();
+        fs::write(p("lib/a - b.md"), "two").unwrap();
+        let paths: BTreeMap<String, String> =
+            [("a/b".to_string(), p("lib/a/b.md")), ("a - b".to_string(), p("lib/a - b.md"))].into();
+        for _ in 0..2 {
+            let mut t = Texts::new(&paths, &p("store"));
+            assert_eq!(t.get("a/b"), "one");
+            assert_eq!(t.get("a - b"), "two");
+            assert_ne!(t.path("a/b"), t.path("a - b"));
+            assert!(t.path("a - b").ends_with(&format!("a - b ({:08x}).txt", id_hash("a - b"))));
+        }
+        assert_eq!(id_hash("a - b"), 0xf055_1209);
+        assert_eq!(id_hash("é/x"), 0x1da2_3496); // pinned: the Python version must agree
     }
 
     #[test]

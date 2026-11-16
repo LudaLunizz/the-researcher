@@ -273,6 +273,36 @@ class MainTests(Env):
         self.assertEqual(self.run_main("--no-popup", "rs")[0], 0)
         self.assertEqual(self.run_main("--no-popup")[0], 0)
 
+    def test_set_names_keep_their_case(self):
+        with open(self.cfg, "a", encoding="utf-8") as f:
+            f.write('[sets.MyRust]\ndocs = ["rust/linux"]\n')
+        code, out = self.run_main("--no-popup", "MyRust")
+        self.assertEqual(code, 0, out)
+        self.assertIn("total: 1 docs", out)
+        self.assertEqual(R.resolve_names(["myrust"], R.load_config(self.cfg)), ["MyRust"])
+
+    def test_two_ids_with_one_store_name_get_two_copies(self):
+        write(os.path.join(self.lib, "web - seo.md"), "other seo")
+        for _ in range(2):
+            paths = R.scan(self.lib, [])
+            texts = R.Texts(paths, self.out)
+            self.assertEqual(texts["web/seo"], "seo")
+            self.assertEqual(texts["web - seo"], "other seo")
+            self.assertNotEqual(texts.path("web/seo"), texts.path("web - seo"))
+            texts.flush()
+        self.assertEqual(R.id_hash("a - b"), 0xF0551209)  # pinned: the Rust version must agree
+        self.assertEqual(R.id_hash("é/x"), 0x1DA23496)
+
+    def test_long_left_out_list_is_only_counted(self):
+        for i in range(25):
+            write(os.path.join(self.lib, "many", f"d{i:02}.md"), f"doc {i}")
+        write(os.path.join(self.conf_dir, "choices.json"), json.dumps(
+            {"mine": {"selected": ["web/seo"], "known": [], "custom": True}}))
+        code, out = self.run_main("--no-popup", "mine")
+        self.assertEqual(code, 0, out)
+        self.assertIn("left out by choice (29): not named (more than 20)", out)
+        self.assertNotIn("many/d00", out)
+
     def test_missing_doc_reported(self):
         code, out = self.run_main("--no-popup", "app")
         self.assertEqual(code, 0)
@@ -333,7 +363,8 @@ class MainTests(Env):
     def test_copy_reused_until_source_changes(self):
         self.run_main("--no-popup", "rust")
         copy = os.path.join(self.out, "rust - memory-a.txt")
-        write(copy, "SOURCE: x\n\nEDITED COPY\n")  # an unchanged source must not be converted again
+        head = read(copy).split("\n", 1)[0]  # the SOURCE line must stay
+        write(copy, f"{head}\n\nEDITED COPY\n")  # an unchanged source must not be converted again
         _, out = self.run_main("--no-popup", "rust")
         self.assertIn("EDITED COPY", read(copy))
         write(os.path.join(self.lib, "rust", "memory-a.md"), "# A changed")

@@ -60,6 +60,7 @@ POPUP_TIMEOUT = 540  # seconds; the skill runs this with a 600 s Bash timeout
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 RESERVED = {"all"}
 CHARS_PER_K = 2400  # ~2.4 chars per token, measured with count_tokens (see README)
+SKIPPED_NAMED = 20  # up to this many left-out documents are named; more are only counted
 
 
 class ConfigError(Exception):
@@ -326,6 +327,23 @@ def store_name(d):
     return d.replace("/", " - ") + ".txt"
 
 
+def id_hash(d):
+    """FNV-1a (32 bit) of the id's UTF-8 bytes; the same number in the Rust version."""
+    h = 0x811C9DC5
+    for b in d.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def free_store_name(d, index):
+    """store_name, unless another document already uses that file (`a/b` and `a - b`): then the
+    id's hash goes into the name, so two documents never share one copy."""
+    fn = store_name(d)
+    if any(i != d and isinstance(r, dict) and r.get("file") == fn for i, r in index.items()):
+        return f"{d.replace('/', ' - ')} ({id_hash(d):08x}).txt"
+    return fn
+
+
 class Texts:
     """Lazy {doc id: plain text}, kept as a persistent copy in the researcher's own folder.
 
@@ -356,8 +374,10 @@ class Texts:
                     and rec.get("src") == self.paths[d] and rec.get("size") == st.st_size
                     and rec.get("mtime_ns") == st.st_mtime_ns):
                 with open(os.path.join(self.store, rec["file"]), encoding="utf-8") as f:
-                    return f.read().split("\n\n", 1)[1].removesuffix("\n")
-        except (OSError, KeyError, IndexError, TypeError):
+                    head, text = f.read().split("\n\n", 1)
+                if head == f"SOURCE: {self.paths[d]}":  # else: another document's copy
+                    return text.removesuffix("\n")
+        except (OSError, KeyError, ValueError, TypeError):
             pass
         return None
 
@@ -365,10 +385,12 @@ class Texts:
         """Characters of the converted text before squeezing (the whole copy is read once)."""
         return self.raw.get(d, len(self.cache.get(d, "")))
 
-    def _save(self, d, text, raw):
+    def _save(self, d, text, raw, st):
+        """`st` is the source as it was before converting: if it changes meanwhile, the next
+        run sees another size or mtime and converts it again."""
         os.makedirs(self.store, exist_ok=True)
-        fn, st = store_name(d), os.stat(self.paths[d])
-        tmp = os.path.join(self.store, fn + ".tmp")
+        fn = free_store_name(d, self.index)
+        tmp = os.path.join(self.store, f"{fn}.{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(f"SOURCE: {self.paths[d]}\n\n{text}\n")
         os.replace(tmp, os.path.join(self.store, fn))
@@ -384,9 +406,10 @@ class Texts:
         try:
             text = self._stored(d) if self.store else None
             if text is None:
+                st = os.stat(self.paths[d])
                 raw, text = convert(self.paths[d])
                 if self.store:
-                    self._save(d, text, len(raw))
+                    self._save(d, text, len(raw), st)
             self.cache[d] = text
             self.raw[d] = (self.index.get(d) or {}).get("raw", len(text))
         except (OSError, RuntimeError) as e:
@@ -408,7 +431,7 @@ class Texts:
 
     def flush(self):
         if self.store and self.dirty:
-            tmp = os.path.join(self.store, ".index.json.tmp")
+            tmp = os.path.join(self.store, f".index.json.{os.getpid()}.tmp")
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(self.index, f, indent=1, sort_keys=True)
@@ -451,10 +474,15 @@ def sections_for(names, sets, kinds, conf, texts, setup):
 
 def resolve_names(argv_names, cfg):
     aliases = {k.lower(): v for k, v in cfg.get("aliases", {}).items()}
-    names = [aliases.get(n.lower(), n.lower()) for n in argv_names]
+    sets = cfg.get("sets", {}) if isinstance(cfg.get("sets"), dict) else {}
+    defined = {k.lower(): k for k in reversed(list(sets))}  # `[sets.MyRust]` is reached by `myrust`
+
+    def canon(n):
+        return n if n in sets else defined.get(n.lower(), n)
+    names = [canon(aliases.get(n.lower(), n.lower())) for n in argv_names]
     if not names:
         d = cfg.get("default_set")
-        names = [d] if d else []
+        names = [canon(d)] if d else []
     return list(dict.fromkeys(names))
 
 
@@ -470,7 +498,7 @@ def load_conf(path):
 
 def save_conf(path, conf):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(conf, f, indent=1, ensure_ascii=False)
     os.replace(tmp, path)
@@ -902,7 +930,7 @@ def load_registry(path):
 
 def save_registry(path, reg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=1, ensure_ascii=False)
     os.replace(tmp, path)
@@ -1228,7 +1256,9 @@ def main(argv=None):
     for line in missing:
         print(line)
     skipped = [d for d in alldocs if d in texts and d not in chosen]
-    if skipped:
+    if len(skipped) > SKIPPED_NAMED:  # a custom set or `all`: naming it all costs tokens
+        print(f"left out by choice ({len(skipped)}): not named (more than {SKIPPED_NAMED})")
+    elif skipped:
         print(f"left out by choice ({len(skipped)}): " + "; ".join(skipped))
     print(f"total: {len(docs)} docs, {total} chars (~{total // CHARS_PER_K}k tokens)")
     return 0

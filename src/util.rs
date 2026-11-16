@@ -164,14 +164,21 @@ pub fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// Write a file through a temporary name and a rename, so a reader never sees half of it.
+/// Write a file through a temporary name and a rename, so a reader never sees half of it. The
+/// temporary name holds the process id: two runs at once never write into the same one.
 pub fn write_atomic(path: &str, data: &[u8]) -> io::Result<()> {
-    let tmp = format!("{path}.tmp");
+    let tmp = format!("{path}.{}.tmp", std::process::id());
     {
         let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
+        if let Err(e) = f.write_all(data) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 /// `os.makedirs(dirname(path), exist_ok=True)`.
