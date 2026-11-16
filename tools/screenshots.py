@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-or-later
-# The Researcher. Copyright (C) 2026 LudaLunizz
+# SPDX-License-Identifier: MIT
+# The Researcher. Copyright (c) 2026 LudaLunizz
 """Make the README screenshots of the popup from the made-up example library.
 
 Usage: tools/screenshots.py [OUTPUT_DIR]      (default docs/img)

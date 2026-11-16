@@ -92,4 +92,4 @@ The tests cover the library scan, set expansion, saved defaults, custom sets, an
 
 ## License
 
-GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later), see [LICENSE](LICENSE). Your own documents and config are never part of this repository and are not covered by it.
+MIT License, see [LICENSE](LICENSE). Your own documents and config are never part of this repository and are not covered by it.
