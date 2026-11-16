@@ -1,0 +1,47 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Found a security problem? Please do not open a public issue: use **Security → Report a vulnerability** (see SECURITY.md).
+        Please do not paste your own research titles or paths if you want to keep them private; a made-up example is fine.
+  - type: dropdown
+    id: version-kind
+    attributes:
+      label: Which version
+      options:
+        - Rust binary (researcher)
+        - Python fallback (researcher.py)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: The Researcher version
+      description: Output of `researcher --version`
+      placeholder: researcher 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Distribution, desktop (Wayland or X11) and how you run Claude Code
+      placeholder: Ubuntu 26.04, GNOME on Wayland, Claude Code in a terminal
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: Terminal output of the failing command, for example `RESEARCHER_NO_POPUP=1 researcher <set>`
+      render: text
