@@ -30,7 +30,11 @@ A record that is sent twice is stored once (primary key = hash of its numbers an
 schema 2, its `seq`), so the app can resend its queue safely, while two identical loads on
 one day (different `seq`) are two rows. Schema 1 rows hash as they always did.
 
-`GET /v1/stats` returns public totals only: installs, loads, documents, characters.
+`GET /v1/stats` returns public totals only: installs, loads, documents, characters, and two
+token estimates (`tokens_squeezed`, `tokens_not_loaded`; per record, characters / `tk` × 1000).
+`GET /v1/badge/squeezed` and `GET /v1/badge/not-loaded` give the same two numbers in the
+shields.io endpoint format, for the README badges
+(`https://img.shields.io/endpoint?url=<worker>/v1/badge/squeezed`).
 
 ## What it keeps and does not keep
 

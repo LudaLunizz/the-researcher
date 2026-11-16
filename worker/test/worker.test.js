@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 
-import worker from "../src/index.js";
+import worker, { short } from "../src/index.js";
 import { MAX_LOADS, parsePayload, recordError, rowHash } from "../src/validate.js";
 
 const NOW = Date.UTC(2026, 10, 16, 12);
@@ -180,7 +180,32 @@ test("stats are totals only", async () => {
     documents: 14,
     raw_chars: 69655 + 20,
     chars: 69652 + 10,
+    // per record with its own tk (2300): (3 + 10) chars squeezed, (lib_chars - chars) not loaded
+    tokens_squeezed: Math.round((3 * 1000) / 2300 + (10 * 1000) / 2300),
+    tokens_not_loaded: Math.round(((2239282 - 69652) * 1000) / 2300 + ((2239282 - 10) * 1000) / 2300),
   });
+});
+
+test("badges: shields.io endpoint JSON with the two token totals", async () => {
+  const env = { DB: fakeD1() };
+  await post(sent(record({ raw: 69652 + 2300, lib_chars: 69652 }), record({ lib_chars: 69652 + 2_300_000 })), env);
+  let res = await worker.fetch(new Request("https://x.test/v1/badge/squeezed"), env);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    schemaVersion: 1, label: "tokens squeezed", message: "1k", color: "brightgreen", cacheSeconds: 3600,
+  });
+  res = await worker.fetch(new Request("https://x.test/v1/badge/not-loaded"), env);
+  assert.equal((await res.json()).message, "1M");
+  for (const p of ["/v1/badge/", "/v1/badge/toString", "/v1/badge/__proto__", "/v1/badge/squeezed/x"]) {
+    assert.equal((await worker.fetch(new Request("https://x.test" + p), env)).status, 404, p);
+  }
+  res = await worker.fetch(new Request("https://x.test/v1/badge/squeezed", { method: "POST" }), env);
+  assert.equal(res.status, 405);
+});
+
+test("short numbers for badges", () => {
+  assert.deepEqual([0, 999, 1000, 1234, 99_960, 123_456, 2_712_345, 3e9].map(short),
+    ["0", "999", "1k", "1.2k", "100k", "123k", "2.7M", "3B"]);
 });
 
 test("nothing else is served", async () => {
