@@ -1,4 +1,6 @@
-# Researcher for Claude
+# The Researcher
+
+**A research loader for Claude.**
 
 Load your saved research into a [Claude Code](https://claude.com/claude-code) session in one step, and only the part you need.
 
@@ -30,8 +32,8 @@ Both pictures use the made-up documents in [examples/library](examples/library).
 ## Install
 
 ```bash
-git clone https://github.com/LudaLunizz/researcher-for-claude.git
-cd researcher-for-claude
+git clone https://github.com/LudaLunizz/the-researcher.git
+cd the-researcher
 mkdir -p ~/.claude/skills
 cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/researcher" ~/.claude/skills/researcher
 
