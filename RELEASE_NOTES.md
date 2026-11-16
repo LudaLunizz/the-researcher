@@ -1,17 +1,17 @@
-Opt-in sharing of the anonymous usage counts (issue #34, PR #35). Same in the Python version.
+Load earlier chats as context: `/load-context` (issue #37, PR #38). Same in the Python version.
 
-- **Nothing is sent until you say yes.** While you have not decided, a load ends with `USAGE SHARING: not decided` and the skill asks you once. `researcher --usage-share on` saves `share = true` under `[usage]` in your config; `off` saves `share = false`. Only that one line of the config is touched.
-- **What is sent:** the same anonymous lines the usage log already holds (day, a random install id, document counts per format, character sums), plus `seq`, the line's number in your log. Never a title, path, set name, library location, GitHub login or account. `researcher --usage-send --dry-run` prints exactly what would go.
-- **When:** with sharing on, each load starts the sender in the background, so a load never waits on the network; a failed send is tried again after the next load. `researcher --usage-send` sends right away (exit 9 when sharing is not on). `researcher --usage` ends with the sharing state and how many lines wait.
-- **Two identical loads on one day now count twice** (the receiver tells them apart by `seq`); a line sent twice is still stored once.
-- **Your own receiver:** `[usage] url = "..."` sends to a copy of `worker/` on your own Cloudflare account instead.
+- **`researcher --context [PRESET]`** opens the chooser with your earlier Claude Code chats from every project folder. Each chat is named by its **first prompt** (or the name you gave it with `--rename`). The most recently used folder comes first, newest chat first, and each row shows its size in tokens and the day it was last active. A filter box finds a chat by words from its first prompt or its folder.
+- **Presets** work like custom sets and are stored in `~/.config/researcher/contexts.json`. The first time, nothing is ticked; tick what you need and keep Remember ticked. The next run starts with those chats ticked, and newer chats show NEW but are never ticked on their own. Without a name the preset is `default`. `--setup`, `--list` and `--no-popup` work as they do for sets.
+- The chat you run it from is never listed; a chat closed a minute ago is. Each ticked chat is loaded as prompts and replies only, without tool calls or their output, like `--session-load`.
+- **New skill `skills/load-context`**: install it next to `researcher` (`cp -r skills/load-context ~/.claude/skills/`) and type `/load-context NAME` in Claude Code.
+- Needs `[sessions] enabled = true` in your config, like the other session commands. The session registry now keeps each chat's first prompt and size, so the window opens fast after the first scan.
 - Linux x86_64 only for now. PDFs still need `pdftotext` (poppler-utils).
 
-Install: download `researcher-v0.3.0-x86_64-linux`, check it against `SHA256SUMS.txt`, and put it on your PATH as `researcher`:
+Install: download `researcher-v0.4.0-x86_64-linux`, check it against `SHA256SUMS.txt`, and put it on your PATH as `researcher`:
 
 ```bash
 sha256sum -c SHA256SUMS.txt
-install -m 755 researcher-v0.3.0-x86_64-linux ~/.local/bin/researcher
+install -m 755 researcher-v0.4.0-x86_64-linux ~/.local/bin/researcher
 ```
 
-Or build it yourself with `cargo install --locked --path .`. Then install the skill as described in the README (the updated `SKILL.md` is what asks the sharing question).
+Or build it yourself with `cargo install --locked --path .`. Then install the skills as described in the README.
