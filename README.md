@@ -2,6 +2,8 @@
 
 **A research loader for Claude.**
 
+[![tokens squeezed](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/squeezed)](#sharing-opt-in) [![tokens not loaded](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/not-loaded)](#sharing-opt-in)
+
 Load your saved research into a [Claude Code](https://claude.com/claude-code) session in one step, and only the part you need.
 
 If you keep research notes, reports, or saved articles on disk and keep telling Claude "read my notes on X first", this does that for you. You name a **set** (`/researcher rust`), a small window lists the documents with their size in tokens, you tick what this session needs, and Claude reads exactly those. No tokens are spent while the window is open or on anything you leave unticked.
@@ -65,6 +67,7 @@ researcher --usage-send            send the lines not sent yet, now
 
 - With sharing on, each load starts a sender in the background: the load never waits on the network, and a failed send is tried again after the next load.
 - What is sent is the log lines as they are, plus `seq`: the line's number in your log, so two identical loads on one day both count and a line sent twice is stored once. Nothing else: no title, path, set name, library location, GitHub login or account. The receiver ([`worker/`](worker/)) refuses any other field and keeps no IP address, headers or request logs (Cloudflare still sees the connection, as any host does).
+- The two badges at the top are live totals over every shared load: **tokens squeezed** is measured (the converted text before minus after squeezing); **tokens not loaded** compares each load with loading the whole library every time, so it is a ceiling, not a measurement. Both are estimated from characters with the ratio each load used (2.4 per token). Raw totals: [`/v1/stats`](https://the-researcher-usage.ludalunizz.workers.dev/v1/stats).
 - `researcher --usage` ends with the sharing state and how many lines wait. `usage-sent` next to the log holds how far the log was sent.
 - `[usage] url = "..."` sends to your own receiver instead (the same `worker/` deployed on your account).
 - To have your lines removed from the project's receiver, open an issue with your install id (the `usage-id` file); then delete `usage-id` to start a new one.

@@ -2,7 +2,8 @@
 //
 //   POST /v1/usage   body = what `researcher --usage-send` sends (schema 2), or the file
 //                    `researcher --usage-export` writes (schema 1)
-//   GET  /v1/stats   public totals: installs, loads, characters
+//   GET  /v1/stats   public totals: installs, loads, characters, estimated tokens
+//   GET  /v1/badge/squeezed, /v1/badge/not-loaded   the token totals as shields.io badges
 //
 // Nothing here reads, logs or stores an IP address, a header or a GitHub login. The
 // only data kept is what validate.js lets through: a random install id, a day,
@@ -13,9 +14,28 @@ import { MAX_BODY, parsePayload, rowHash } from "./validate.js";
 const INSERT =
   "INSERT OR IGNORE INTO loads (h, id, day, docs, pdf, html, md, txt, src_bytes, raw, chars, lib_docs, lib_chars, tk) " +
   "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+// Tokens are estimated per record with the characters-per-1000-tokens the app assumed (tk).
 const STATS =
   "SELECT COUNT(DISTINCT id) AS installs, COUNT(*) AS loads, COALESCE(SUM(docs), 0) AS docs, " +
-  "COALESCE(SUM(raw), 0) AS raw_chars, COALESCE(SUM(chars), 0) AS chars FROM loads";
+  "COALESCE(SUM(raw), 0) AS raw_chars, COALESCE(SUM(chars), 0) AS chars, " +
+  "COALESCE(SUM(MAX(raw - chars, 0) * 1000.0 / tk), 0) AS tokens_squeezed, " +
+  "COALESCE(SUM(MAX(lib_chars - chars, 0) * 1000.0 / tk), 0) AS tokens_not_loaded FROM loads";
+const BADGES = {
+  squeezed: { label: "tokens squeezed", key: "tokens_squeezed", color: "brightgreen" },
+  "not-loaded": { label: "tokens not loaded", key: "tokens_not_loaded", color: "blue" },
+};
+
+/** 1234 -> "1.2k", 2712345 -> "2.7M": short enough for a badge. */
+export function short(n) {
+  const v = Math.round(n);
+  for (const [d, unit] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
+    if (v >= d) {
+      const x = v / d;
+      return `${x >= 100 ? Math.round(x) : Number(x.toFixed(1))}${unit}`;
+    }
+  }
+  return String(v);
+}
 const CHUNK = 50; // statements per D1 batch
 
 const HEADERS = { "x-content-type-options": "nosniff" };
@@ -84,18 +104,31 @@ async function receive(request, env) {
   return json({ ok: true, received: rows.length, new: added }, 200, { "cache-control": "no-store" });
 }
 
-async function stats(env) {
+async function totals(env) {
   const row = await env.DB.prepare(STATS).first();
+  return {
+    installs: row.installs,
+    loads: row.loads,
+    documents: row.docs,
+    raw_chars: row.raw_chars,
+    chars: row.chars,
+    tokens_squeezed: Math.round(row.tokens_squeezed),
+    tokens_not_loaded: Math.round(row.tokens_not_loaded),
+  };
+}
+
+async function stats(env) {
+  return json(await totals(env), 200, { "cache-control": "public, max-age=300" });
+}
+
+/** shields.io "endpoint" JSON: https://img.shields.io/endpoint?url=<this URL> */
+async function badge(env, which) {
+  const b = BADGES[which];
+  const t = await totals(env);
   return json(
-    {
-      installs: row.installs,
-      loads: row.loads,
-      documents: row.docs,
-      raw_chars: row.raw_chars,
-      chars: row.chars,
-    },
+    { schemaVersion: 1, label: b.label, message: short(t[b.key]), color: b.color, cacheSeconds: 3600 },
     200,
-    { "cache-control": "public, max-age=300" },
+    { "cache-control": "public, max-age=3600" },
   );
 }
 
@@ -114,6 +147,10 @@ export default {
     if (pathname === "/v1/stats") {
       if (request.method !== "GET") return json({ ok: false, error: "GET only" }, 405, { allow: "GET" });
       return stats(env);
+    }
+    if (pathname.startsWith("/v1/badge/") && Object.hasOwn(BADGES, pathname.slice(10))) {
+      if (request.method !== "GET") return json({ ok: false, error: "GET only" }, 405, { allow: "GET" });
+      return badge(env, pathname.slice(10));
     }
     if (pathname === "/") {
       return new Response("the-researcher usage receiver: anonymous counts only. https://github.com/LudaLunizz/the-researcher\n", {
