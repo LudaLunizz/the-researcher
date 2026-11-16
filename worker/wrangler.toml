@@ -1,0 +1,23 @@
+name = "the-researcher-usage"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+workers_dev = true # https://the-researcher-usage.<your-subdomain>.workers.dev, no domain needed
+
+# No request logs or traces are kept for this Worker.
+[observability]
+enabled = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "researcher-usage"
+database_id = "REPLACE-WITH-THE-ID-wrangler-d1-create-PRINTS"
+
+# Optional rate limit per client (the IP is only the limiter's key, never stored). Not
+# tested here: check the Cloudflare "Rate Limiting" docs for the current syntax, then
+# uncomment. The Worker works without it (env.RATE is optional).
+# [[ratelimits]]
+# name = "RATE"
+# namespace_id = "1001"
+#   [ratelimits.simple]
+#   limit = 30
+#   period = 60
