@@ -2,7 +2,7 @@
 
 **A research loader for Claude.**
 
-[![tokens squeezed](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/squeezed)](#sharing-opt-in) [![tokens not loaded](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/not-loaded)](#sharing-opt-in)
+[![tokens squeezed](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/squeezed)](#sharing-opt-in) [![tokens not loaded](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/not-loaded)](#sharing-opt-in) *so far, by all users*
 
 Load your saved research into a [Claude Code](https://claude.com/claude-code) session in one step, and only the part you need.
 
