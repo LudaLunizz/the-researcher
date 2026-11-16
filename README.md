@@ -88,6 +88,21 @@ python3 ~/.claude/skills/researcher/researcher.py --init ~/research   # writes ~
 
 Try it first on the made-up documents in [examples/library](examples/library): `researcher.py --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
+## Rust version (preview)
+
+A Rust port of `researcher.py` lives in `src/`. It is one binary with the same command line, exit codes, output and files: config, saved choices, the text copy, the usage log and the session registry. You can switch between the two versions at any time. Both write the same text copies; a test checks this byte for byte against the Python version.
+
+- **The popup is egui** (eframe) instead of GTK 4: pure Rust, nothing to install for it on Linux beyond a running desktop (Wayland or X11).
+- **Linux only for now.** CI also builds it for Windows and macOS so it stays portable, but it is not tested or supported there yet. On those systems the config and data folders will be the native ones (for example `%APPDATA%\researcher` on Windows).
+- PDFs still go through `pdftotext`, which is also available on Windows and macOS (poppler).
+
+```bash
+cargo build --release                  # target/release/researcher
+target/release/researcher --library examples/library rust
+```
+
+The skill still calls `researcher.py`; switching it to the binary is a separate step.
+
 ## Configure
 
 ```toml
@@ -156,6 +171,7 @@ Documents are loaded into Claude's context as text. Treat them like any untruste
 
 ```bash
 python3 -I -m unittest discover -s tests -v
+cargo test                                  # the Rust version, plus the check that both write the same text
 ```
 
 The tests cover the library scan, set expansion, saved defaults, custom sets, and the command line. The popup needs a display and is not covered by CI. It only opens when the script is run for a load or `--setup`; set `RESEARCHER_NO_POPUP=1` to make that impossible (scripts, CI).
