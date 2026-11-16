@@ -617,7 +617,9 @@ def assistant(text, ts="2026-11-16T10:01:00Z"):
                 {"type": "tool_use", "name": "Bash", "input": {"command": "secret-tool-call"}}]}}
 
 
-class SessionTests(Env):
+class SessionEnv(Env):
+    """Three chats in /work/app (SID3 still open) and a fake non-session transcript."""
+
     def setUp(self):
         super().setUp()
         self.proj = os.path.join(self.tmp.name, "projects")
@@ -636,6 +638,9 @@ class SessionTests(Env):
         jl(os.path.join(d, SID2 + ".jsonl"), [user("Second one"), {"type": "ai-title", "aiTitle": "Nice title"}])
         jl(os.path.join(d, SID3 + ".jsonl"), [user("Still open")], age=5)  # modified just now
         jl(os.path.join(d, "agent-abc.jsonl"), [user("not a session id")])
+
+
+class SessionTests(SessionEnv):
 
     def test_off_by_default(self):
         write(self.cfg, f'library = "{self.lib}"\n')
@@ -702,6 +707,90 @@ class SessionTests(Env):
         write(self.cfg, f'[sessions]\nenabled = true\nprojects_dir = "{self.proj}"\n')
         self.assertEqual(self.run_main("--sessions")[0], 0)
 
+
+SID4 = "44444444-4444-4444-8444-444444444444"
+
+
+class ContextTests(SessionEnv):
+    """--context: earlier chats from every folder, named by their first prompt, with presets."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)  # the tests may run inside Claude Code
+        self.presets = os.path.join(self.conf_dir, "contexts.json")
+        jl(os.path.join(self.proj, "-work-web", SID4 + ".jsonl"),
+           [user("Newest chat, other folder", ts="2026-11-17T09:00:00Z", cwd="/work/web")])
+
+    def save(self, name, selected):
+        write(self.presets, json.dumps({name: {"selected": selected, "known": []}}))
+
+    def test_needs_sessions_on(self):
+        write(self.cfg, f'library = "{self.lib}"\n')
+        code, out = self.run_main("--context")
+        self.assertEqual(code, 7)
+        self.assertIn("SESSIONS OFF", out)
+
+    def test_new_preset_without_popup_loads_nothing(self):
+        code, out = self.run_main("--context", "noname")
+        self.assertEqual(code, 5)
+        self.assertIn("context preset noname has no saved choice yet", out)
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_setup_saves_all_chats_newest_folder_first(self):
+        code, out = self.run_main("--context", "--setup", "--no-popup", "work")
+        self.assertEqual(code, 5)  # nothing saved yet and no popup: nothing to save either
+        self.save("work", [])
+        code, out = self.run_main("--context", "--setup", "work")
+        self.assertEqual(code, 0, out)
+        self.assertIn("SAVED context preset work: 0 of 4 chats", out)
+        known = json.loads(read(self.presets))["work"]["known"]
+        # /work/web has the newest chat; then newest first (ties by id); the open SID3 is offered
+        self.assertEqual(known, [SID4, SID1, SID2, SID3])
+
+    def test_the_running_chat_is_never_offered(self):
+        os.environ["CLAUDE_CODE_SESSION_ID"] = SID3
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_SESSION_ID", None)
+        self.save("work", [])
+        self.run_main("--context", "--setup", "work")
+        self.assertNotIn(SID3, json.loads(read(self.presets))["work"]["known"])
+
+    def test_preset_loads_chats_named_by_first_prompt(self):
+        self.save("work", [SID2, SID4, "99999999-9999-4999-8999-999999999999"])
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f'CHAT "Second one" ({SID2})', out)  # first prompt, not the AI title
+        self.assertIn(f'CHAT "Newest chat, other folder" ({SID4})', out)
+        self.assertIn("MISSING  chat 99999999-9999-4999-8999-999999999999", out)
+        self.assertIn("total: 2 chats", out)
+        self.assertNotIn(SID1, out)
+        paths = [l.split("chars  ", 1)[1] for l in out.splitlines() if "chars  " in l and "total" not in l]
+        self.assertEqual(len(paths), 2)
+        self.assertIn("USER: Newest chat", read(paths[0]))  # in list order: newest folder first
+        self.assertIn("USER: Second one", read(paths[1]))
+
+    def test_manual_name_wins_over_first_prompt(self):
+        self.run_main("--sessions")
+        self.run_main("--rename", SID2, "my name")
+        self.save("work", [SID2])
+        _, out = self.run_main("--context", "work")
+        self.assertIn(f'CHAT "my name" ({SID2})', out)
+
+    def test_sessions_list_still_hides_open_chats(self):
+        self.save("work", [])
+        self.run_main("--context", "--setup", "work")
+        _, out = self.run_main("--sessions")
+        self.assertNotIn(SID3, out)
+        self.assertIn("3 closed sessions", out)
+
+    def test_list_and_bad_names(self):
+        _, out = self.run_main("--context", "--list")
+        self.assertIn("no context presets saved yet", out)
+        self.save("work", [SID1])
+        _, out = self.run_main("--context", "--list")
+        self.assertIn("work", out)
+        self.assertIn("1 chats", out)
+        code, out = self.run_main("--context", "a/b")
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

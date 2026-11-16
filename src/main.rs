@@ -61,6 +61,9 @@ struct Args {
     /// write a tracked session's conversation as a .txt to load as context
     #[arg(long, value_name = "ID")]
     session_load: Option<String>,
+    /// pick earlier Claude Code chats (all folders) to load as context; SET names are presets
+    #[arg(long)]
+    context: bool,
     /// sessions shown by --sessions
     #[arg(long, default_value_t = 30)]
     limit: usize,
@@ -410,6 +413,29 @@ fn run(args: Args) -> i32 {
     } else {
         None
     };
+    if args.context {
+        let cfg = match library::load_config(&cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("CONFIG ERROR: {e}");
+                return 6;
+            }
+        };
+        let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
+        let out = args.out.clone().unwrap_or_else(cache_home);
+        return sessions::context(
+            &cfg,
+            &sessions::ContextArgs {
+                names: &args.sets,
+                setup: args.setup,
+                no_popup,
+                list: args.list,
+                reg_path: &util::join(&cfg_dir, "sessions.json"),
+                presets_path: &util::join(&cfg_dir, "contexts.json"),
+                out_dir: &out,
+            },
+        );
+    }
     if let Some(action) = session_action {
         let cfg = match library::load_config(&cfg_path) {
             Ok(c) => c,
@@ -550,7 +576,13 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
             }
         }
         texts.flush();
-        match popup::popup(&secs, sizes, args.setup, &format!("researcher {}", names.join(" "))) {
+        match popup::popup(
+            &secs,
+            sizes,
+            args.setup,
+            &format!("researcher {}", names.join(" ")),
+            &popup::Look::default(),
+        ) {
             Err(e) => println!("NO POPUP ({e}): using the saved defaults"),
             Ok(Outcome::Cancelled) => {
                 println!("CANCELLED: the user closed the popup, nothing loaded");

@@ -26,9 +26,26 @@ pub enum Outcome {
 /// Size (characters of the squeezed text) of each readable document; absent = unreadable.
 pub type Sizes = BTreeMap<String, usize>;
 
+/// How the rows read. The default shows research documents by their id; `--context` shows
+/// earlier chats by their first prompt, grouped by project folder.
+#[derive(Default)]
+pub struct Look {
+    /// Shown instead of the id.
+    pub labels: BTreeMap<String, String>,
+    /// Small text after the size (for chats: the last-active day).
+    pub notes: BTreeMap<String, String>,
+    /// Heading each row sits under, instead of the folder part of its id.
+    pub groups: BTreeMap<String, String>,
+    /// Chats instead of research documents (wording only).
+    pub chats: bool,
+}
+
 struct Row {
     doc: String,
     shown: String,
+    note: String,
+    /// Lower-case label and heading, for the filter box.
+    find: String,
     heading: Option<String>,
     on: bool,
     readable: bool,
@@ -59,21 +76,34 @@ fn folder(d: &str) -> &str {
 
 /// Rows for `docs`, with a folder heading wherever the folder changes (only when more than one
 /// folder shows).
-fn rows(docs: &[String], sec: &Section, sizes: &Sizes) -> Vec<Row> {
-    let folders: HashSet<&str> = docs.iter().map(|d| folder(d)).collect();
-    let grouped = folders.len() > 1;
-    let mut last: Option<&str> = None;
+fn rows(docs: &[String], sec: &Section, sizes: &Sizes, look: &Look) -> Vec<Row> {
+    let group = |d: &str| -> String {
+        look.groups.get(d).cloned().unwrap_or_else(|| {
+            let f = folder(d);
+            if f.is_empty() { "(top level)".to_string() } else { format!("{f}/") }
+        })
+    };
+    let folders: HashSet<String> = docs.iter().map(|d| group(d)).collect();
+    let grouped = folders.len() > 1 || !look.groups.is_empty();
+    let mut last: Option<String> = None;
     docs.iter()
         .map(|d| {
-            let f = folder(d);
-            let heading = (grouped && last != Some(f)).then(|| {
-                last = Some(f);
-                if f.is_empty() { "(top level)".to_string() } else { format!("{f}/") }
+            let f = group(d);
+            let heading = (grouped && last.as_ref() != Some(&f)).then(|| {
+                last = Some(f.clone());
+                f.clone()
             });
             let readable = sizes.contains_key(d);
+            let shown = match look.labels.get(d) {
+                Some(l) => l.clone(),
+                None if grouped => d.rsplit('/').next().unwrap_or(d).to_string(),
+                None => d.clone(),
+            };
             Row {
                 doc: d.clone(),
-                shown: if grouped { d.rsplit('/').next().unwrap_or(d).to_string() } else { d.clone() },
+                find: format!("{shown} {f} {d}").to_lowercase(),
+                note: look.notes.get(d).cloned().unwrap_or_default(),
+                shown,
                 heading,
                 on: readable && sec.ticked.contains(d),
                 readable,
@@ -83,7 +113,18 @@ fn rows(docs: &[String], sec: &Section, sizes: &Sizes) -> Vec<Row> {
         .collect()
 }
 
-fn subtitle(sec: &Section) -> String {
+fn subtitle(sec: &Section, look: &Look) -> String {
+    if look.chats {
+        let kept = sec.ticked.len();
+        return if sec.first {
+            "new preset: nothing saved yet. Tick the chats this one needs; tick Remember to keep them as its preset."
+                .into()
+        } else if sec.new.is_empty() {
+            format!("saved preset: {kept} chats")
+        } else {
+            format!("saved preset: {kept} chats, {} newer chats since (marked NEW)", sec.new.len())
+        };
+    }
     if sec.first {
         if sec.kind == SetKind::Custom {
             "new set: nothing saved yet. Tick the research this one needs; it is saved as its preset.".into()
@@ -103,6 +144,8 @@ fn subtitle(sec: &Section) -> String {
 struct App {
     sections: Vec<SectionState>,
     sizes: Sizes,
+    chats: bool,
+    filter: String,
     setup: bool,
     names: String,
     command: String,
@@ -148,9 +191,17 @@ impl App {
         self.finish(ctx, Outcome::Picked(picks));
     }
 
-    fn doc_rows(ui: &mut egui::Ui, rows: &mut [Row], sizes: &Sizes, indent: f32, grouped_indent: f32) {
+    fn doc_rows(ui: &mut egui::Ui, rows: &mut [Row], sizes: &Sizes, indent: f32, grouped_indent: f32, filter: &str) {
+        let mut heading: Option<&String> = None;
         for r in rows {
-            if let Some(h) = &r.heading {
+            if r.heading.is_some() {
+                heading = r.heading.as_ref();
+            }
+            if !filter.is_empty() && !r.find.contains(filter) {
+                continue;
+            }
+            // with a filter on, a heading shows above the first row of its group that matches
+            if let Some(h) = heading.take() {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(indent);
@@ -158,11 +209,14 @@ impl App {
                 });
             }
             ui.horizontal(|ui| {
-                ui.add_space(if r.heading.is_some() || grouped_indent > indent { grouped_indent } else { indent });
+                ui.add_space(if grouped_indent > indent { grouped_indent } else { indent });
                 if r.readable {
                     let k = sizes.get(&r.doc).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64;
                     ui.checkbox(&mut r.on, &r.shown);
                     ui.label(RichText::new(format!("~{k:.0}k")).small());
+                    if !r.note.is_empty() {
+                        ui.label(RichText::new(&r.note).small().weak());
+                    }
                     if r.new {
                         ui.label(RichText::new("NEW").strong().color(Color32::from_rgb(0xff, 0xcc, 0x33)));
                     }
@@ -207,7 +261,11 @@ impl eframe::App for App {
         egui::Panel::top("head").frame(margin).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let title = if self.setup { "Change the saved presets" } else { "Claude Code wants to load research" };
+                let title = match (self.setup, self.chats) {
+                    (true, _) => "Change the saved presets",
+                    (false, true) => "Claude Code wants to load earlier chats",
+                    (false, false) => "Claude Code wants to load research",
+                };
                 ui.label(RichText::new(title).heading().strong());
                 ui.label(RichText::new(" for ").heading());
                 ui.label(RichText::new(&self.names).heading().strong());
@@ -221,6 +279,22 @@ impl eframe::App for App {
             if !self.setup && !self.command.is_empty() {
                 ui.label(RichText::new(format!("Asked by: {}", self.command)).small().monospace());
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Filter:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text(if self.chats {
+                            "words from the first prompt or the folder"
+                        } else {
+                            "words from the name"
+                        })
+                        .desired_width(ui.available_width() - 70.0),
+                );
+                if !self.filter.is_empty() && ui.button("Clear").clicked() {
+                    self.filter.clear();
+                }
+            });
         });
 
         let mut ok_clicked = false;
@@ -228,11 +302,12 @@ impl eframe::App for App {
         egui::Panel::bottom("bar").frame(margin).show(ui, |ui| {
             let k = chosen.iter().map(|d| self.k(d)).fold(0.0, |a, b| a + b); // an empty f64 sum is -0.0
             let tail = if self.setup { "" } else { " will be loaded" };
-            ui.label(RichText::new(format!("{} documents, ~{k:.0}k tokens{tail}", chosen.len())).strong());
+            let noun = if self.chats { "chats" } else { "documents" };
+            ui.label(RichText::new(format!("{} {noun}, ~{k:.0}k tokens{tail}", chosen.len())).strong());
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label =
-                    if self.setup { "Save presets".to_string() } else { format!("Load {} documents", chosen.len()) };
+                    if self.setup { "Save presets".to_string() } else { format!("Load {} {noun}", chosen.len()) };
                 let ok = egui::Button::new(RichText::new(label).strong()).fill(if can_ok {
                     ui.visuals().selection.bg_fill
                 } else {
@@ -248,16 +323,19 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let sizes = self.sizes.clone();
                 let setup = self.setup;
+                let filter = self.filter.trim().to_lowercase();
                 for sec in &mut self.sections {
                     ui.add_space(12.0);
                     ui.label(RichText::new(&sec.name).heading().strong());
                     ui.label(RichText::new(&sec.sub).small());
                     ui.horizontal(|ui| {
-                        if ui.button("Select all").clicked() {
-                            sec.rows_mut().for_each(|r| r.on = r.readable);
+                        // with a filter on, the buttons act on the rows that show
+                        let hit = |r: &Row| filter.is_empty() || r.find.contains(&filter);
+                        if ui.button(if filter.is_empty() { "Select all" } else { "Select shown" }).clicked() {
+                            sec.rows_mut().filter(|r| hit(r)).for_each(|r| r.on = r.readable);
                         }
-                        if ui.button("Select none").clicked() {
-                            sec.rows_mut().for_each(|r| r.on = false);
+                        if ui.button(if filter.is_empty() { "Select none" } else { "Unselect shown" }).clicked() {
+                            sec.rows_mut().filter(|r| hit(r)).for_each(|r| r.on = false);
                         }
                         if ui.add_enabled(!sec.first, egui::Button::new("Back to saved preset")).clicked() {
                             let saved = sec.saved.clone();
@@ -265,7 +343,7 @@ impl eframe::App for App {
                         }
                     });
                     let grouped = sec.main.iter().any(|r| r.heading.is_some());
-                    App::doc_rows(ui, &mut sec.main, &sizes, 12.0, if grouped { 24.0 } else { 12.0 });
+                    App::doc_rows(ui, &mut sec.main, &sizes, 12.0, if grouped { 24.0 } else { 12.0 }, &filter);
                     if !sec.other.is_empty() {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -274,9 +352,17 @@ impl eframe::App for App {
                             egui::CollapsingHeader::new(&sec.other_label)
                                 .id_salt(id)
                                 .default_open(sec.other_open)
+                                .open((!filter.is_empty()).then_some(true))
                                 .show(ui, |ui| {
                                     let grouped = sec.other.iter().any(|r| r.heading.is_some());
-                                    App::doc_rows(ui, &mut sec.other, &sizes, 0.0, if grouped { 12.0 } else { 0.0 });
+                                    App::doc_rows(
+                                        ui,
+                                        &mut sec.other,
+                                        &sizes,
+                                        0.0,
+                                        if grouped { 12.0 } else { 0.0 },
+                                        &filter,
+                                    );
                                 });
                         });
                     }
@@ -316,7 +402,7 @@ fn have_display() -> Result<(), String> {
 }
 
 /// Show the chooser and wait for the user. Err when no window can be shown.
-pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str) -> Result<Outcome, String> {
+pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str, look: &Look) -> Result<Outcome, String> {
     have_display()?;
     let states = sections
         .iter()
@@ -324,13 +410,14 @@ pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str) -> 
             let other_open = sec.main.is_empty();
             SectionState {
                 name: sec.name.clone(),
-                sub: subtitle(sec),
-                main: rows(&sec.main, sec, &sizes),
-                other: rows(&sec.other, sec, &sizes),
-                other_label: if other_open {
-                    "Your library: tick the research to use".into()
-                } else {
-                    format!("Add other research from your library ({} more)", sec.other.len())
+                sub: subtitle(sec, look),
+                main: rows(&sec.main, sec, &sizes, look),
+                other: rows(&sec.other, sec, &sizes, look),
+                other_label: match (other_open, look.chats) {
+                    (true, true) => "Your chats: tick the ones to load".into(),
+                    (true, false) => "Your library: tick the research to use".into(),
+                    (false, true) => format!("Add other chats ({} more)", sec.other.len()),
+                    (false, false) => format!("Add other research from your library ({} more)", sec.other.len()),
                 },
                 other_open,
                 saved: sec.ticked.clone(),
@@ -344,6 +431,8 @@ pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str) -> 
     let app = App {
         sections: states,
         sizes,
+        chats: look.chats,
+        filter: String::new(),
         setup,
         names,
         command: command.to_string(),
@@ -352,7 +441,8 @@ pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str) -> 
         result: Arc::clone(&result),
         closing: false,
     };
-    let title = format!("The Researcher - {}", if setup { "change saved presets" } else { "choose research to load" });
+    let what = if look.chats { "choose chats to load" } else { "choose research to load" };
+    let title = format!("The Researcher - {}", if setup { "change saved presets" } else { what });
     let size = if app.shot.is_some() { [720.0, 560.0] } else { [720.0, 780.0] };
     run(&title, size, Box::new(app))?;
     let out = result.lock().expect("not poisoned").take();
