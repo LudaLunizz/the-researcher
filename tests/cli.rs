@@ -78,13 +78,21 @@ impl Env {
             .env("XDG_DATA_HOME", &self.data)
             .env("XDG_CONFIG_HOME", self.tmp.join("xdg-config"))
             .env("XDG_CACHE_HOME", self.tmp.join("xdg-cache"))
-            .env_remove("RESEARCHER_LIBRARY");
+            .env_remove("RESEARCHER_LIBRARY")
+            .env_remove("CLAUDE_CODE_SESSION_ID"); // the tests may run inside Claude Code
         c
     }
 
     /// (exit code, stdout) of `researcher --config CFG --out OUT ARGS...`
     fn run(&self, args: &[&str]) -> (i32, String) {
-        let o = self.cmd().arg("--config").arg(&self.cfg).arg("--out").arg(&self.out).args(args).output().unwrap();
+        self.run_with(args, &[])
+    }
+
+    /// `run` with extra environment variables.
+    fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+        let mut c = self.cmd();
+        c.envs(env.iter().copied());
+        let o = c.arg("--config").arg(&self.cfg).arg("--out").arg(&self.out).args(args).output().unwrap();
         (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into_owned())
     }
 
@@ -892,6 +900,115 @@ fn sessions_need_no_library() {
     let s = sessions_env();
     write(&s.e.cfg, &format!("[sessions]\nenabled = true\nprojects_dir = \"{}\"\n", s.proj.display()));
     assert_eq!(s.e.run(&["--sessions"]).0, 0);
+}
+
+// ---------------------------------------------------------------- --context: earlier chats
+
+const SID4: &str = "44444444-4444-4444-8444-444444444444";
+
+/// The sessions setup plus a newer chat in a second folder.
+fn context_env() -> (Sess, PathBuf) {
+    let s = sessions_env();
+    let entry = serde_json::json!({"type": "user", "timestamp": "2026-11-17T09:00:00Z", "cwd": "/work/web",
+                                   "message": {"role": "user", "content": "Newest chat, other folder"}});
+    jl(&s.proj.join("-work-web").join(format!("{SID4}.jsonl")), &[entry], 3600);
+    let presets = s.e.conf_dir.join("contexts.json");
+    (s, presets)
+}
+
+fn save_preset(path: &Path, name: &str, selected: &[&str]) {
+    write(path, &serde_json::json!({name: {"selected": selected, "known": []}}).to_string());
+}
+
+fn known(path: &Path, name: &str) -> Vec<String> {
+    let v: Value = serde_json::from_str(&read(path)).unwrap();
+    v[name]["known"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn context_needs_sessions_on() {
+    let (s, _) = context_env();
+    write(&s.e.cfg, &format!("library = \"{}\"\n", s.e.lib.display()));
+    let (code, out) = s.e.run(&["--context"]);
+    assert_eq!(code, 7);
+    assert!(out.contains("SESSIONS OFF"));
+}
+
+#[test]
+fn context_new_preset_without_popup_loads_nothing() {
+    let (s, _) = context_env();
+    let (code, out) = s.e.run(&["--context", "noname"]);
+    assert_eq!(code, 5);
+    assert!(out.contains("context preset noname has no saved choice yet"), "{out}");
+    assert!(!s.e.out.exists());
+}
+
+#[test]
+fn context_setup_saves_all_chats_newest_folder_first() {
+    let (s, presets) = context_env();
+    assert_eq!(s.e.run(&["--context", "--setup", "work"]).0, 5);
+    save_preset(&presets, "work", &[]);
+    let (code, out) = s.e.run(&["--context", "--setup", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("SAVED context preset work: 0 of 4 chats"), "{out}");
+    // /work/web has the newest chat; then newest first (ties by id); the open SID3 is offered
+    assert_eq!(known(&presets, "work"), [SID4, SID1, SID2, SID3]);
+}
+
+#[test]
+fn context_never_offers_the_running_chat() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[]);
+    s.e.run_with(&["--context", "--setup", "work"], &[("CLAUDE_CODE_SESSION_ID", SID3)]);
+    assert!(!known(&presets, "work").contains(&SID3.to_string()));
+}
+
+#[test]
+fn context_preset_loads_chats_named_by_first_prompt() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[SID2, SID4, "99999999-9999-4999-8999-999999999999"]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("CHAT \"Second one\" ({SID2})")), "{out}"); // first prompt, not the AI title
+    assert!(out.contains(&format!("CHAT \"Newest chat, other folder\" ({SID4})")));
+    assert!(out.contains("MISSING  chat 99999999-9999-4999-8999-999999999999"));
+    assert!(out.contains("total: 2 chats"));
+    assert!(!out.contains(SID1));
+    let paths: Vec<&str> =
+        out.lines().filter(|l| !l.contains("total")).filter_map(|l| l.split_once("chars  ").map(|(_, p)| p)).collect();
+    assert_eq!(paths.len(), 2);
+    assert!(read(Path::new(paths[0])).contains("USER: Newest chat")); // in list order
+    assert!(read(Path::new(paths[1])).contains("USER: Second one"));
+}
+
+#[test]
+fn context_manual_name_wins_over_first_prompt() {
+    let (s, presets) = context_env();
+    s.e.run(&["--sessions"]);
+    s.e.run(&["--rename", SID2, "my name"]);
+    save_preset(&presets, "work", &[SID2]);
+    let (_, out) = s.e.run(&["--context", "work"]);
+    assert!(out.contains(&format!("CHAT \"my name\" ({SID2})")), "{out}");
+}
+
+#[test]
+fn context_leaves_open_chats_out_of_the_sessions_list() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[]);
+    s.e.run(&["--context", "--setup", "work"]);
+    let (_, out) = s.e.run(&["--sessions"]);
+    assert!(!out.contains(SID3));
+    assert!(out.contains("3 closed sessions"), "{out}");
+}
+
+#[test]
+fn context_list_and_bad_names() {
+    let (s, presets) = context_env();
+    assert!(s.e.run(&["--context", "--list"]).1.contains("no context presets saved yet"));
+    save_preset(&presets, "work", &[SID1]);
+    let (_, out) = s.e.run(&["--context", "--list"]);
+    assert!(out.contains("work") && out.contains("1 chats"), "{out}");
+    assert_eq!(s.e.run(&["--context", "a/b"]).0, 2);
 }
 
 // ---------------------------------------------------------------- parity with the Python version

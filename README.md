@@ -111,6 +111,7 @@ The original Python version, `skills/researcher/researcher.py`, still works and 
    cd the-researcher
    mkdir -p ~/.claude/skills
    cp -r skills/researcher ~/.claude/skills/        # or: ln -s "$PWD/skills/researcher" ~/.claude/skills/researcher
+   cp -r skills/load-context ~/.claude/skills/      # optional: /load-context for earlier chats
 
    researcher --init ~/research                     # optional: writes ~/.config/researcher/config.toml
    ```
@@ -158,11 +159,14 @@ researcher --sessions             list tracked closed sessions (opt-in, see Sess
 researcher --rename ID NAME       rename a tracked session
 researcher --resume ID            print the command that resumes a session
 researcher --session-load ID      write a session's conversation as a .txt to load as context
+researcher --context [PRESET ...] pick earlier chats in a popup and load them (see Earlier chats)
+researcher --context --setup P    change a context preset, load nothing
+researcher --context --list       list the saved context presets
 ```
 
 It prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous, 9 usage sharing not switched on (`--usage-send`), 1 a send failed (the records stay queued).
 
-Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`, `usage-sent`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
+Files: config, saved choices, the session registry and context presets in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`, `contexts.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`, `usage-sent`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
 
 ## Sessions (optional)
 
@@ -180,6 +184,16 @@ Then `researcher --sessions` lists every closed Claude Code session, newest firs
 Name and id are stored together, keyed by the full id, and every command prints them together (`"name" (id)`), so a name can't drift onto the wrong session. `ID` may be a unique prefix of 4 or more characters. `--resume ID` prints `cd <project folder> && claude --resume <id>` (Claude Code only finds a session from its own folder). `--session-load ID` writes the session's prompts and replies, without tool output, as a `.txt`; the skill reads it like a research document. Sessions longer than 200,000 characters keep their start and their end.
 
 The registry only reads `~/.claude/projects`; it never changes your transcripts. Sessions are loaded as reference material, the same caution as the documents below applies.
+
+## Earlier chats as context (`/load-context`)
+
+With sessions switched on, `/load-context` in Claude Code (or `researcher --context`) opens the same kind of window as a research set, but it lists your earlier chats: every project folder, the most recently used folder first, newest chat first. Each chat shows its **first prompt** (or the name you gave it with `--rename`), its size in tokens and the day it was last active. A filter box finds a chat by words from its first prompt or its folder. The chat you type `/load-context` in is never listed; chats you closed a minute ago are.
+
+Presets work like custom sets. `/load-context noname` the first time shows every chat unticked; tick what belongs to noname and keep "Remember" ticked, and the next `/load-context noname` starts with those ticked. Chats added since show NEW and are never ticked on their own, and Remember is only pre-ticked the first time, so a one-off pick does not replace the preset. Without a name the preset is `default`. `--context --setup NAME` changes a preset, `--context --list` shows them, `--no-popup` loads a saved preset without asking.
+
+Each ticked chat is written like `--session-load` (prompts and replies, no tool traffic) to `~/.cache/researcher/`, and the skill reads them. Presets live in `~/.config/researcher/contexts.json`.
+
+Install the skill next to `researcher`: `cp -r skills/load-context ~/.claude/skills/` (or `ln -s "$PWD/skills/load-context" ~/.claude/skills/load-context`).
 
 ## Safety
 

@@ -512,9 +512,17 @@ def save_conf(path, conf):
 
 # ---------------------------------------------------------------- popup
 
-def popup(sections, texts, setup, command=""):
+def popup(sections, texts, setup, command="", look=None):
     """Show the chooser. Returns {set: (ticked set, remember)}, None if cancelled or "timeout".
-    Raises RuntimeError when no display/GTK 4 is available."""
+    Raises RuntimeError when no display/GTK 4 is available.
+
+    look (for --context): {"labels": {id: shown}, "notes": {id: small text}, "groups": {id:
+    heading}, "chats": True}; by default rows show the document id under its folder."""
+    look = look or {}
+    labels, notes, groups = look.get("labels", {}), look.get("notes", {}), look.get("groups", {})
+    sizes = look.get("sizes", {})
+    chats = bool(look.get("chats"))
+    noun = "chats" if chats else "documents"
     try:
         import gi
         gi.require_version("Gtk", "4.0")
@@ -531,13 +539,18 @@ def popup(sections, texts, setup, command=""):
     remember = {}
 
     def k(d):
-        return len(texts.get(d, "")) / CHARS_PER_K
+        return (sizes[d] if d in sizes else len(texts.get(d, ""))) / CHARS_PER_K
 
     def folder(d):
         return d.rpartition("/")[0]
 
-    win = Gtk.Window(title="The Researcher - " +
-                     ("change saved presets" if setup else "choose research to load"))
+    def group(d):
+        if d in groups:
+            return groups[d]
+        return folder(d) + "/" if folder(d) else "(top level)"
+
+    win = Gtk.Window(title="The Researcher - " + ("change saved presets" if setup else
+                     "choose chats to load" if chats else "choose research to load"))
     win.set_default_size(720, 780)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for m in ("top", "bottom", "start", "end"):
@@ -549,11 +562,16 @@ def popup(sections, texts, setup, command=""):
                         "Tick what each should contain, then press <b>Save presets</b>. "
                         "Nothing is loaded.")
     else:
-        head.set_markup(f"<big><b>Claude Code wants to load research</b></big> for {names}\n"
+        what = "earlier chats" if chats else "research"
+        head.set_markup(f"<big><b>Claude Code wants to load {what}</b></big> for {names}\n"
                         "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
                         "Claude until then; <b>Cancel</b> loads nothing."
                         + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
     outer.append(head)
+    search = Gtk.SearchEntry(placeholder_text="Filter: words from the first prompt or the folder"
+                             if chats else "Filter: words from the name")
+    outer.append(search)
+    rows = []  # (lower-case search text, CheckButton, heading label or None)
     scroll = Gtk.ScrolledWindow(vexpand=True)
     body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     scroll.set_child(body)
@@ -562,44 +580,52 @@ def popup(sections, texts, setup, command=""):
 
     def update(*_):
         c = {d for lst in boxes.values() for d, cb in lst if cb.get_active()}
-        total.set_markup(f"<b>{len(c)} documents, ~{sum(k(d) for d in c):.0f}k tokens</b>"
+        total.set_markup(f"<b>{len(c)} {noun}, ~{sum(k(d) for d in c):.0f}k tokens</b>"
                          + ("" if setup else " will be loaded"))
-        ok.set_label(f"Save presets" if setup else f"Load {len(c)} documents")
+        ok.set_label("Save presets" if setup else f"Load {len(c)} {noun}")
         ok.set_sensitive(setup or bool(c))
 
     def add_docs(target, docs, sec, lst):
         """Check boxes for `docs`, with a small folder heading when more than one folder shows."""
-        folders = {folder(d) for d in docs}
-        last = None
+        grouped = len({group(d) for d in docs}) > 1 or bool(groups)
+        last = h = None
         for d in docs:
-            if len(folders) > 1 and folder(d) != last:
-                last = folder(d)
+            if grouped and group(d) != last:
+                last = group(d)
                 h = Gtk.Label(xalign=0)
-                h.set_markup(f"<small><b>{esc(last + '/' if last else '(top level)')}</b></small>")
+                h.set_markup(f"<small><b>{esc(last)}</b></small>")
                 h.set_margin_top(6)
                 h.set_margin_start(12)
                 target.append(h)
             cb = Gtk.CheckButton()
             l = Gtk.Label(xalign=0)
-            shown = d.rpartition("/")[2] if len(folders) > 1 else d
+            shown = labels.get(d) or (d.rpartition("/")[2] if grouped else d)
+            rows.append((f"{shown} {group(d)} {d}".lower(), cb, h))
             if d in texts:
+                note = f"  <small><span alpha='60%'>{esc(notes[d])}</span></small>" if notes.get(d) else ""
                 extra = "  <span foreground='#ffcc33'><b>NEW</b></span>" if d in sec["new"] else ""
-                l.set_markup(f"{esc(shown)}  <small>~{k(d):.0f}k</small>{extra}")
+                l.set_markup(f"{esc(shown)}  <small>~{k(d):.0f}k</small>{note}{extra}")
                 cb.set_active(d in sec["ticked"])
             else:
                 l.set_markup(f"<s>{esc(shown)}</s>  <span foreground='#ff6666'>"
                              "MISSING or unreadable</span>")
                 cb.set_sensitive(False)
             cb.set_child(l)
-            cb.set_margin_start(24 if len(folders) > 1 else 12)
+            cb.set_margin_start(24 if grouped else 12)
             cb.connect("toggled", update)
             target.append(cb)
             lst.append((d, cb))
 
+    expanders = []
     for sec in sections:
         n = sec["name"]
         custom = sec["kind"] == "custom"
-        if sec["first"]:
+        if chats:
+            sub = ("new preset: nothing saved yet. Tick the chats this one needs; tick Remember to "
+                   "keep them as its preset." if sec["first"] else
+                   f"saved preset: {len(sec['ticked'])} chats" + (
+                       f", {len(sec['new'])} newer chats since (marked NEW)" if sec["new"] else ""))
+        elif sec["first"]:
             sub = ("new set: nothing saved yet. Tick the research this one needs; it is saved "
                    "as its preset." if custom else
                    f"{len(sec['docs'])} documents (no preset saved yet, all ticked)")
@@ -612,8 +638,10 @@ def popup(sections, texts, setup, command=""):
         body.append(lbl)
         lst = []
         row = Gtk.Box(spacing=6)
-        for text, fn in (("Select all", lambda l: [cb.set_active(cb.get_sensitive()) for _, cb in l]),
-                         ("Select none", lambda l: [cb.set_active(False) for _, cb in l]),
+        for text, fn in (("Select all", lambda l: [cb.set_active(cb.get_sensitive())
+                                                   for _, cb in l if cb.get_visible()]),
+                         ("Select none", lambda l: [cb.set_active(False)
+                                                    for _, cb in l if cb.get_visible()]),
                          ("Back to saved preset", None)):
             b = Gtk.Button(label=text)
             if fn is None:
@@ -628,9 +656,14 @@ def popup(sections, texts, setup, command=""):
             add_docs(body, sec["main"], sec, lst)
         if sec["other"]:
             inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            ex = Gtk.Expander(label=("Your library: tick the research to use"
-                                     if not sec["main"] else
-                                     f"Add other research from your library ({len(sec['other'])} more)"))
+            if chats:
+                label = ("Your chats: tick the ones to load" if not sec["main"] else
+                         f"Add other chats ({len(sec['other'])} more)")
+            else:
+                label = ("Your library: tick the research to use" if not sec["main"] else
+                         f"Add other research from your library ({len(sec['other'])} more)")
+            ex = Gtk.Expander(label=label)
+            expanders.append(ex)
             ex.set_margin_start(12)
             ex.set_margin_top(6)
             ex.set_expanded(not sec["main"])
@@ -667,6 +700,22 @@ def popup(sections, texts, setup, command=""):
         finish({n: ({d for d, cb in lst if cb.get_active()}, remember[n].get_active())
                 for n, lst in boxes.items()})
 
+    def refilter(*_):
+        q = search.get_text().strip().lower()
+        shown_heads = set()
+        for find, cb, h in rows:
+            hit = not q or q in find
+            cb.set_visible(hit)
+            if hit and h is not None:
+                shown_heads.add(id(h))
+        for _, _, h in rows:
+            if h is not None:
+                h.set_visible(not q or id(h) in shown_heads)
+        if q:
+            for ex in expanders:
+                ex.set_expanded(True)
+
+    search.connect("search-changed", refilter)
     cancel.connect("clicked", lambda *_: finish(None))
     ok.connect("clicked", done)
     win.connect("close-request", lambda *_: (finish(None), False)[1])
@@ -1155,10 +1204,12 @@ def save_registry(path, reg):
     os.replace(tmp, path)
 
 
-def scan_sessions(reg, settings, now=None):
-    """Add closed sessions to the registry and refresh the changed ones. Returns the number added."""
+def scan_sessions(reg, settings, now=None, idle=None, skip=""):
+    """Add sessions untouched for `idle` seconds (default: idle_minutes) to the registry and
+    refresh the changed ones (never `skip`, the session that runs this). Returns the number added."""
     import time
     now = time.time() if now is None else now
+    idle = float(settings["idle_minutes"]) * 60 if idle is None else idle
     added = 0
     base = settings["projects_dir"]
     try:
@@ -1173,19 +1224,21 @@ def scan_sessions(reg, settings, now=None):
             continue
         for fn in files:
             sid = fn[:-6]
-            if not fn.endswith(".jsonl") or not SESSION_ID_RE.fullmatch(sid):
+            if not fn.endswith(".jsonl") or not SESSION_ID_RE.fullmatch(sid) or sid == skip:
                 continue
             path = os.path.join(pdir, fn)
             try:
                 mtime = os.path.getmtime(path)
             except OSError:
                 continue
-            if now - mtime < float(settings["idle_minutes"]) * 60:
+            if now - mtime < idle:
                 continue  # probably still open
             rec = reg["sessions"].get(sid)
-            if rec and rec.get("mtime") == mtime and rec.get("file") == path:
+            if (rec and rec.get("mtime") == mtime and rec.get("file") == path
+                    and "first" in rec and "chars" in rec):
                 continue
-            info = session_info(read_transcript(path))
+            entries = read_transcript(path)
+            info = session_info(entries)
             if not info["first"] and not info["title"]:
                 continue  # nothing was ever asked
             auto = clean_name(info["title"] or info["first"])
@@ -1196,7 +1249,9 @@ def scan_sessions(reg, settings, now=None):
             elif rec.get("name_source") != "manual":
                 rec["name"] = auto
             rec.update(file=path, mtime=mtime, project=proj, cwd=info["cwd"],
-                       started=info["started"], last=info["last"])
+                       started=info["started"], last=info["last"],
+                       first=clean_name(info["first"]) if info["first"] else None)
+            rec["chars"] = len(session_text(sid, rec, entries))
     return added
 
 
@@ -1228,12 +1283,12 @@ def resume_command(sid, rec):
     return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
 
 
-def session_text(sid, rec):
+def session_text(sid, rec, entries=None):
     """The conversation of a session as plain text: prompts and replies, no tool traffic."""
     parts = [f"SESSION: {rec['name']}", f"SESSION ID: {sid}",
              f"PROJECT FOLDER: {rec.get('cwd') or rec.get('project', '')}",
              f"LAST ACTIVE: {(rec.get('last') or '')[:16].replace('T', ' ')}", ""]
-    for e in read_transcript(rec["file"]):
+    for e in read_transcript(rec["file"]) if entries is None else entries:
         if e.get("type") == "user":
             text = real_prompt(e)
             who = "USER"
@@ -1292,13 +1347,175 @@ def sessions_main(args, cfg, reg_path, out_dir):
     except ConfigError as e:
         print(f"SESSION ERROR: {e}")
         return 8
-    items = sorted(reg["sessions"].items(),
+    # --context also registers sessions that were open a moment ago; the list shows closed ones
+    import time
+    now, idle = time.time(), float(settings["idle_minutes"]) * 60
+    items = sorted(((sid, rec) for sid, rec in reg["sessions"].items()
+                    if not isinstance(rec.get("mtime"), (int, float)) or now - rec["mtime"] >= idle),
                    key=lambda kv: kv[1].get("last") or kv[1].get("started") or "", reverse=True)
     print(f"{len(items)} closed sessions tracked ({added} new); newest first")
     for sid, rec in items[:args.limit]:
         print(session_line(sid, rec))
     if len(items) > args.limit:
         print(f"... {len(items) - args.limit} more (--limit N)")
+    return 0
+
+
+# ---------------------------------------------------------------- --context: earlier chats
+
+PRESET_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+DEFAULT_PRESET = "default"
+
+
+def shown_name(rec):
+    """What a chat is called in the picker: a name the user gave it, otherwise its first prompt."""
+    if rec.get("first") and rec.get("name_source") != "manual":
+        return rec["first"]
+    return rec.get("name", "")
+
+
+def chat_folder(rec):
+    """The heading a chat sits under: its project folder (~ for the home folder)."""
+    cwd = rec.get("cwd")
+    if cwd:
+        home = os.path.expanduser("~")
+        if cwd == home or cwd.startswith(home + os.sep):
+            return "~" + cwd[len(home):]
+        return cwd
+    return rec.get("project", "")
+
+
+def last_of(rec):
+    return rec.get("last") or rec.get("started") or ""
+
+
+def chat_catalog(reg, skip):
+    """Every chat that can be loaded, by folder (the folder used most recently first), newest
+    first inside a folder."""
+    folders = {}
+    for sid, rec in reg["sessions"].items():
+        if sid == skip or not os.path.isfile(rec.get("file") or ""):
+            continue
+        folders.setdefault(chat_folder(rec), []).append((last_of(rec), sid))
+    # sorts are stable (also with reverse=True): newest first, ties by name
+    order = sorted(sorted(folders), key=lambda f: max(t for t, _ in folders[f]), reverse=True)
+    out = []
+    for f in order:
+        inner = sorted(sorted(folders[f], key=lambda x: x[1]), key=lambda x: x[0], reverse=True)
+        out += [sid for _, sid in inner]
+    return out
+
+
+def chat_sections(names, catalog, presets, setup):
+    """One popup section per preset, like a custom set; Remember is only pre-ticked on first use
+    (new chats come all the time; a one-off load must not replace the preset)."""
+    out = []
+    for n in names:
+        saved = presets.get(n)
+        selected = set(saved.get("selected", [])) if saved else set()
+        known = set(saved.get("known", [])) if saved else set()
+        main = [d for d in catalog if d in selected]
+        out.append({"name": n, "kind": "custom", "docs": list(catalog), "main": main,
+                    "other": [d for d in catalog if d not in selected],
+                    "new": {d for d in catalog if d not in known} if saved else set(),
+                    "ticked": set(main), "remember": saved is None or setup,
+                    "first": saved is None})
+    return out
+
+
+def context_main(args, cfg, reg_path, presets_path, out_dir):
+    """--context [PRESET ...]: pick earlier chats (all folders) in the popup and write each as a
+    .txt to load as context. Presets are saved like custom sets, in their own file."""
+    settings = sessions_settings(cfg)
+    if settings is None:
+        print("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to load earlier "
+              "chats; nothing done")
+        return 7
+    presets = load_conf(presets_path)
+    if args.list:
+        if not presets:
+            print("no context presets saved yet")
+        for n, rec in presets.items():
+            print(f"{n:20} {len(set(rec.get('selected', []))):>4} chats")
+        return 0
+    names = list(dict.fromkeys(n.strip().lower() for n in args.sets)) or [DEFAULT_PRESET]
+    bad = [n for n in names if not PRESET_RE.fullmatch(n)]
+    if bad:
+        print(f"bad preset name(s): {', '.join(bad)} (use lowercase letters, digits, . _ -)")
+        return 2
+
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID", "").lower()  # never offer the chat running this
+    reg = load_registry(reg_path)
+    scan_sessions(reg, settings, idle=0, skip=me)
+    try:
+        save_registry(reg_path, reg)
+    except OSError as e:
+        print(f"could not save the session registry to {reg_path}: {e}")
+    catalog = chat_catalog(reg, me)
+    if not catalog:
+        print(f"NO CHATS: no earlier Claude Code chats in {settings['projects_dir']}; nothing loaded")
+        return 0
+    recs = reg["sessions"]
+    secs = chat_sections(names, catalog, presets, args.setup)
+
+    picks = None
+    if not (args.no_popup or os.environ.get("RESEARCHER_NO_POPUP")):
+        texts = dict.fromkeys(catalog, "")  # every chat is readable; sizes come from the registry
+        look = {"chats": True, "sizes": {sid: int(recs[sid].get("chars") or 0) for sid in catalog}, "labels": {sid: shown_name(recs[sid]) for sid in catalog},
+                "groups": {sid: chat_folder(recs[sid]) for sid in catalog},
+                "notes": {sid: last_of(recs[sid])[:10] for sid in catalog}}
+        try:
+            picks = popup(secs, texts, args.setup, "researcher --context " + " ".join(names), look)
+        except RuntimeError as e:
+            print(f"NO POPUP ({e}): using the saved presets")
+        else:
+            if picks is None:
+                print("CANCELLED: the user closed the popup, nothing loaded")
+                return 3
+            if picks == "timeout":
+                print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded")
+                return 4
+    unsaved = [n for n in names if n not in presets]
+    if picks is None and unsaved:
+        print(f"NO POPUP: context preset {', '.join(unsaved)} has no saved choice yet; nothing loaded")
+        return 5
+    gone = []
+    if picks is None:  # a saved preset can name a chat whose transcript was deleted since
+        have = set(catalog)
+        gone = list(dict.fromkeys(d for n in names for d in presets[n].get("selected", [])
+                                  if d not in have))
+        picks = {s["name"]: (s["ticked"], False) for s in secs}
+
+    for n, (ticked, keep) in picks.items():
+        if keep or args.setup:
+            presets[n] = {"selected": [d for d in catalog if d in ticked], "known": list(catalog)}
+            print(f"SAVED context preset {n}: {len(ticked)} of {len(catalog)} chats")
+    if any(keep or args.setup for _, keep in picks.values()):
+        try:
+            save_conf(presets_path, presets)
+        except OSError as e:
+            print(f"could not save the presets to {presets_path}: {e}")
+    if args.setup:
+        print("setup only: nothing loaded")
+        return 0
+
+    chosen = {d for t, _ in picks.values() for d in t}
+    sids = [d for d in catalog if d in chosen]
+    docs = [f"sessions/{sid}" for sid in sids]
+    texts = {f"sessions/{sid}": session_text(sid, recs[sid]) for sid in sids}
+    try:
+        written = write_outputs(out_dir, docs, texts, {f"sessions/{sid}": recs[sid]["file"] for sid in sids})
+    except OSError as e:
+        print(f"SESSION ERROR: could not write to {out_dir}: {e}")
+        return 8
+    total = 0
+    for sid, doc, path in zip(sids, docs, written):
+        total += len(texts[doc])
+        print(f'CHAT "{shown_name(recs[sid])}" ({sid})')
+        print(f"{len(texts[doc]):>7} chars  {path}")
+    for sid in gone:
+        print(f"MISSING  chat {sid} (its transcript is gone)")
+    print(f"total: {len(docs)} chats, {total} chars (~{total // CHARS_PER_K}k tokens)")
     return 0
 
 
@@ -1318,6 +1535,9 @@ def main(argv=None):
     ap.add_argument("--resume", metavar="ID", help="print the command that resumes a session")
     ap.add_argument("--session-load", metavar="ID",
                     help="write a tracked session's conversation as a .txt to load as context")
+    ap.add_argument("--context", action="store_true",
+                    help="pick earlier Claude Code chats (all folders) to load as context; "
+                         "SET names are presets")
     ap.add_argument("--limit", type=int, default=30, help="sessions shown by --sessions (default 30)")
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
@@ -1382,6 +1602,16 @@ def main(argv=None):
     if args.init is not None:
         lib = args.init or os.path.expanduser("~/research")
         return init_config(cfg_path, lib)
+
+    if args.context:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as e:
+            print(f"CONFIG ERROR: {e}")
+            return 6
+        conf_dir = os.path.dirname(cfg_path)
+        return context_main(args, cfg, os.path.join(conf_dir, "sessions.json"),
+                            os.path.join(conf_dir, "contexts.json"), args.out or cache_home())
 
     if args.sessions or args.rename or args.resume or args.session_load:
         try:
