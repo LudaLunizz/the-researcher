@@ -1,11 +1,12 @@
 // node --test test/   (Node 22.13+; the D1 stand-in is node:sqlite running the real schema.sql)
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 
 import worker from "../src/index.js";
-import { MAX_LOADS, parsePayload, recordError } from "../src/validate.js";
+import { MAX_LOADS, parsePayload, recordError, rowHash } from "../src/validate.js";
 
 const NOW = Date.UTC(2026, 10, 16, 12);
 const record = (over = {}) => ({
@@ -23,6 +24,8 @@ const record = (over = {}) => ({
   ...over,
 });
 const payload = (...loads) => ({ schema: 1, loads: loads.length ? loads : [record()] });
+/** What `researcher --usage-send` sends: schema 2, every record numbered by its log line. */
+const sent = (...loads) => ({ schema: 2, loads: loads.map((r, i) => ({ ...r, seq: r.seq ?? i + 1 })) });
 
 /** The few D1 calls the Worker uses, on an in-memory SQLite with the real schema. */
 function fakeD1() {
@@ -88,6 +91,38 @@ test("anything outside the whitelist is refused", () => {
   assert.ok(parsePayload({ schema: 2, loads: [record()] }, NOW).error);
   assert.ok(parsePayload({ schema: 1, loads: [] }, NOW).error);
   assert.ok(parsePayload({ schema: 1, loads: Array(MAX_LOADS + 1).fill(record()) }, NOW).error);
+});
+
+test("schema 2 needs a seq on every record, schema 1 allows none", () => {
+  assert.equal(parsePayload(sent(record()), NOW).error, undefined);
+  assert.equal(parsePayload(sent(record()), NOW).rows[0].seq, 1);
+  assert.equal(parsePayload(payload(), NOW).rows[0].seq, null);
+  assert.ok(parsePayload({ schema: 2, loads: [record()] }, NOW).error); // no seq
+  assert.ok(parsePayload({ schema: 1, loads: [record({ seq: 1 })] }, NOW).error); // seq in schema 1
+  for (const seq of [0, -1, 1.5, "3", null, 1_000_000_001]) {
+    assert.ok(parsePayload({ schema: 2, loads: [record({ seq })] }, NOW).error, String(seq));
+  }
+  assert.ok(parsePayload({ schema: 3, loads: [record({ seq: 1 })] }, NOW).error);
+});
+
+test("schema 1 rows keep the hash they had before seq existed", async () => {
+  const { rows } = parsePayload(payload(), NOW);
+  const old = createHash("sha256")
+    .update("7d75b3c23f2e4970|2026-11-16|7|0|4|3|0|113432|69655|69652|114|2239282|2300")
+    .digest("hex");
+  assert.equal(await rowHash(rows[0]), old);
+  assert.notEqual(await rowHash(parsePayload(sent(record()), NOW).rows[0]), old);
+});
+
+test("two identical loads with their own seq are both kept; a resend is stored once", async () => {
+  const env = { DB: fakeD1() };
+  let res = await post(sent(record(), record()), env);
+  assert.deepEqual(await res.json(), { ok: true, received: 2, new: 2 });
+  res = await post(sent(record(), record()), env);
+  assert.deepEqual(await res.json(), { ok: true, received: 2, new: 0 });
+  res = await post(sent(record({ seq: 3 })), env);
+  assert.deepEqual(await res.json(), { ok: true, received: 1, new: 1 });
+  assert.equal(env.DB.db.prepare("SELECT COUNT(*) AS n FROM loads").get().n, 3);
 });
 
 test("POST stores records and the same record twice is stored once", async () => {
