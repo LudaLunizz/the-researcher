@@ -9,6 +9,8 @@ Usage: researcher.py [SET ...]             popup, then write the ticked docs as 
        researcher.py --no-popup SET [...]  use the saved defaults, ask nothing
        researcher.py --list                show sets, saved defaults, library size
        researcher.py --init [LIBRARY]      write a starter config.toml
+       researcher.py --sessions | --rename ID NAME | --resume ID | --session-load ID
+                                           closed-session tracking (opt-in: [sessions] in config)
 
 A "library" is a folder of documents (.html, .md, .txt, .pdf). A "set" is a named list
 of documents from it, defined in config.toml. A GTK 4 popup lets the user tick what to
@@ -35,6 +37,7 @@ import html
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -509,6 +512,254 @@ def write_outputs(out_dir, docs, texts, paths):
     return [os.path.join(out_dir, fn) for fn in written]
 
 
+# ---------------------------------------------------------------- sessions (opt-in)
+# Closed Claude Code sessions: a registry keyed by the FULL session id, so a name can never
+# be separated from the id it belongs to. Names are taken from Claude Code's own title or the
+# first prompt, and can be renamed (a manual name is never overwritten by a rescan).
+
+SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+NAME_MAX = 80
+SESSION_LOAD_MAX = 200000  # chars; a longer session keeps its start and its end
+SESSION_DEFAULTS = {"idle_minutes": 10, "projects_dir": "~/.claude/projects"}
+
+
+def sessions_settings(cfg):
+    sec = cfg.get("sessions")
+    if not isinstance(sec, dict) or not sec.get("enabled"):
+        return None
+    out = dict(SESSION_DEFAULTS)
+    for k in out:
+        if k in sec:
+            out[k] = sec[k]
+    out["projects_dir"] = os.path.abspath(os.path.expanduser(str(out["projects_dir"])))
+    return out
+
+
+def clean_name(text):
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    return text if len(text) <= NAME_MAX else text[:NAME_MAX - 1].rstrip() + "…"
+
+
+def block_text(content):
+    """The plain text of a message: a string, or the text blocks of a list (tools skipped)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def read_transcript(path):
+    """Entries of a session .jsonl; unreadable or broken lines are skipped."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    out.append(d)
+    except OSError:
+        pass
+    return out
+
+
+def real_prompt(entry):
+    """The user's own prompt of an entry, or '' (tool results, meta and system text, commands)."""
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return ""
+    msg = entry.get("message")
+    text = block_text(msg.get("content") if isinstance(msg, dict) else "").strip()
+    return "" if not text or text.startswith("<") else text
+
+
+def session_info(entries):
+    title = first = cwd = None
+    started = last = None
+    for e in entries:
+        if e.get("type") == "custom-title" and e.get("customTitle"):
+            title = e["customTitle"]
+        elif e.get("type") == "ai-title" and e.get("aiTitle") and not title:
+            title = e["aiTitle"]
+        if first is None:
+            first = real_prompt(e) or None
+        cwd = cwd or e.get("cwd")
+        ts = e.get("timestamp")
+        if isinstance(ts, str):
+            started = started or ts
+            last = ts
+    return {"title": title, "first": first, "cwd": cwd, "started": started, "last": last}
+
+
+def load_registry(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            reg = json.load(f)
+        if isinstance(reg.get("sessions"), dict):
+            return reg
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {"version": 1, "sessions": {}}
+
+
+def save_registry(path, reg):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(reg, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def scan_sessions(reg, settings, now=None):
+    """Add closed sessions to the registry and refresh the changed ones. Returns the number added."""
+    import time
+    now = time.time() if now is None else now
+    added = 0
+    base = settings["projects_dir"]
+    try:
+        projects = sorted(os.listdir(base))
+    except OSError:
+        return 0
+    for proj in projects:
+        pdir = os.path.join(base, proj)
+        try:
+            files = os.listdir(pdir)
+        except OSError:
+            continue
+        for fn in files:
+            sid = fn[:-6]
+            if not fn.endswith(".jsonl") or not SESSION_ID_RE.fullmatch(sid):
+                continue
+            path = os.path.join(pdir, fn)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now - mtime < float(settings["idle_minutes"]) * 60:
+                continue  # probably still open
+            rec = reg["sessions"].get(sid)
+            if rec and rec.get("mtime") == mtime and rec.get("file") == path:
+                continue
+            info = session_info(read_transcript(path))
+            if not info["first"] and not info["title"]:
+                continue  # nothing was ever asked
+            auto = clean_name(info["title"] or info["first"])
+            if rec is None:
+                rec = reg["sessions"][sid] = {"name": auto, "name_source": "auto",
+                                              "registered": time.strftime("%Y-%m-%d %H:%M")}
+                added += 1
+            elif rec.get("name_source") != "manual":
+                rec["name"] = auto
+            rec.update(file=path, mtime=mtime, project=proj, cwd=info["cwd"],
+                       started=info["started"], last=info["last"])
+    return added
+
+
+def find_session(reg, ident):
+    """A registry id from a full id or a unique prefix (4+ characters)."""
+    ident = ident.strip().lower()
+    if ident in reg["sessions"]:
+        return ident
+    hits = [i for i in reg["sessions"] if len(ident) >= 4 and i.startswith(ident)]
+    if len(hits) == 1:
+        return hits[0]
+    raise ConfigError(f"no session matches '{ident}'" if not hits else
+                      f"'{ident}' matches {len(hits)} sessions; give more of the id")
+
+
+def session_label(sid, rec):
+    """Name and full id, always together."""
+    return f'"{rec["name"]}" ({sid})'
+
+
+def session_line(sid, rec):
+    when = (rec.get("last") or rec.get("started") or "")[:16].replace("T", " ")
+    return f"{sid}  {when:16}  {rec['name']}"
+
+
+def resume_command(sid, rec):
+    cwd = rec.get("cwd")
+    cmd = f"claude --resume {sid}"
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+
+def session_text(sid, rec):
+    """The conversation of a session as plain text: prompts and replies, no tool traffic."""
+    parts = [f"SESSION: {rec['name']}", f"SESSION ID: {sid}",
+             f"PROJECT FOLDER: {rec.get('cwd') or rec.get('project', '')}",
+             f"LAST ACTIVE: {(rec.get('last') or '')[:16].replace('T', ' ')}", ""]
+    for e in read_transcript(rec["file"]):
+        if e.get("type") == "user":
+            text = real_prompt(e)
+            who = "USER"
+        elif e.get("type") == "assistant":
+            msg = e.get("message")
+            text = block_text(msg.get("content") if isinstance(msg, dict) else "").strip()
+            who = "ASSISTANT"
+        else:
+            continue
+        if text:
+            parts.append(f"{who}: {text}\n")
+    body = "\n".join(parts)
+    if len(body) > SESSION_LOAD_MAX:
+        keep = SESSION_LOAD_MAX // 5
+        body = (body[:keep] + f"\n\n[... {len(body) - SESSION_LOAD_MAX} characters left out "
+                "of the middle ...]\n\n" + body[-(SESSION_LOAD_MAX - keep):])
+    return body
+
+
+def sessions_main(args, cfg, reg_path, out_dir):
+    settings = sessions_settings(cfg)
+    if settings is None:
+        print("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to track "
+              "closed sessions; nothing done")
+        return 7
+    reg = load_registry(reg_path)
+    added = scan_sessions(reg, settings)
+    try:
+        if args.rename:
+            sid = find_session(reg, args.rename[0])
+            name = clean_name(args.rename[1])
+            if not name:
+                raise ConfigError("the new name is empty")
+            reg["sessions"][sid].update(name=name, name_source="manual")
+            save_registry(reg_path, reg)
+            print(f"RENAMED {session_label(sid, reg['sessions'][sid])}")
+            return 0
+        save_registry(reg_path, reg)
+        if args.resume:
+            sid = find_session(reg, args.resume)
+            print(f"SESSION {session_label(sid, reg['sessions'][sid])}")
+            print(resume_command(sid, reg["sessions"][sid]))
+            return 0
+        if args.session_load:
+            sid = find_session(reg, args.session_load)
+            rec = reg["sessions"][sid]
+            if not os.path.isfile(rec.get("file", "")):
+                raise ConfigError(f"the transcript of {session_label(sid, rec)} is gone")
+            text = session_text(sid, rec)
+            doc = f"sessions/{sid}"
+            written = write_outputs(out_dir, [doc], {doc: text}, {doc: rec["file"]})
+            print(f"SESSION {session_label(sid, rec)}")
+            print(f"{len(text):>7} chars  {written[0]}")
+            print(f"total: 1 session, {len(text)} chars (~{len(text) // CHARS_PER_K}k tokens)")
+            return 0
+    except ConfigError as e:
+        print(f"SESSION ERROR: {e}")
+        return 8
+    items = sorted(reg["sessions"].items(),
+                   key=lambda kv: kv[1].get("last") or kv[1].get("started") or "", reverse=True)
+    print(f"{len(items)} closed sessions tracked ({added} new); newest first")
+    for sid, rec in items[:args.limit]:
+        print(session_line(sid, rec))
+    if len(items) > args.limit:
+        print(f"... {len(items) - args.limit} more (--limit N)")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
@@ -519,6 +770,13 @@ def main(argv=None):
     ap.add_argument("--no-popup", action="store_true",
                     help="use the saved defaults, ask nothing (same as RESEARCHER_NO_POPUP=1)")
     ap.add_argument("--list", action="store_true", help="list sets and saved defaults")
+    ap.add_argument("--sessions", action="store_true",
+                    help="list tracked closed sessions (needs [sessions] enabled = true)")
+    ap.add_argument("--rename", nargs=2, metavar=("ID", "NAME"), help="rename a tracked session")
+    ap.add_argument("--resume", metavar="ID", help="print the command that resumes a session")
+    ap.add_argument("--session-load", metavar="ID",
+                    help="write a tracked session's conversation as a .txt to load as context")
+    ap.add_argument("--limit", type=int, default=30, help="sessions shown by --sessions (default 30)")
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
     ap.add_argument("--library", help="library folder (overrides config and RESEARCHER_LIBRARY)")
@@ -531,6 +789,15 @@ def main(argv=None):
     if args.init is not None:
         lib = args.init or os.path.expanduser("~/research")
         return init_config(cfg_path, lib)
+
+    if args.sessions or args.rename or args.resume or args.session_load:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as e:
+            print(f"CONFIG ERROR: {e}")
+            return 6
+        return sessions_main(args, cfg, os.path.join(os.path.dirname(cfg_path), "sessions.json"),
+                             args.out or cache_home())
 
     try:
         cfg = load_config(cfg_path)

@@ -28,3 +28,7 @@ docs = ["myapp/roadmap"]
 
 # Any other name (for example `/researcher side-project`) is a custom set:
 # the first call shows the whole library and you tick what that project needs.
+
+# Optional: track closed Claude Code sessions (names + session ids), resume them, load them as context.
+# [sessions]
+# enabled = true
