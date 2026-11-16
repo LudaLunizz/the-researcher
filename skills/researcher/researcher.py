@@ -59,7 +59,7 @@ INDEX_NAMES = tuple("index" + e for e in DOC_EXTS)
 POPUP_TIMEOUT = 540  # seconds; the skill runs this with a 600 s Bash timeout
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
 RESERVED = {"all"}
-CHARS_PER_K = 2300  # ~2.3 chars per token, measured with count_tokens (see README)
+CHARS_PER_K = 2400  # ~2.4 chars per token, measured with count_tokens (see README)
 
 
 class ConfigError(Exception):
