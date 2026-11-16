@@ -22,6 +22,25 @@ The first picture is a set with a saved preset: the documents you ticked last ti
 
 Both pictures use the made-up documents in [examples/library](examples/library). `tools/screenshots.py` makes them again (it opens the popup twice for two seconds, needs a display, and touches none of your own files).
 
+## What it saves
+
+Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16 Nov 2026) on four reports that exist as HTML and as PDF, about 91 KB of HTML in total. Each was counted three ways: as the raw HTML, as the text the researcher converts it to, and as the PDF.
+
+| Document | Raw HTML | Converted text | PDF |
+|---|---:|---:|---:|
+| C in Linux | 18,403 | 8,614 | 21,379 |
+| Go in Linux | 12,603 | 5,537 | 13,564 |
+| C++ in Linux | 6,151 | 4,458 | 10,811 |
+| Kotlin for Linux | 4,912 | 3,498 | 8,284 |
+| **Total** | **42,069** | **22,107** | **54,038** |
+
+- Converting HTML to text cuts the load to **53%** of the raw HTML (47% saved). It ranged from 44% to 73% per document: pages heavy in markup, tables and inline CSS gain most.
+- A PDF read as a document costs **2.4x** the converted text, because the page images are counted as well.
+- The researcher still reads every ticked document in full. The larger saving is what you leave unticked, which costs nothing. It also replaces the search-and-read turns of "read my notes on X" with one call.
+- The sizes in the popup assume **2.3 characters per token**, the figure measured here (2.2 to 2.4). An earlier flat 4 characters per token understated the real cost by roughly 1.7x. The ratio varies with the content: code, tables and non-English text tokenize denser than prose, so treat popup sizes as close, not exact.
+
+Four documents in one language-heavy folder is a small sample, so read the percentages as indicative.
+
 ## Requirements
 
 - Python 3.11 or newer (3.11 for `tomllib`)
