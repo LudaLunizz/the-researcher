@@ -235,6 +235,115 @@ class MainTests(Env):
         cfg = R.load_config(os.path.join(HERE, "..", "examples", "config.toml"))
         self.assertIn("myapp", cfg["sets"])
 
+SID1 = "11111111-1111-4111-8111-111111111111"
+SID2 = "22222222-2222-4222-8222-222222222222"
+SID3 = "33333333-3333-4333-8333-333333333333"
+
+
+def jl(path, entries, age=3600):
+    write(path, "\n".join(json.dumps(e) for e in entries) + "\nnot json\n")
+    t = __import__("time").time() - age
+    os.utime(path, (t, t))
+
+
+def user(text, ts="2026-11-16T10:00:00Z", **kw):
+    return {"type": "user", "timestamp": ts, "cwd": "/work/app",
+            "message": {"role": "user", "content": text}, **kw}
+
+
+def assistant(text, ts="2026-11-16T10:01:00Z"):
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": text},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "secret-tool-call"}}]}}
+
+
+class SessionTests(Env):
+    def setUp(self):
+        super().setUp()
+        self.proj = os.path.join(self.tmp.name, "projects")
+        self.reg = os.path.join(self.conf_dir, "sessions.json")
+        with open(self.cfg, "a", encoding="utf-8") as f:
+            f.write(f'\n[sessions]\nenabled = true\nprojects_dir = "{self.proj}"\n')
+        d = os.path.join(self.proj, "-work-app")
+        jl(os.path.join(d, SID1 + ".jsonl"), [
+            {"type": "file-history-snapshot"},
+            user("<system-reminder>ignore me</system-reminder>", isMeta=True),
+            user("<command-message>x</command-message>"),
+            user("Fix the popup crash on   start-up"),
+            assistant("Found it, the timeout was wrong."),
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "TOOLOUT"}]}},
+        ])
+        jl(os.path.join(d, SID2 + ".jsonl"), [user("Second one"), {"type": "ai-title", "aiTitle": "Nice title"}])
+        jl(os.path.join(d, SID3 + ".jsonl"), [user("Still open")], age=5)  # modified just now
+        jl(os.path.join(d, "agent-abc.jsonl"), [user("not a session id")])
+
+    def test_off_by_default(self):
+        write(self.cfg, f'library = "{self.lib}"\n')
+        code, out = self.run_main("--sessions")
+        self.assertEqual(code, 7)
+        self.assertIn("SESSIONS OFF", out)
+        self.assertFalse(os.path.exists(self.reg))
+
+    def test_lists_closed_sessions_with_full_id(self):
+        code, out = self.run_main("--sessions")
+        self.assertEqual(code, 0)
+        self.assertIn(f"{SID1}  2026-11-16 10:01  Fix the popup crash on start-up", out)
+        self.assertIn(f"{SID2}", out)
+        self.assertIn("Nice title", out)  # Claude Code's own title wins over the first prompt
+        self.assertNotIn(SID3, out)       # still open: not tracked yet
+        self.assertNotIn("agent-abc", out)
+        self.assertIn("2 closed sessions", out)
+
+    def test_rename_sticks_and_keeps_the_id(self):
+        self.run_main("--sessions")
+        code, out = self.run_main("--rename", SID1[:8], "popup crash")
+        self.assertEqual(code, 0)
+        self.assertIn(f'"popup crash" ({SID1})', out)
+        _, out = self.run_main("--sessions")  # a rescan must not undo a manual name
+        self.assertIn(f"{SID1}  2026-11-16 10:01  popup crash", out)
+        with open(self.reg, encoding="utf-8") as f:
+            reg = json.load(f)
+        self.assertEqual(reg["sessions"][SID1]["name_source"], "manual")
+
+    def test_auto_name_follows_a_later_title_but_manual_does_not(self):
+        self.run_main("--sessions")
+        path = os.path.join(self.proj, "-work-app", SID1 + ".jsonl")
+        jl(path, [user("Fix the popup crash"), {"type": "custom-title", "customTitle": "Crash hunt"}])
+        _, out = self.run_main("--sessions")
+        self.assertIn("Crash hunt", out)
+
+    def test_ambiguous_and_unknown_ids(self):
+        self.run_main("--sessions")
+        code, out = self.run_main("--resume", "ffff")
+        self.assertEqual(code, 8)
+        self.assertIn("no session matches", out)
+        code, out = self.run_main("--rename", "", "x")
+        self.assertEqual(code, 8)
+
+    def test_resume_prints_cd_and_full_id(self):
+        self.run_main("--sessions")
+        code, out = self.run_main("--resume", SID1)
+        self.assertEqual(code, 0)
+        self.assertIn(f"cd /work/app && claude --resume {SID1}", out)
+
+    def test_session_load_writes_conversation_without_tool_traffic(self):
+        self.run_main("--sessions")
+        code, out = self.run_main("--session-load", SID1[:6])
+        self.assertEqual(code, 0)
+        path = [l.split("chars  ", 1)[1] for l in out.splitlines() if "chars  " in l and "total" not in l][0]
+        text = read(path)
+        self.assertIn(f"SESSION ID: {SID1}", text)
+        self.assertIn("USER: Fix the popup crash on   start-up", text)
+        self.assertIn("ASSISTANT: Found it", text)
+        for bad in ("ignore me", "TOOLOUT", "secret-tool-call", "hmm", "command-message"):
+            self.assertNotIn(bad, text)
+
+    def test_no_library_needed(self):
+        write(self.cfg, f'[sessions]\nenabled = true\nprojects_dir = "{self.proj}"\n')
+        self.assertEqual(self.run_main("--sessions")[0], 0)
+
+
 
 if __name__ == "__main__":
     unittest.main()

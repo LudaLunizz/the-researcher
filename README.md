@@ -72,11 +72,32 @@ researcher.py --setup SET            popup only: change the saved defaults, load
 researcher.py --no-popup SET         use the saved defaults without asking
 researcher.py --list                 sets, document counts, saved defaults
 researcher.py --init [LIBRARY]       write a starter config
+researcher.py --sessions             list tracked closed sessions (opt-in, see Sessions)
+researcher.py --rename ID NAME       rename a tracked session
+researcher.py --resume ID            print the command that resumes a session
+researcher.py --session-load ID      write a session's conversation as a .txt to load as context
 ```
 
-The script prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem.
+The script prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous.
 
-Files: config and saved choices in `~/.config/researcher/` (`config.toml`, `choices.json`), converted text in `~/.cache/researcher/`.
+Files: config, saved choices and the session registry in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`), converted text in `~/.cache/researcher/`.
+
+## Sessions (optional)
+
+Off by default. Switch it on in `config.toml`:
+
+```toml
+[sessions]
+enabled = true
+# idle_minutes = 10                  # a session untouched this long counts as closed
+# projects_dir = "~/.claude/projects"
+```
+
+Then `researcher.py --sessions` lists every closed Claude Code session, newest first: the **full session id** (the one Claude Code prints when you close a session), the last-active time and a name. The name comes from Claude Code's own title if the session has one, otherwise from the first prompt. `--rename ID NAME` replaces it, and a rescan never overwrites a name you set.
+
+Name and id are stored together, keyed by the full id, and every command prints them together (`"name" (id)`), so a name can't drift onto the wrong session. `ID` may be a unique prefix of 4 or more characters. `--resume ID` prints `cd <project folder> && claude --resume <id>` (Claude Code only finds a session from its own folder). `--session-load ID` writes the session's prompts and replies, without tool output, as a `.txt`; the skill reads it like a research document. Sessions longer than 200,000 characters keep their start and their end.
+
+The registry only reads `~/.claude/projects`; it never changes your transcripts. Sessions are loaded as reference material, the same caution as the documents below applies.
 
 ## Safety
 
