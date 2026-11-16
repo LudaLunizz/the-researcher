@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# Researcher for Claude. Copyright (C) 2026 LudaLunizz
+# The Researcher. Copyright (C) 2026 LudaLunizz
 # This program is free software: you can redistribute it and/or modify it under the terms of
 # the GNU Affero General Public License as published by the Free Software Foundation, either
 # version 3 of the License, or (at your option) any later version. It is distributed WITHOUT
 # ANY WARRANTY; see the GNU Affero General Public License (file LICENSE) for details.
-"""Researcher for Claude: load saved research documents into a Claude Code session.
+"""The Researcher: a research loader for Claude (saved research into a Claude Code session).
 
 Usage: researcher.py [SET ...]             popup, then write the ticked docs as .txt files
        researcher.py --setup SET [...]     popup only, to change the saved defaults
@@ -92,7 +92,7 @@ def library_path(cfg, override=None):
 
 
 STARTER = """\
-# Researcher for Claude: config
+# The Researcher: config
 # The folder that holds your research documents (.html, .md, .txt, .pdf).
 library = "{library}"
 
@@ -339,7 +339,7 @@ def popup(sections, texts, setup, command=""):
     def folder(d):
         return d.rpartition("/")[0]
 
-    win = Gtk.Window(title="Researcher for Claude - " +
+    win = Gtk.Window(title="The Researcher - " +
                      ("change saved presets" if setup else "choose research to load"))
     win.set_default_size(720, 780)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
