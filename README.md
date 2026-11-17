@@ -4,7 +4,7 @@
 
 [![tokens squeezed](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/squeezed)](#sharing-opt-in) [![tokens not loaded](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/not-loaded)](#sharing-opt-in)   *so far, by all users*
 
-Load your saved research into a [Claude Code](https://claude.com/claude-code) session in one step, and only the part you need.
+Load your saved research into a [Claude Code](https://claude.com/claude-code) or [opencode](https://opencode.ai) session in one step, and only the part you need.
 
 If you keep research notes, reports, or saved articles on disk and keep telling Claude "read my notes on X first", this does that for you. You name a **set** (`/researcher rust`), a small window lists the documents with their size in tokens, you tick what this session needs, and Claude reads exactly those. No tokens are spent while the window is open or on anything you leave unticked.
 
@@ -121,6 +121,26 @@ The original Python version, `skills/researcher/researcher.py`, still works and 
    ```
 
 The skill runs `researcher` when it is on your PATH, and `researcher.py` otherwise. You can skip `--init`: on the first load the Rust version asks for your research folder in a window and writes the config itself.
+
+### In opencode
+
+The same skill works in [opencode](https://opencode.ai). opencode reads skills from `~/.config/opencode/skills/` and slash commands from `~/.config/opencode/command/`:
+
+```bash
+mkdir -p ~/.config/opencode/skills ~/.config/opencode/command
+ln -s "$PWD/skills/researcher" ~/.config/opencode/skills/researcher
+cp opencode/commands/researcher.md ~/.config/opencode/command/researcher.md
+```
+
+Restart opencode, then type `/researcher rust`, or say "load my research for rust". It runs the same `researcher` program with the same config, library, text copy and usage log, so Claude Code and opencode share everything. If opencode runs sandboxed (a container, bubblewrap) it needs read access to the program, `~/.config/researcher`, your library and the text copy, and a display for the popup; without a display you get the saved defaults. opencode also reads `~/.claude/skills/` on its own unless `OPENCODE_DISABLE_CLAUDE_CODE` is set, so the Claude Code install above may already be enough.
+
+opencode asks before reading files outside the project folder, and the loader prints paths in the researcher's own folders. To skip that question for just those two folders, add this to `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+"permission": { "external_directory": { "~/.cache/researcher/*": "allow", "~/.local/share/researcher/text/*": "allow" } }
+```
+
+Not available in opencode: `/load-context` and `--sessions`, which read Claude Code's own session files.
 
 Try it first on the made-up documents in [examples/library](examples/library): `researcher --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
