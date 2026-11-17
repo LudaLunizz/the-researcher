@@ -26,6 +26,12 @@ The first time you load research, before a library is set, a smaller window asks
 
 ![First use: choose the research folder](docs/img/first-use.png)
 
+`/load-context` (earlier chats as context, see [below](#earlier-chats-as-context-load-context)) opens the same kind of window for your earlier Claude Code chats. The first picture is a saved preset: the chats ticked last time are ticked, the rest are folded under "Add other chats", and chats started since are counted as newer and marked **NEW** once you unfold it. The second is a preset you have never used: every chat, grouped by project folder, nothing ticked.
+
+![Chat window with a saved preset](docs/img/context-saved-preset.png)
+
+![Chat window for a new preset](docs/img/context-new-preset.png)
+
 All pictures use the made-up documents in [examples/library](examples/library) and made-up chats. `tools/screenshots.sh` makes them again: it opens the windows five times for about a second each, needs a display, and runs with a throwaway home folder, so none of your own files, settings or paths are touched or shown.
 
 ## The text copy
@@ -215,11 +221,7 @@ The registry only reads `~/.claude/projects`; it never changes your transcripts.
 
 With sessions switched on, `/load-context` in Claude Code (or `researcher --context`) opens the same kind of window as a research set, but it lists your earlier chats: every project folder, the most recently used folder first, newest chat first. Each chat shows its **first prompt** (or the name you gave it with `--rename`), its size in tokens and the day it was last active. A filter box finds a chat by words from its first prompt or its folder. The chat you type `/load-context` in is never listed; chats you closed a minute ago are.
 
-The first picture is a saved preset: the chats ticked last time are ticked, the rest are folded under "Add other chats", and chats started since are counted as newer and marked **NEW** once you unfold it. The second is a preset you have never used: every chat, grouped by project folder, nothing ticked.
-
-![Chat window with a saved preset](docs/img/context-saved-preset.png)
-
-![Chat window for a new preset](docs/img/context-new-preset.png)
+Pictures of this window are under [How it looks](#how-it-looks).
 
 Presets work like custom sets. `/load-context noname` the first time shows every chat unticked; tick what belongs to noname and keep "Remember" ticked, and the next `/load-context noname` starts with those ticked. Chats added since show NEW and are never ticked on their own, and Remember is only pre-ticked the first time, so a one-off pick does not replace the preset. Without a name the preset is `default`. `--context --setup NAME` changes a preset, `--context --list` shows them, `--no-popup` loads a saved preset without asking.
 
