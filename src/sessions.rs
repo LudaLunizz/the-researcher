@@ -382,12 +382,10 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
                 println!("SESSION {}", label(&sid, &rec));
                 println!("{n:>7} chars  {}", written[0]);
                 println!("total: 1 session, {n} chars (~{}k tokens)", n / CHARS_PER_K);
-                // one chat, against every chat that could have been loaded
-                let all: Vec<u64> = sessions(&reg).values().map(chat_chars).collect();
+                // one chat, against every chat up to it (last active at or before it)
+                let lib = chats_up_to(sessions(&reg).values(), &last_of(&rec));
                 let bytes = fs::metadata(&file).map_or(0, |m| m.len());
-                if let Some(note) =
-                    usage_of_chats(cfg, cfg_path, &[(n, bytes)], (all.len(), all.iter().sum::<u64>() as usize))
-                {
+                if let Some(note) = usage_of_chats(cfg, cfg_path, &[(n, bytes)], lib) {
                     println!("{note}");
                 }
                 return Ok(Some(0));
@@ -497,6 +495,13 @@ fn chat_catalog(reg: &Map<String, Value>, skip: &str) -> Vec<String> {
             v.into_iter().map(|(_, sid)| sid)
         })
         .collect()
+}
+
+/// (chats, characters) of the chats last active at or before `cutoff` (all of them when the
+/// cutoff is unknown): what loading everything up to that chat would have cost.
+fn chats_up_to<'a>(recs: impl Iterator<Item = &'a Value>, cutoff: &str) -> (usize, usize) {
+    recs.filter(|r| cutoff.is_empty() || last_of(r).as_str() <= cutoff)
+        .fold((0, 0), |(n, c), r| (n + 1, c + chat_chars(r) as usize))
 }
 
 fn str_set(rec: Option<&Value>, key: &str) -> BTreeSet<String> {
@@ -694,8 +699,9 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
         println!("MISSING  chat {sid} (its transcript is gone)");
     }
     println!("total: {} chats, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
-    // every chat that could have been loaded is the "whole library" of this load
-    let lib = (catalog.len(), catalog.iter().map(|sid| chat_chars(&map[sid]) as usize).sum());
+    // the "whole library" of this load: every chat up to the newest one picked
+    let newest = chosen.iter().map(|sid| last_of(&map[*sid])).max().unwrap_or_default();
+    let lib = chats_up_to(catalog.iter().map(|sid| &map[sid]), &newest);
     if let Some(note) = usage_of_chats(cfg, a.cfg_path, &loaded, lib) {
         println!("{note}");
     }

@@ -1246,6 +1246,22 @@ fn a_context_load_is_logged_and_counted() {
     assert!(e_usage_report(&s.e).contains("1 loads"));
 }
 
+#[test]
+fn a_chat_load_is_compared_with_the_chats_up_to_the_newest_picked() {
+    let (s, presets) = context_env();
+    // SID1 is older than the chat in the other folder: that newer chat is not part of the saving
+    save_preset(&presets, "work", &[SID1]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    let r = &s.e.records()[0];
+    assert_eq!(r["lib_docs"], 3, "{out}");
+    // picking the newest chat brings every chat into the comparison again
+    save_preset(&presets, "work2", &[SID1, SID4]);
+    let (code, out) = s.e.run(&["--context", "work2"]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(s.e.records()[1]["lib_docs"], 4, "{out}");
+}
+
 fn e_usage_report(e: &Env) -> String {
     e.run(&["--usage"]).1
 }

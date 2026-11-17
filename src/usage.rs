@@ -170,7 +170,7 @@ pub fn record(docs: &[String], texts: &mut Texts, paths: &BTreeMap<String, Strin
 }
 
 /// The record of earlier Claude Code chats loaded as context: `chats` = (characters, transcript
-/// bytes) of each chat loaded; `lib` = (chats, characters) of every chat that could have been.
+/// bytes) of each chat loaded; `lib` = (chats, characters) of every chat up to the newest one picked.
 /// A chat is read as it is written, so nothing is squeezed (raw = chars).
 pub fn chat_record(chats: &[(usize, u64)], lib: (usize, usize)) -> std::io::Result<Value> {
     let chars: usize = chats.iter().map(|c| c.0).sum();

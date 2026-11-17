@@ -836,6 +836,17 @@ class ChatUsageTests(SessionEnv):
         for word in ("Second one", "Newest chat", "work", "web", "popup"):
             self.assertNotIn(word, raw)
 
+    def test_a_chat_load_is_compared_with_the_chats_up_to_the_newest_picked(self):
+        # SID1 is older than the chat in the other folder: that newer chat is not part of the saving
+        write(self.presets, json.dumps({"work": {"selected": [SID1], "known": []}}))
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.records()[0]["lib_docs"], 3)
+        write(self.presets, json.dumps({"work2": {"selected": [SID1, SID4], "known": []}}))
+        code, out = self.run_main("--context", "work2")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.records()[1]["lib_docs"], 4)
+
     def test_a_session_load_is_logged_and_counted(self):
         self.run_main("--sessions")
         code, out = self.run_main("--session-load", SID1[:6])
