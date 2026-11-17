@@ -881,7 +881,7 @@ def file_size(path):
 
 def chat_usage_record(loaded, lib):
     """The record of earlier Claude Code chats loaded as context: loaded = [(characters, transcript
-    bytes)] of each chat loaded; lib = (chats, characters) of every chat that could have been. A chat
+    bytes)] of each chat loaded; lib = (chats, characters) of every chat up to the newest one picked. A chat
     is read as it is written, so nothing is squeezed (raw = chars)."""
     chars = sum(c for c, _ in loaded)
     return usage_build({"chat": (len(loaded), chars)}, sum(b for _, b in loaded), chars, lib)
@@ -1410,10 +1410,9 @@ def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
             print(f"SESSION {session_label(sid, rec)}")
             print(f"{len(text):>7} chars  {written[0]}")
             print(f"total: 1 session, {len(text)} chars (~{len(text) // CHARS_PER_K}k tokens)")
-            # one chat, against every chat that could have been loaded
-            every = [r.get("chars") or 0 for r in reg["sessions"].values()]
+            # one chat, against every chat up to it (last active at or before it)
             note = usage_of_chats(cfg, cfg_path, [(len(text), file_size(rec["file"]))],
-                                  (len(every), sum(every)))
+                                  chats_up_to(reg["sessions"].values(), last_of(rec)))
             if note:
                 print(note)
             return 0
@@ -1460,6 +1459,17 @@ def chat_folder(rec):
 
 def last_of(rec):
     return rec.get("last") or rec.get("started") or ""
+
+
+def chats_up_to(recs, cutoff):
+    """(chats, characters) of the chats last active at or before `cutoff` (all of them when the
+    cutoff is unknown): what loading everything up to that chat would have cost."""
+    n = c = 0
+    for r in recs:
+        if not cutoff or last_of(r) <= cutoff:
+            n += 1
+            c += r.get("chars") or 0
+    return n, c
 
 
 def chat_catalog(reg, skip):
@@ -1589,11 +1599,12 @@ def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
     for sid in gone:
         print(f"MISSING  chat {sid} (its transcript is gone)")
     print(f"total: {len(docs)} chats, {total} chars (~{total // CHARS_PER_K}k tokens)")
-    # every chat that could have been loaded is the "whole library" of this load
+    # the "whole library" of this load: every chat up to the newest one picked
+    newest = max((last_of(recs[sid]) for sid in sids), default="")
     note = usage_of_chats(cfg, cfg_path,
                           [(len(texts[doc]), file_size(recs[sid]["file"]))
                            for sid, doc in zip(sids, docs)],
-                          (len(catalog), sum(recs[sid].get("chars") or 0 for sid in catalog)))
+                          chats_up_to((recs[sid] for sid in catalog), newest))
     if note:
         print(note)
     return 0
