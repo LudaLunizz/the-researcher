@@ -79,7 +79,8 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.tmp.join("xdg-config"))
             .env("XDG_CACHE_HOME", self.tmp.join("xdg-cache"))
             .env_remove("RESEARCHER_LIBRARY")
-            .env_remove("CLAUDE_CODE_SESSION_ID"); // the tests may run inside Claude Code
+            .env_remove("CLAUDE_CODE_SESSION_ID") // the tests may run inside Claude Code
+            .env_remove("OPENCODE"); // or inside opencode
         c
     }
 
@@ -1325,4 +1326,127 @@ fn the_conversion_saving_uses_the_measured_ratios() {
     // (240000 * 0.73 + 120000 * 1.2) / 2400 = 133 thousand tokens; markdown has no saving
     assert!(out.contains("converted:     ~133k tokens"), "{out}");
     assert!(out.contains("1 of 1 loads say their formats"), "{out}");
+}
+
+// ---------------------------------------------------------------- opencode chats
+
+const OC1: &str = "ses_AbC123xyz";
+const OC2: &str = "ses_Def456uvw";
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+/// The sessions setup (no Claude chats) with a fake `opencode` program that answers
+/// `session list` and `export ID` from files and logs every call. `updated` = ages in seconds.
+#[cfg(unix)]
+fn opencode_env(on: bool, ages: [u64; 2]) -> (Sess, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let s = sessions_env();
+    let fake = s.e.tmp.join("fake-oc");
+    fs::create_dir_all(&fake).unwrap();
+    let t = now_ms();
+    let list = serde_json::json!([
+        {"id": OC1, "title": "Researching Rust", "updated": t - ages[0] * 1000, "created": t - 9_000_000, "directory": "/work/app"},
+        {"id": OC2, "title": "New session - 2026-11-17T07:11:29.702Z", "updated": t - ages[1] * 1000, "created": t - 9_000_000, "directory": "/work/web"},
+    ]);
+    write(&fake.join("list.json"), &list.to_string());
+    let msg = |role: &str, id: &str, parts: Value| serde_json::json!({"info": {"role": role, "id": id, "time": {"created": 1_794_899_706_762u64}}, "parts": parts});
+    let ex1 = serde_json::json!({"info": {"id": OC1, "title": "Researching Rust"}, "messages": [
+        msg("user", "m1", serde_json::json!([{"type": "text", "text": "Load the rust   research"}])),
+        msg("assistant", "m2", serde_json::json!([
+            {"type": "reasoning", "text": "hidden-thought"}, {"type": "text", "text": "Loaded four documents."},
+            {"type": "tool", "tool": "bash", "state": {"output": "TOOLOUT"}},
+            {"type": "text", "text": "synthetic-noise", "synthetic": true}])),
+    ]});
+    let ex2 = serde_json::json!({"info": {"id": OC2, "title": "New session - 2026-11-17T07:11:29.702Z"}, "messages": [
+        msg("user", "m3", serde_json::json!([{"type": "text", "text": "Newest chat, other folder"}])),
+    ]});
+    write(&fake.join(format!("export-{OC1}.json")), &ex1.to_string());
+    write(&fake.join(format!("export-{OC2}.json")), &ex2.to_string());
+    let script = fake.join("opencode");
+    write(
+        &script,
+        "#!/bin/sh\nd=\"$(dirname \"$0\")\"\necho \"$*\" >> \"$d/calls.log\"\ncase \"$1\" in\n  session) cat \"$d/list.json\" ;;\n  export) cat \"$d/export-$2.json\" ;;\nesac\n",
+    );
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    if on {
+        s.e.append_cfg(&format!("opencode = true\nopencode_cmd = \"{}\"\n", script.display()));
+    }
+    (s, fake)
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_chats_are_off_unless_asked() {
+    let (s, fake) = opencode_env(false, [3600, 7200]);
+    let (code, out) = s.e.run(&["--sessions"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("ses_"), "{out}");
+    assert!(!fake.join("calls.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_chats_are_listed_loaded_and_cached() {
+    let (s, fake) = opencode_env(true, [3600, 7200]);
+    let (code, out) = s.e.run(&["--sessions"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("4 closed sessions") || out.contains("sessions tracked"), "{out}");
+    assert!(out.contains(&format!("{OC1}  2026-11-")), "{out}");
+    assert!(out.contains("Researching Rust"), "{out}");
+    // the placeholder title is not a name: the first prompt is
+    assert!(out.contains("Newest chat, other folder"), "{out}");
+    // a lower-case prefix finds the mixed-case id and the full id is printed back
+    let (code, out) = s.e.run(&["--session-load", "ses_abc1"]);
+    assert_eq!(code, 0, "{out}");
+    let path =
+        out.lines().find_map(|l| l.split_once("chars  ").filter(|_| !l.contains("total")).map(|(_, p)| p)).unwrap();
+    let text = read(Path::new(path));
+    assert!(text.contains(&format!("SESSION ID: {OC1}")), "{text}");
+    assert!(text.contains("USER: Load the rust   research"), "{text}");
+    assert!(text.contains("ASSISTANT: Loaded four documents."), "{text}");
+    for bad in ["hidden-thought", "TOOLOUT", "synthetic-noise"] {
+        assert!(!text.contains(bad), "{bad}");
+    }
+    let (code, out) = s.e.run(&["--resume", "ses_abc1"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("cd /work/app && opencode -s {OC1}")), "{out}");
+    // each chat was exported once, however often the list runs
+    let calls = read(&fake.join("calls.log"));
+    assert_eq!(calls.lines().filter(|l| l.starts_with("export")).count(), 2, "{calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_chats_join_the_context_picker() {
+    let (s, _fake) = opencode_env(true, [3600, 7200]);
+    let presets = s.e.conf_dir.join("contexts.json");
+    save_preset(&presets, "work", &[OC1]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("CHAT \"Researching Rust\" ({OC1})")), "{out}");
+    assert!(out.contains("total: 1 chats"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_never_offers_the_chat_that_runs_this() {
+    let (s, _fake) = opencode_env(true, [30, 7200]); // OC1 was written 30 s ago
+    let presets = s.e.conf_dir.join("contexts.json");
+    save_preset(&presets, "work", &[OC1, OC2]);
+    let (_, out) = s.e.run_with(&["--context", "work"], &[("OPENCODE", "1")]);
+    assert!(!out.contains(&format!("({OC1})")), "{out}");
+    assert!(out.contains(&format!("({OC2})")), "{out}");
+    assert!(out.contains(&format!("MISSING  chat {OC1}")), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_missing_program_is_said_not_fatal() {
+    let (s, _fake) = opencode_env(false, [3600, 7200]);
+    s.e.append_cfg("opencode = true\nopencode_cmd = \"/nonexistent/opencode\"\n");
+    let (code, out) = s.e.run(&["--sessions"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("OPENCODE SKIPPED"), "{out}");
 }

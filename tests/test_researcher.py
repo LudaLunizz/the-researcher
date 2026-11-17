@@ -798,6 +798,111 @@ class ContextTests(SessionEnv):
         code, out = self.run_main("--context", "a/b")
         self.assertEqual(code, 2)
 
+OC1 = "ses_AbC123xyz"
+OC2 = "ses_Def456uvw"
+
+
+class OpencodeTests(SessionEnv):
+    """opencode chats: asked from the `opencode` program (a fake one here), cached as transcripts."""
+
+    def now_ms(self):
+        import time
+        return int(time.time() * 1000)
+
+    def fake(self, ages=(3600, 7200), on=True):
+        os.environ.pop("OPENCODE", None)  # the tests may run inside opencode
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        d = os.path.join(self.tmp.name, "fake-oc")
+        t = self.now_ms()
+        write(os.path.join(d, "list.json"), json.dumps([
+            {"id": OC1, "title": "Researching Rust", "updated": t - ages[0] * 1000,
+             "created": t - 9_000_000, "directory": "/work/app"},
+            {"id": OC2, "title": "New session - 2026-11-17T07:11:29.702Z", "updated": t - ages[1] * 1000,
+             "created": t - 9_000_000, "directory": "/work/web"}]))
+
+        def msg(role, mid, parts):
+            return {"info": {"role": role, "id": mid, "time": {"created": 1794899706762}}, "parts": parts}
+        write(os.path.join(d, f"export-{OC1}.json"), json.dumps({
+            "info": {"id": OC1, "title": "Researching Rust"},
+            "messages": [msg("user", "m1", [{"type": "text", "text": "Load the rust   research"}]),
+                         msg("assistant", "m2", [
+                             {"type": "reasoning", "text": "hidden-thought"},
+                             {"type": "text", "text": "Loaded four documents."},
+                             {"type": "tool", "tool": "bash", "state": {"output": "TOOLOUT"}},
+                             {"type": "text", "text": "synthetic-noise", "synthetic": True}])]}))
+        write(os.path.join(d, f"export-{OC2}.json"), json.dumps({
+            "info": {"id": OC2, "title": "New session - 2026-11-17T07:11:29.702Z"},
+            "messages": [msg("user", "m3", [{"type": "text", "text": "Newest chat, other folder"}])]}))
+        script = os.path.join(d, "opencode")
+        write(script, '#!/bin/sh\nd="$(dirname "$0")"\necho "$*" >> "$d/calls.log"\n'
+                      'case "$1" in\n  session) cat "$d/list.json" ;;\n  export) cat "$d/export-$2.json" ;;\nesac\n')
+        os.chmod(script, 0o755)
+        if on:
+            with open(self.cfg, "a", encoding="utf-8") as f:
+                f.write(f'opencode = true\nopencode_cmd = "{script}"\n')
+        return d
+
+    def test_off_unless_asked(self):
+        d = self.fake(on=False)
+        code, out = self.run_main("--sessions")
+        self.assertEqual(code, 0)
+        self.assertNotIn("ses_", out)
+        self.assertFalse(os.path.exists(os.path.join(d, "calls.log")))
+
+    def test_listed_loaded_resumed_and_cached(self):
+        d = self.fake()
+        code, out = self.run_main("--sessions")
+        self.assertEqual(code, 0)
+        self.assertIn("4 closed sessions", out)
+        self.assertIn(f"{OC1}  2026-11-", out)
+        self.assertIn("Researching Rust", out)
+        self.assertIn("Newest chat, other folder", out)  # the placeholder title is not a name
+        code, out = self.run_main("--session-load", "ses_abc1")  # lower-case prefix, mixed-case id
+        self.assertEqual(code, 0)
+        path = [ln.split("chars  ", 1)[1] for ln in out.splitlines() if "chars  " in ln and "total" not in ln][0]
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(f"SESSION ID: {OC1}", text)
+        self.assertIn("USER: Load the rust   research", text)
+        self.assertIn("ASSISTANT: Loaded four documents.", text)
+        for bad in ("hidden-thought", "TOOLOUT", "synthetic-noise"):
+            self.assertNotIn(bad, text)
+        code, out = self.run_main("--resume", "ses_abc1")
+        self.assertEqual(code, 0)
+        self.assertIn(f"cd /work/app && opencode -s {OC1}", out)
+        with open(os.path.join(d, "calls.log"), encoding="utf-8") as f:
+            calls = f.read().splitlines()
+        self.assertEqual(len([c for c in calls if c.startswith("export")]), 2)
+
+    def test_joins_the_context_picker(self):
+        self.fake()
+        write(os.path.join(self.conf_dir, "contexts.json"),
+              json.dumps({"work": {"selected": [OC1], "known": []}}))
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0)
+        self.assertIn(f'CHAT "Researching Rust" ({OC1})', out)
+        self.assertIn("total: 1 chats", out)
+
+    def test_never_offers_the_chat_that_runs_this(self):
+        self.fake(ages=(30, 7200))
+        write(os.path.join(self.conf_dir, "contexts.json"),
+              json.dumps({"work": {"selected": [OC1, OC2], "known": []}}))
+        os.environ["OPENCODE"] = "1"
+        self.addCleanup(os.environ.pop, "OPENCODE", None)
+        _, out = self.run_main("--context", "work")
+        self.assertNotIn(f"({OC1})", out)
+        self.assertIn(f"({OC2})", out)
+        self.assertIn(f"MISSING  chat {OC1}", out)
+
+    def test_missing_program_is_said_not_fatal(self):
+        self.fake(on=False)
+        with open(self.cfg, "a", encoding="utf-8") as f:
+            f.write('opencode = true\nopencode_cmd = "/nonexistent/opencode"\n')
+        code, out = self.run_main("--sessions")
+        self.assertEqual(code, 0)
+        self.assertIn("OPENCODE SKIPPED", out)
+
+
 
 if __name__ == "__main__":
     unittest.main()
