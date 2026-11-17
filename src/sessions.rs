@@ -4,7 +4,9 @@
 //! first prompt, and can be renamed (a manual name is never overwritten by a rescan).
 
 use std::fs;
-use std::sync::LazyLock;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -19,6 +21,8 @@ use crate::util::{self, chars, py_strip};
 
 static SESSION_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("valid"));
+/// opencode session ids: `ses_` and letters/digits (case matters).
+static OC_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^ses_[A-Za-z0-9]+$").expect("valid"));
 static WS_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\s\x1c-\x1f]+").expect("valid"));
 const NAME_MAX: usize = 80;
 /// Characters; a longer session keeps its start and its end.
@@ -27,6 +31,9 @@ const SESSION_LOAD_MAX: usize = 200_000;
 pub struct Settings {
     idle_minutes: f64,
     projects_dir: String,
+    /// Also list opencode's chats (opt-in, asks the `opencode` program).
+    opencode: bool,
+    opencode_cmd: String,
 }
 
 /// The `[sessions]` settings, or None when sessions are off.
@@ -46,7 +53,12 @@ pub fn settings(cfg: &Config) -> Option<Settings> {
         Some(other) => other.to_string(),
         None => "~/.claude/projects".into(),
     };
-    Some(Settings { idle_minutes, projects_dir: util::user_path(&dir) })
+    let opencode = util::truthy_toml(sec.get("opencode"));
+    let opencode_cmd = match sec.get("opencode_cmd") {
+        Some(toml::Value::String(c)) if !c.trim().is_empty() => util::expanduser(c.trim()),
+        _ => "opencode".into(),
+    };
+    Some(Settings { idle_minutes, projects_dir: util::user_path(&dir), opencode, opencode_cmd })
 }
 
 fn clean_name(text: &str) -> String {
@@ -165,70 +177,249 @@ fn opt(v: &Option<String>) -> Value {
     v.as_ref().map_or(Value::Null, |s| Value::String(s.clone()))
 }
 
-/// Add sessions untouched for `idle_secs` to the registry and refresh the changed ones (never
-/// `skip`, the session that runs this). Returns the number added.
-fn scan_sessions(reg: &mut Map<String, Value>, st: &Settings, idle_secs: f64, skip: &str) -> usize {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    let Ok(rd) = fs::read_dir(&st.projects_dir) else { return 0 };
-    let mut projects: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-    projects.sort();
+/// Add or refresh the registry record of one session from its transcript. Returns 1 when the
+/// session is new, 0 when it was known or nothing was ever asked.
+fn register(
+    reg: &mut Map<String, Value>,
+    sid: &str,
+    path: &str,
+    mtime: f64,
+    proj: &str,
+    source: Option<&str>,
+    entries: &[Map<String, Value>],
+) -> usize {
+    let mut info = session_info(entries);
+    let Some(base) = info.title.clone().or_else(|| info.first.clone()) else {
+        return 0; // nothing was ever asked
+    };
+    // a chat started from a command or skill opens with its whole expanded text: opencode's own
+    // title is the better label
+    if source == Some("opencode") && info.title.is_some() {
+        info.first.clone_from(&info.title);
+    }
+    let auto = clean_name(&base);
+    let map = sessions_mut(reg);
     let mut added = 0;
-    for proj in projects {
-        let pdir = util::join(&st.projects_dir, &proj);
-        let Ok(rd) = fs::read_dir(&pdir) else { continue };
-        let mut files: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
-        files.sort();
-        for f in files {
-            let Some(sid) = f.strip_suffix(".jsonl") else { continue };
-            if !SESSION_ID_RE.is_match(sid) || sid == skip {
-                continue;
+    let rec = match map.get_mut(sid).and_then(Value::as_object_mut) {
+        Some(rec) => {
+            if s(rec, "name_source") != Some("manual") {
+                rec.insert("name".into(), Value::String(auto));
             }
-            let path = util::join(&pdir, &f);
-            let Ok(meta) = fs::metadata(&path) else { continue };
-            let mtime = util::mtime_secs(&meta);
-            if now - mtime < idle_secs {
-                continue; // probably still open
-            }
-            let old = sessions(reg).get(sid).and_then(Value::as_object);
-            if old.is_some_and(|r| {
-                r.get("mtime").and_then(Value::as_f64) == Some(mtime)
-                    && s(r, "file") == Some(path.as_str())
-                    && r.contains_key("first")
-                    && r.contains_key("chars")
-            }) {
-                continue;
-            }
-            let entries = read_transcript(&path);
-            let info = session_info(&entries);
-            let Some(base) = info.title.as_ref().or(info.first.as_ref()) else {
-                continue; // nothing was ever asked
-            };
-            let auto = clean_name(base);
-            let map = sessions_mut(reg);
-            let rec = match map.get_mut(sid).and_then(Value::as_object_mut) {
-                Some(rec) => {
-                    if s(rec, "name_source") != Some("manual") {
-                        rec.insert("name".into(), Value::String(auto));
-                    }
-                    rec
-                }
-                None => {
-                    added += 1;
-                    let registered = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-                    map.insert(sid.to_string(), json!({"name": auto, "name_source": "auto", "registered": registered}));
-                    map.get_mut(sid).and_then(Value::as_object_mut).expect("just inserted")
-                }
-            };
-            rec.insert("file".into(), Value::String(path.clone()));
-            rec.insert("mtime".into(), json!(mtime));
-            rec.insert("project".into(), Value::String(proj.clone()));
-            rec.insert("cwd".into(), opt(&info.cwd));
-            rec.insert("started".into(), opt(&info.started));
-            rec.insert("last".into(), opt(&info.last));
-            rec.insert("first".into(), opt(&info.first.as_deref().map(clean_name)));
-            let n = chars(&session_text(sid, &Value::Object(rec.clone()), &entries));
-            rec.insert("chars".into(), json!(n));
+            rec
         }
+        None => {
+            added = 1;
+            let registered = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+            map.insert(sid.to_string(), json!({"name": auto, "name_source": "auto", "registered": registered}));
+            map.get_mut(sid).and_then(Value::as_object_mut).expect("just inserted")
+        }
+    };
+    rec.insert("file".into(), Value::String(path.to_string()));
+    rec.insert("mtime".into(), json!(mtime));
+    rec.insert("project".into(), Value::String(proj.to_string()));
+    rec.insert("cwd".into(), opt(&info.cwd));
+    rec.insert("started".into(), opt(&info.started));
+    rec.insert("last".into(), opt(&info.last));
+    rec.insert("first".into(), opt(&info.first.as_deref().map(clean_name)));
+    if let Some(src) = source {
+        rec.insert("source".into(), Value::String(src.to_string()));
+    }
+    let n = chars(&session_text(sid, &Value::Object(rec.clone()), entries));
+    rec.insert("chars".into(), json!(n));
+    added
+}
+
+/// True when the registry already holds this version of the session's transcript.
+fn up_to_date(reg: &Map<String, Value>, sid: &str, path: &str, mtime: f64) -> bool {
+    sessions(reg).get(sid).and_then(Value::as_object).is_some_and(|r| {
+        r.get("mtime").and_then(Value::as_f64) == Some(mtime)
+            && s(r, "file") == Some(path)
+            && r.contains_key("first")
+            && r.contains_key("chars")
+    })
+}
+
+/// Add sessions untouched for `idle_secs` to the registry and refresh the changed ones (never
+/// `skip`, the session that runs this). Returns the number added. opencode chats are added too
+/// when `[sessions] opencode` is on; `in_opencode` = this runs inside opencode (its newest chat
+/// is the one that runs this).
+fn scan_sessions(
+    reg: &mut Map<String, Value>,
+    st: &Settings,
+    idle_secs: f64,
+    skip: &str,
+    reg_path: &str,
+    in_opencode: bool,
+) -> usize {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let mut added = 0;
+    if let Ok(rd) = fs::read_dir(&st.projects_dir) {
+        let mut projects: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        projects.sort();
+        for proj in projects {
+            let pdir = util::join(&st.projects_dir, &proj);
+            let Ok(rd) = fs::read_dir(&pdir) else { continue };
+            let mut files: Vec<String> = rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            files.sort();
+            for f in files {
+                let Some(sid) = f.strip_suffix(".jsonl") else { continue };
+                if !SESSION_ID_RE.is_match(sid) || sid == skip {
+                    continue;
+                }
+                let path = util::join(&pdir, &f);
+                let Ok(meta) = fs::metadata(&path) else { continue };
+                let mtime = util::mtime_secs(&meta);
+                if now - mtime < idle_secs {
+                    continue; // probably still open
+                }
+                if up_to_date(reg, sid, &path, mtime) {
+                    continue;
+                }
+                added += register(reg, sid, &path, mtime, &proj, None, &read_transcript(&path));
+            }
+        }
+    }
+    if st.opencode {
+        added += scan_opencode(reg, st, idle_secs, reg_path, in_opencode);
+    }
+    added
+}
+
+// ---------------------------------------------------------------- opencode chats
+
+/// Run the opencode program and return its standard output.
+fn oc_run(cmd: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("{cmd}: {e}"))?;
+    if out.status.success() { Ok(out.stdout) } else { Err(format!("{cmd} {} failed", args.join(" "))) }
+}
+
+fn iso_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_default()
+}
+
+/// The text parts of an opencode message (tool calls, reasoning, synthetic and ignored text left out).
+fn oc_text(parts: Option<&Value>) -> String {
+    let texts: Vec<&str> = parts
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter(|p| !util::truthy_json(p.get("synthetic")) && !util::truthy_json(p.get("ignored")))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    py_strip(&texts.join("\n")).to_string()
+}
+
+/// `opencode export` as transcript entries in the shape of a Claude Code .jsonl (title, user and
+/// assistant text with timestamps), so the rest of the program reads both the same way.
+fn oc_entries(export: &Value, dir: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let title = export.pointer("/info/title").and_then(Value::as_str).unwrap_or("");
+    if !title.is_empty() && !title.starts_with("New session - ") && !title.starts_with('<') {
+        out.push(json!({"type": "ai-title", "aiTitle": title}));
+    }
+    for m in export.get("messages").and_then(Value::as_array).map_or(&[][..], Vec::as_slice) {
+        let role = m.pointer("/info/role").and_then(Value::as_str).unwrap_or("");
+        let text = oc_text(m.get("parts"));
+        if text.is_empty() || !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        let ms = m.pointer("/info/time/created").and_then(Value::as_i64).unwrap_or(0);
+        let content = if role == "user" { json!(text) } else { json!([{"type": "text", "text": text}]) };
+        out.push(
+            json!({"type": role, "timestamp": iso_ms(ms), "cwd": dir, "message": {"role": role, "content": content}}),
+        );
+    }
+    out
+}
+
+/// Add opencode's chats (top-level ones; sub-agent sessions are not listed by opencode) to the
+/// registry. Each changed chat is exported once and cached as a transcript next to the registry.
+fn scan_opencode(
+    reg: &mut Map<String, Value>,
+    st: &Settings,
+    idle_secs: f64,
+    reg_path: &str,
+    in_opencode: bool,
+) -> usize {
+    let list = match oc_run(&st.opencode_cmd, &["session", "list", "--format", "json"]) {
+        Ok(b) => serde_json::from_slice::<Value>(&b).ok().and_then(|v| v.as_array().cloned()),
+        Err(e) => {
+            println!("OPENCODE SKIPPED ({e}): opencode chats left out");
+            return 0;
+        }
+    };
+    let Some(list) = list else {
+        println!("OPENCODE SKIPPED (unreadable session list): opencode chats left out");
+        return 0;
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+    let upd = |v: &Value| v.get("updated").and_then(Value::as_f64).unwrap_or(0.0) / 1000.0;
+    // inside opencode, the chat that runs this is the newest one, still being written
+    let live = if in_opencode {
+        list.iter()
+            .filter(|v| now - upd(v) < 600.0)
+            .max_by(|a, b| upd(a).total_cmp(&upd(b)))
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+    } else {
+        None
+    };
+    let cache = util::join(&util::dirname(reg_path), "sessions-opencode");
+    let mut todo: Vec<(String, f64, String, String)> = Vec::new(); // id, mtime, directory, cache file
+    for v in &list {
+        let Some(sid) = v.get("id").and_then(Value::as_str).filter(|i| OC_ID_RE.is_match(i)) else { continue };
+        let mtime = upd(v);
+        if Some(sid) == live || now - mtime < idle_secs {
+            continue;
+        }
+        let path = util::join(&cache, &format!("{sid}.jsonl"));
+        if up_to_date(reg, sid, &path, mtime) && fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let dir = v.get("directory").and_then(Value::as_str).unwrap_or("").to_string();
+        todo.push((sid.to_string(), mtime, dir, path));
+    }
+    // opencode takes about two seconds per export: four at a time
+    let next = AtomicUsize::new(0);
+    let done: Mutex<Vec<Option<Value>>> = Mutex::new(vec![None; todo.len()]);
+    std::thread::scope(|sc| {
+        for _ in 0..4.min(todo.len()) {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((sid, ..)) = todo.get(i) else { break };
+                    let ex = oc_run(&st.opencode_cmd, &["export", sid])
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                    if let Ok(mut d) = done.lock() {
+                        d[i] = ex;
+                    }
+                }
+            });
+        }
+    });
+    let done = done.into_inner().unwrap_or_default();
+    let mut added = 0;
+    for ((sid, mtime, dir, path), ex) in todo.iter().zip(done) {
+        let Some(ex) = ex else { continue };
+        let entries = oc_entries(&ex, dir);
+        let body: Vec<String> = entries.iter().map(Value::to_string).collect();
+        if util::make_parent(path).is_err() || util::write_atomic(path, (body.join("\n") + "\n").as_bytes()).is_err() {
+            continue;
+        }
+        let maps: Vec<Map<String, Value>> =
+            entries.into_iter().filter_map(|e| if let Value::Object(m) = e { Some(m) } else { None }).collect();
+        added += register(reg, sid, path, *mtime, "opencode", Some("opencode"), &maps);
     }
     added
 }
@@ -237,10 +428,12 @@ fn scan_sessions(reg: &mut Map<String, Value>, st: &Settings, idle_secs: f64, sk
 fn find_session(reg: &Map<String, Value>, ident: &str) -> Result<String, ConfigError> {
     let ident = py_strip(ident).to_lowercase();
     let map = sessions(reg);
-    if map.contains_key(&ident) {
-        return Ok(ident);
+    // opencode ids mix upper and lower case: match without case, answer with the real id
+    if let Some(k) = map.keys().find(|k| k.to_lowercase() == ident) {
+        return Ok(k.clone());
     }
-    let hits: Vec<&String> = map.keys().filter(|i| chars(&ident) >= 4 && i.starts_with(&ident)).collect();
+    let hits: Vec<&String> =
+        map.keys().filter(|i| chars(&ident) >= 4 && i.to_lowercase().starts_with(&ident)).collect();
     match hits.len() {
         1 => Ok(hits[0].clone()),
         0 => Err(ConfigError(format!("no session matches '{ident}'"))),
@@ -338,7 +531,8 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
         return 7;
     };
     let mut reg = load_registry(reg_path);
-    let added = scan_sessions(&mut reg, &st, st.idle_minutes * 60.0, "");
+    let added =
+        scan_sessions(&mut reg, &st, st.idle_minutes * 60.0, "", reg_path, std::env::var_os("OPENCODE").is_some());
     let result = (|| -> Result<Option<i32>, ConfigError> {
         let io = |e: std::io::Error| ConfigError(e.to_string());
         match &action {
@@ -360,7 +554,11 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
                 let sid = find_session(&reg, id)?;
                 let rec = &sessions(&reg)[&sid];
                 println!("SESSION {}", label(&sid, rec));
-                let cmd = format!("claude --resume {sid}");
+                let cmd = if s(rec.as_object().expect("record"), "source") == Some("opencode") {
+                    format!("opencode -s {sid}")
+                } else {
+                    format!("claude --resume {sid}")
+                };
                 match rec.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()) {
                     Some(cwd) => println!("cd {} && {cmd}", util::shell_quote(cwd)),
                     None => println!("{cmd}"),
@@ -600,13 +798,17 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
     // the chat that runs this is never offered; chats closed a moment ago are
     let me = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default().to_lowercase();
     let mut reg = load_registry(a.reg_path);
-    scan_sessions(&mut reg, &st, 0.0, &me);
+    scan_sessions(&mut reg, &st, 0.0, &me, a.reg_path, std::env::var_os("OPENCODE").is_some());
     if let Err(e) = save_registry(a.reg_path, &reg) {
         println!("could not save the session registry to {}: {e}", a.reg_path);
     }
     let catalog = chat_catalog(&reg, &me);
     if catalog.is_empty() {
-        println!("NO CHATS: no earlier Claude Code chats in {}; nothing loaded", st.projects_dir);
+        if st.opencode {
+            println!("NO CHATS: no earlier Claude Code ({}) or opencode chats; nothing loaded", st.projects_dir);
+        } else {
+            println!("NO CHATS: no earlier Claude Code chats in {}; nothing loaded", st.projects_dir);
+        }
         return 0;
     }
     let map = sessions(&reg);

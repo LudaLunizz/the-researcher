@@ -148,7 +148,7 @@ opencode asks before reading files outside the project folder, and the loader pr
 
 The popup title names the program that asked: opencode when opencode started the loader (it sets `OPENCODE=1`), Claude Code otherwise. `RESEARCHER_HOST="name"` overrides it.
 
-Not available in opencode: `/load-context` and `--sessions`, which read Claude Code's own session files.
+`/load-context` works in opencode too: copy `opencode/commands/load-context.md` next to the other command, link `skills/load-context`, and switch on opencode chats in the config (see Sessions, below). Without that, `--sessions` and `--context` only know Claude Code's chats.
 
 Try it first on the made-up documents in [examples/library](examples/library): `researcher --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".
 
@@ -209,13 +209,17 @@ Off by default. Switch it on in `config.toml`:
 enabled = true
 # idle_minutes = 10                  # a session untouched this long counts as closed
 # projects_dir = "~/.claude/projects"
+# opencode = true                    # also list opencode's chats (asks the opencode program)
+# opencode_cmd = "opencode"          # the program to ask, when it is not on PATH
 ```
 
-Then `researcher --sessions` lists every closed Claude Code session, newest first: the **full session id** (the one Claude Code prints when you close a session), the last-active time and a name. The name comes from Claude Code's own title if the session has one, otherwise from the first prompt. `--rename ID NAME` replaces it, and a rescan never overwrites a name you set.
+Then `researcher --sessions` lists every closed Claude Code (and, if switched on, opencode) session, newest first: the **full session id** (the one Claude Code prints when you close a session), the last-active time and a name. The name comes from Claude Code's own title if the session has one, otherwise from the first prompt. `--rename ID NAME` replaces it, and a rescan never overwrites a name you set.
 
 Name and id are stored together, keyed by the full id, and every command prints them together (`"name" (id)`), so a name can't drift onto the wrong session. `ID` may be a unique prefix of 4 or more characters. `--resume ID` prints `cd <project folder> && claude --resume <id>` (Claude Code only finds a session from its own folder). `--session-load ID` writes the session's prompts and replies, without tool output, as a `.txt`; the skill reads it like a research document. Sessions longer than 200,000 characters keep their start and their end.
 
-The registry only reads `~/.claude/projects`; it never changes your transcripts. Sessions are loaded as reference material, the same caution as the documents below applies.
+**opencode chats.** opencode keeps its chats in its own database, so with `opencode = true` the researcher asks the program itself (`opencode session list`, `opencode export ID`) and keeps one plain transcript per chat in `sessions-opencode/` next to `sessions.json`. Each chat is exported once and again only after it changed; the first run takes a few seconds per chat (four at a time). They show up in `--sessions`, `--context` and the other commands like any chat, with opencode's own title as the name (the first prompt when it has none) and the folder opencode ran in. `--resume ID` prints `cd <folder> && opencode -s <id>`. Only top-level chats are listed, not the helper sessions a sub-agent opens. Inside opencode (it sets `OPENCODE=1`) the chat you type `/load-context` in is left out. If the program cannot be run, the output says `OPENCODE SKIPPED (...)` and Claude Code's chats still load. Set `opencode_cmd` to the full path when opencode is not on `PATH` (a sandbox, say); the program must see the same opencode data as your chats.
+
+The registry only reads `~/.claude/projects` (and asks opencode for its chats); it never changes your transcripts. Sessions are loaded as reference material, the same caution as the documents below applies.
 
 ## Earlier chats as context (`/load-context`)
 

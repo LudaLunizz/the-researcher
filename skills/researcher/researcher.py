@@ -1187,9 +1187,12 @@ def usage_export(path):
 # first prompt, and can be renamed (a manual name is never overwritten by a rescan).
 
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# opencode session ids: `ses_` and letters/digits (case matters)
+OC_ID_RE = re.compile(r"ses_[A-Za-z0-9]+")
 NAME_MAX = 80
 SESSION_LOAD_MAX = 200000  # chars; a longer session keeps its start and its end
-SESSION_DEFAULTS = {"idle_minutes": 10, "projects_dir": "~/.claude/projects"}
+SESSION_DEFAULTS = {"idle_minutes": 10, "projects_dir": "~/.claude/projects", "opencode": False,
+                    "opencode_cmd": "opencode"}
 
 
 def sessions_settings(cfg):
@@ -1201,6 +1204,9 @@ def sessions_settings(cfg):
         if k in sec:
             out[k] = sec[k]
     out["projects_dir"] = os.path.abspath(os.path.expanduser(str(out["projects_dir"])))
+    out["opencode"] = bool(out["opencode"])
+    cmd = out["opencode_cmd"]
+    out["opencode_cmd"] = os.path.expanduser(cmd.strip()) if isinstance(cmd, str) and cmd.strip() else "opencode"
     return out
 
 
@@ -1282,9 +1288,47 @@ def save_registry(path, reg):
     os.replace(tmp, path)
 
 
-def scan_sessions(reg, settings, now=None, idle=None, skip=""):
+def register(reg, sid, path, mtime, proj, entries, source=None):
+    """Add or refresh the registry record of one session from its transcript. Returns 1 when the
+    session is new, 0 when it was known or nothing was ever asked."""
+    import time
+    info = session_info(entries)
+    if not info["first"] and not info["title"]:
+        return 0  # nothing was ever asked
+    if source == "opencode" and info["title"]:
+        # a chat started from a command or skill opens with its whole expanded text: opencode's
+        # own title is the better label
+        info["first"] = info["title"]
+    auto = clean_name(info["title"] or info["first"])
+    rec = reg["sessions"].get(sid)
+    added = 0
+    if rec is None:
+        rec = reg["sessions"][sid] = {"name": auto, "name_source": "auto",
+                                      "registered": time.strftime("%Y-%m-%d %H:%M")}
+        added = 1
+    elif rec.get("name_source") != "manual":
+        rec["name"] = auto
+    rec.update(file=path, mtime=mtime, project=proj, cwd=info["cwd"],
+               started=info["started"], last=info["last"],
+               first=clean_name(info["first"]) if info["first"] else None)
+    if source:
+        rec["source"] = source
+    rec["chars"] = len(session_text(sid, rec, entries))
+    return added
+
+
+def up_to_date(reg, sid, path, mtime):
+    """True when the registry already holds this version of the session's transcript."""
+    rec = reg["sessions"].get(sid)
+    return bool(rec and rec.get("mtime") == mtime and rec.get("file") == path
+                and "first" in rec and "chars" in rec)
+
+
+def scan_sessions(reg, settings, now=None, idle=None, skip="", reg_path="", in_opencode=False):
     """Add sessions untouched for `idle` seconds (default: idle_minutes) to the registry and
-    refresh the changed ones (never `skip`, the session that runs this). Returns the number added."""
+    refresh the changed ones (never `skip`, the session that runs this). Returns the number added.
+    opencode chats are added too when `[sessions] opencode` is on; `in_opencode` = this runs inside
+    opencode (its newest chat is the one that runs this)."""
     import time
     now = time.time() if now is None else now
     idle = float(settings["idle_minutes"]) * 60 if idle is None else idle
@@ -1293,7 +1337,7 @@ def scan_sessions(reg, settings, now=None, idle=None, skip=""):
     try:
         projects = sorted(os.listdir(base))
     except OSError:
-        return 0
+        projects = []
     for proj in projects:
         pdir = os.path.join(base, proj)
         try:
@@ -1311,34 +1355,127 @@ def scan_sessions(reg, settings, now=None, idle=None, skip=""):
                 continue
             if now - mtime < idle:
                 continue  # probably still open
-            rec = reg["sessions"].get(sid)
-            if (rec and rec.get("mtime") == mtime and rec.get("file") == path
-                    and "first" in rec and "chars" in rec):
+            if up_to_date(reg, sid, path, mtime):
                 continue
-            entries = read_transcript(path)
-            info = session_info(entries)
-            if not info["first"] and not info["title"]:
-                continue  # nothing was ever asked
-            auto = clean_name(info["title"] or info["first"])
-            if rec is None:
-                rec = reg["sessions"][sid] = {"name": auto, "name_source": "auto",
-                                              "registered": time.strftime("%Y-%m-%d %H:%M")}
-                added += 1
-            elif rec.get("name_source") != "manual":
-                rec["name"] = auto
-            rec.update(file=path, mtime=mtime, project=proj, cwd=info["cwd"],
-                       started=info["started"], last=info["last"],
-                       first=clean_name(info["first"]) if info["first"] else None)
-            rec["chars"] = len(session_text(sid, rec, entries))
+            added += register(reg, sid, path, mtime, proj, read_transcript(path))
+    if settings["opencode"]:
+        added += scan_opencode(reg, settings, now, idle, reg_path, in_opencode)
+    return added
+
+
+def oc_run(cmd, args):
+    """Run the opencode program and return its standard output."""
+    try:
+        out = subprocess.run([cmd, *args], stdin=subprocess.DEVNULL, capture_output=True, check=False)
+    except OSError as e:
+        raise ConfigError(f"{cmd}: {e.strerror or e}") from e
+    if out.returncode != 0:
+        raise ConfigError(f"{cmd} {' '.join(args)} failed")
+    return out.stdout
+
+
+def iso_ms(ms):
+    t = datetime.datetime.fromtimestamp(ms // 1000, datetime.timezone.utc)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+
+
+def oc_text(parts):
+    """The text parts of an opencode message (tool calls, reasoning, synthetic and ignored text left out)."""
+    texts = [p.get("text", "") for p in parts or []
+             if isinstance(p, dict) and p.get("type") == "text"
+             and not p.get("synthetic") and not p.get("ignored") and isinstance(p.get("text"), str)]
+    return "\n".join(texts).strip()
+
+
+def oc_entries(export, directory):
+    """`opencode export` as transcript entries in the shape of a Claude Code .jsonl (title, user and
+    assistant text with timestamps), so the rest of the program reads both the same way."""
+    out = []
+    info = export.get("info") if isinstance(export, dict) else None
+    title = info.get("title") if isinstance(info, dict) else ""
+    if isinstance(title, str) and title and not title.startswith("New session - ") and not title.startswith("<"):
+        out.append({"type": "ai-title", "aiTitle": title})
+    for m in (export.get("messages") if isinstance(export, dict) else None) or []:
+        mi = m.get("info") if isinstance(m, dict) else None
+        role = mi.get("role") if isinstance(mi, dict) else ""
+        text = oc_text(m.get("parts"))
+        if not text or role not in ("user", "assistant"):
+            continue
+        created = (mi.get("time") or {}).get("created") if isinstance(mi.get("time"), dict) else 0
+        content = text if role == "user" else [{"type": "text", "text": text}]
+        out.append({"type": role, "timestamp": iso_ms(int(created or 0)), "cwd": directory,
+                    "message": {"role": role, "content": content}})
+    return out
+
+
+def scan_opencode(reg, settings, now, idle, reg_path, in_opencode):
+    """Add opencode's chats (top-level ones; sub-agent sessions are not listed by opencode) to the
+    registry. Each changed chat is exported once and cached as a transcript next to the registry."""
+    from concurrent.futures import ThreadPoolExecutor
+    cmd = settings["opencode_cmd"]
+    try:
+        listing = json.loads(oc_run(cmd, ["session", "list", "--format", "json"]))
+        if not isinstance(listing, list):
+            raise ConfigError("unreadable session list")
+    except (ConfigError, ValueError) as e:
+        print(f"OPENCODE SKIPPED ({e}): opencode chats left out")
+        return 0
+
+    def upd(v):
+        u = v.get("updated") if isinstance(v, dict) else 0
+        return u / 1000.0 if isinstance(u, (int, float)) else 0.0
+    live = None
+    if in_opencode:  # the chat that runs this is the newest one, still being written
+        recent = [v for v in listing if isinstance(v, dict) and now - upd(v) < 600]
+        if recent:
+            live = max(recent, key=upd).get("id")
+    cache = os.path.join(os.path.dirname(reg_path), "sessions-opencode")
+    todo = []
+    for v in listing:
+        sid = v.get("id") if isinstance(v, dict) else None
+        if not isinstance(sid, str) or not OC_ID_RE.fullmatch(sid):
+            continue
+        mtime = upd(v)
+        if sid == live or now - mtime < idle:
+            continue
+        path = os.path.join(cache, f"{sid}.jsonl")
+        if up_to_date(reg, sid, path, mtime) and os.path.isfile(path):
+            continue
+        todo.append((sid, mtime, v.get("directory") or "", path))
+
+    def export(item):
+        try:
+            return json.loads(oc_run(cmd, ["export", item[0]]))
+        except (ConfigError, ValueError):
+            return None
+    # opencode takes about two seconds per export: four at a time
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        exports = list(pool.map(export, todo))
+    added = 0
+    for (sid, mtime, directory, path), ex in zip(todo, exports):
+        if ex is None:
+            continue
+        entries = oc_entries(ex, directory)
+        try:
+            os.makedirs(cache, exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries))
+            os.replace(tmp, path)
+        except OSError:
+            continue
+        added += register(reg, sid, path, mtime, "opencode", entries, source="opencode")
     return added
 
 
 def find_session(reg, ident):
     """A registry id from a full id or a unique prefix (4+ characters)."""
     ident = ident.strip().lower()
-    if ident in reg["sessions"]:
-        return ident
-    hits = [i for i in reg["sessions"] if len(ident) >= 4 and i.startswith(ident)]
+    # opencode ids mix upper and lower case: match without case, answer with the real id
+    exact = [i for i in reg["sessions"] if i.lower() == ident]
+    if exact:
+        return exact[0]
+    hits = [i for i in reg["sessions"] if len(ident) >= 4 and i.lower().startswith(ident)]
     if len(hits) == 1:
         return hits[0]
     raise ConfigError(f"no session matches '{ident}'" if not hits else
@@ -1357,7 +1494,7 @@ def session_line(sid, rec):
 
 def resume_command(sid, rec):
     cwd = rec.get("cwd")
-    cmd = f"claude --resume {sid}"
+    cmd = f"opencode -s {sid}" if rec.get("source") == "opencode" else f"claude --resume {sid}"
     return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
 
 
@@ -1393,7 +1530,7 @@ def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
               "closed sessions; nothing done")
         return 7
     reg = load_registry(reg_path)
-    added = scan_sessions(reg, settings)
+    added = scan_sessions(reg, settings, reg_path=reg_path, in_opencode="OPENCODE" in os.environ)
     try:
         if args.rename:
             sid = find_session(reg, args.rename[0])
@@ -1540,14 +1677,18 @@ def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
 
     me = os.environ.get("CLAUDE_CODE_SESSION_ID", "").lower()  # never offer the chat running this
     reg = load_registry(reg_path)
-    scan_sessions(reg, settings, idle=0, skip=me)
+    scan_sessions(reg, settings, idle=0, skip=me, reg_path=reg_path, in_opencode="OPENCODE" in os.environ)
     try:
         save_registry(reg_path, reg)
     except OSError as e:
         print(f"could not save the session registry to {reg_path}: {e}")
     catalog = chat_catalog(reg, me)
     if not catalog:
-        print(f"NO CHATS: no earlier Claude Code chats in {settings['projects_dir']}; nothing loaded")
+        if settings["opencode"]:
+            print(f"NO CHATS: no earlier Claude Code ({settings['projects_dir']}) or opencode chats; "
+                  "nothing loaded")
+        else:
+            print(f"NO CHATS: no earlier Claude Code chats in {settings['projects_dir']}; nothing loaded")
         return 0
     recs = reg["sessions"]
     secs = chat_sections(names, catalog, presets, args.setup)
