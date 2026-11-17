@@ -1330,9 +1330,12 @@ fn the_conversion_saving_uses_the_measured_ratios() {
 
 // ---------------------------------------------------------------- opencode chats
 
+#[cfg(unix)]
 const OC1: &str = "ses_AbC123xyz";
+#[cfg(unix)]
 const OC2: &str = "ses_Def456uvw";
 
+#[cfg(unix)]
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
 }
