@@ -140,6 +140,8 @@ opencode asks before reading files outside the project folder, and the loader pr
 "permission": { "external_directory": { "~/.cache/researcher/*": "allow", "~/.local/share/researcher/text/*": "allow" } }
 ```
 
+The popup title names the program that asked: opencode when opencode started the loader (it sets `OPENCODE=1`), Claude Code otherwise. `RESEARCHER_HOST="name"` overrides it.
+
 Not available in opencode: `/load-context` and `--sessions`, which read Claude Code's own session files.
 
 Try it first on the made-up documents in [examples/library](examples/library): `researcher --library examples/library rust`. Then edit `~/.config/researcher/config.toml` (see [examples/config.toml](examples/config.toml)) and in Claude Code type `/researcher rust`, or just say "load my research for rust".

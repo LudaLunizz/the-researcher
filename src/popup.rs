@@ -261,20 +261,24 @@ impl eframe::App for App {
         egui::Panel::top("head").frame(margin).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                let host = host_name();
                 let title = match (self.setup, self.chats) {
-                    (true, _) => "Change the saved presets",
-                    (false, true) => "Claude Code wants to load earlier chats",
-                    (false, false) => "Claude Code wants to load research",
+                    (true, _) => "Change the saved presets".to_string(),
+                    (false, true) => format!("{host} wants to load earlier chats"),
+                    (false, false) => format!("{host} wants to load research"),
                 };
-                ui.label(RichText::new(title).heading().strong());
+                ui.label(RichText::new(&title).heading().strong());
                 ui.label(RichText::new(" for ").heading());
                 ui.label(RichText::new(&self.names).heading().strong());
             });
             ui.label(if self.setup {
-                "Tick what each should contain, then press Save presets. Nothing is loaded."
+                "Tick what each should contain, then press Save presets. Nothing is loaded.".to_string()
             } else {
-                "Tick what this session needs, then press Load. Nothing is sent to Claude until then; \
-                 Cancel loads nothing."
+                format!(
+                    "Tick what this session needs, then press Load. Nothing is sent to {} until then; \
+                     Cancel loads nothing.",
+                    host_short()
+                )
             });
             if !self.setup && !self.command.is_empty() {
                 ui.label(RichText::new(format!("Asked by: {}", self.command)).small().monospace());
@@ -687,4 +691,39 @@ pub fn first_use(default: &str, config: &str) -> Result<FirstUse, String> {
     run("The Researcher - choose your research folder", [640.0, 270.0], Box::new(app))?;
     let out = result.lock().expect("not poisoned").take();
     Ok(out.unwrap_or(FirstUse::Cancelled))
+}
+
+/// The program that asked for the load, for the popup text: `RESEARCHER_HOST` if set, `opencode` when
+/// opencode started us (it sets `OPENCODE=1` for its tools), otherwise Claude Code.
+pub fn host_name() -> String {
+    host_from(std::env::var("RESEARCHER_HOST").ok(), std::env::var_os("OPENCODE").is_some())
+}
+
+/// Same, for "Nothing is sent to ..." ("Claude" for Claude Code).
+fn host_short() -> String {
+    match host_name().as_str() {
+        "Claude Code" => "Claude".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn host_from(over: Option<String>, opencode: bool) -> String {
+    match over.map(|h| h.trim().to_string()) {
+        Some(h) if !h.is_empty() => h,
+        _ if opencode => "opencode".to_string(),
+        _ => "Claude Code".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::host_from;
+
+    #[test]
+    fn host_follows_override_then_opencode() {
+        assert_eq!(host_from(None, false), "Claude Code");
+        assert_eq!(host_from(None, true), "opencode");
+        assert_eq!(host_from(Some("Zed".into()), true), "Zed");
+        assert_eq!(host_from(Some("  ".into()), true), "opencode");
+    }
 }

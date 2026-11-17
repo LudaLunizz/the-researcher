@@ -512,6 +512,15 @@ def save_conf(path, conf):
 
 # ---------------------------------------------------------------- popup
 
+
+def host_name():
+    """The program that asked for the load, for the popup text: RESEARCHER_HOST if set, opencode when
+    opencode started us (it sets OPENCODE=1 for its tools), otherwise Claude Code."""
+    over = (os.environ.get("RESEARCHER_HOST") or "").strip()
+    if over:
+        return over
+    return "opencode" if "OPENCODE" in os.environ else "Claude Code"
+
 def popup(sections, texts, setup, command="", look=None):
     """Show the chooser. Returns {set: (ticked set, remember)}, None if cancelled or "timeout".
     Raises RuntimeError when no display/GTK 4 is available.
@@ -563,9 +572,11 @@ def popup(sections, texts, setup, command="", look=None):
                         "Nothing is loaded.")
     else:
         what = "earlier chats" if chats else "research"
-        head.set_markup(f"<big><b>Claude Code wants to load {what}</b></big> for {names}\n"
+        host = host_name()
+        head.set_markup(f"<big><b>{esc(host)} wants to load {what}</b></big> for {names}\n"
                         "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
-                        "Claude until then; <b>Cancel</b> loads nothing."
+                        f"{esc('Claude' if host == 'Claude Code' else host)} until then; "
+                        "<b>Cancel</b> loads nothing."
                         + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
     outer.append(head)
     search = Gtk.SearchEntry(placeholder_text="Filter: words from the first prompt or the folder"
