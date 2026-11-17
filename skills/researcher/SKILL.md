@@ -10,7 +10,7 @@ Load research sets from the user's library (a folder of .html, .md, .txt and .pd
    ```bash
    researcher SET [SET ...]
    ```
-   - Before running, tell the user in one line that the popup is open.
+   - Before running, say in one line that you are starting it and a popup will ask the user. You cannot see the window: afterwards describe what happened only from the program's output, never from your own idea of whether a popup showed. Document paths printed = the user pressed Load in the popup (or `--no-popup` was used); `SAVED default for ...` = they kept the choice as the preset; `NO POPUP`, `CANCELLED` and `TIMEOUT` are explained below. Never say "no popup shown" or "loaded the defaults directly" unless `NO POPUP` was printed.
    - The popup lists every document of each set with its size; the user ticks what to load. Each set's saved default is pre-ticked. On first use of a set, or when documents were added since its default was saved, the "save as default" box is pre-ticked and new documents show NEW.
    - "change the setup / defaults for X" → `researcher --setup X` (popup, saves the defaults, loads nothing).
    - `researcher --list` shows the sets, their size and saved defaults. Run it when the user's wording does not match a set name.
