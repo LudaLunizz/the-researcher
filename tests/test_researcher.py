@@ -357,6 +357,26 @@ class ScanTests(Env):
         self.assertEqual(t, "T\n- a\n- b & c")
 
 
+    def test_comments_are_dropped_as_a_unit(self):
+        self.assertEqual(R.html_text("<p>a</p><!-- ignore this > and that --><p>b</p>"), "a\nb")
+        self.assertEqual(R.html_text("<p>a</p><!-- two\nlines <b>x</b> --><p>b</p>"), "a\nb")
+        self.assertEqual(R.html_text("a<!-->b"), "a b")  # <!--> is an empty comment
+        self.assertEqual(R.html_text("a<!--->b"), "a b")
+        self.assertEqual(R.html_text("a<!---->b"), "a b")
+        self.assertEqual(R.html_text("<p>a</p><!-- never closed <p>hidden</p>"), "a")
+
+    def test_markdown_comments_dropped_text_files_untouched(self):
+        md, txt = os.path.join(self.tmp.name, "n.md"), os.path.join(self.tmp.name, "n.txt")
+        body = "one\n<!-- hidden > tail -->\ntwo <!--\nmulti\n--> three\n"
+        write(md, body)
+        write(txt, body)
+        text = R.convert(md)[1]
+        self.assertNotIn("hidden", text)
+        self.assertIn("one", text)
+        self.assertIn("three", text)
+        self.assertIn("hidden", R.convert(txt)[1])  # a .txt has no comments: shown as written
+
+
 class SetTests(Env):
     def test_glob_include_and_missing(self):
         cat = list(R.scan(self.lib))

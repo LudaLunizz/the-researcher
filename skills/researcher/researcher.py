@@ -188,8 +188,17 @@ def scan(library, exclude=()):
             if not any(fnmatch.fnmatchcase(k, pat) for pat in exclude)}
 
 
+COMMENT_RE = re.compile(r"(?s)<!--(?:>|->|.*?(?:-->|\Z))")  # <!--> and <!---> are empty comments; unclosed runs to the end
+
+
+def drop_comments(raw):
+    """Remove <!-- ... --> comments as a unit, so nothing hidden in one reaches the model.
+    Runs before the tag step: a '>' inside a comment must not end it early."""
+    return COMMENT_RE.sub(" ", raw)
+
+
 def html_text(raw):
-    t = re.sub(r"(?is)<(script|style|svg)\b.*?</\1>", " ", raw)
+    t = re.sub(r"(?is)<(script|style|svg)\b.*?</\1>", " ", drop_comments(raw))
     t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6]|section|table)>", "\n", t)
     t = re.sub(r"(?i)<(td|th)\b[^>]*>", " | ", t)
     t = re.sub(r"(?i)<li\b[^>]*>", "- ", t)
@@ -200,7 +209,7 @@ def html_text(raw):
     return "\n".join(line.strip() for line in t.splitlines()).strip()
 
 
-TEXT_VERSION = 2  # bump when to_text() or squeeze() changes: every stored copy is made again
+TEXT_VERSION = 3  # bump when to_text(), drop_comments() or squeeze() changes: every stored copy is made again
 INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))  # zero-width, soft hyphen
 PAGE_NUMBER_RE = re.compile(r"(?i)^(page\s+)?\d{1,4}(\s*(/|of)\s*\d{1,4})?$")
 PAGE_WORD_RE = re.compile(r"(?i)\b(page|pagina|blz|seite|p\.)\s*\d")
@@ -281,6 +290,8 @@ def convert(path):
     if ext in (".html", ".htm"):
         raw = html_text(raw)
         return raw, squeeze(raw, "html")
+    if ext == ".md":
+        raw = drop_comments(raw)
     return raw, squeeze(raw, "plain")
 
 

@@ -11,9 +11,9 @@ use serde_json::{Map, Value, json};
 
 use crate::util::{self, chars, py_rstrip, py_splitlines, py_strip};
 
-/// Bump when `html_text`, `convert` or `squeeze` changes: every stored copy is made again.
+/// Bump when `html_text`, `drop_comments`, `convert` or `squeeze` changes: every stored copy is made again.
 /// Shared with the Python version, which writes the same copies.
-pub const TEXT_VERSION: i64 = 2;
+pub const TEXT_VERSION: i64 = 3;
 
 fn re(p: &str) -> Regex {
     Regex::new(p).expect("valid built-in pattern")
@@ -24,6 +24,8 @@ static BREAKS: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)<br[\s\x1c-\x1f]*/?>|</(p|div|li|tr|h[1-6]|section|table)>"));
 static CELL: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<(td|th)\b[^>]*>"));
 static ITEM: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<li\b[^>]*>"));
+// `<!-->` and `<!--->` are complete (empty) comments; an unclosed one runs to the end, like in a browser.
+static COMMENT: LazyLock<Regex> = LazyLock::new(|| re(r"(?s)<!--(?:>|->|.*?(?:-->|\z))"));
 static TAG: LazyLock<Regex> = LazyLock::new(|| re(r"<[^>]+>"));
 static INLINE_WS: LazyLock<Regex> = LazyLock::new(|| re(r"[ \t\r\x0c\x0b]+"));
 static BLANK_RUNS: LazyLock<Regex> = LazyLock::new(|| re(r"\n[\s\x1c-\x1f]*\n+"));
@@ -61,9 +63,16 @@ fn drop_skipped(raw: &str) -> String {
     out
 }
 
+/// Remove `<!-- ... -->` comments as a unit, so nothing hidden in one reaches the model.
+/// Runs before the tag step: a `>` inside a comment must not end it early.
+pub fn drop_comments(raw: &str) -> String {
+    COMMENT.replace_all(raw, " ").into_owned()
+}
+
 /// HTML → plain text (block tags become line breaks, table cells " | ", list items "- ").
 pub fn html_text(raw: &str) -> String {
-    let t = drop_skipped(raw);
+    let t = drop_comments(raw);
+    let t = drop_skipped(&t);
     let t = BREAKS.replace_all(&t, "\n");
     let t = CELL.replace_all(&t, " | ");
     let t = ITEM.replace_all(&t, "- ");
@@ -220,6 +229,7 @@ pub fn convert(path: &str) -> Result<(String, String), String> {
         let text = squeeze(&raw, Kind::Html);
         return Ok((raw, text));
     }
+    let raw = if ext == ".md" { drop_comments(&raw) } else { raw };
     let text = squeeze(&raw, Kind::Plain);
     Ok((raw, text))
 }
@@ -462,6 +472,32 @@ mod tests {
     fn html_to_text() {
         let t = html_text("<h1>T</h1><ul><li>a</li><li>b &amp; c</li></ul><style>p{}</style>");
         assert_eq!(t, "T\n- a\n- b & c");
+    }
+
+    #[test]
+    fn comments_are_dropped_as_a_unit() {
+        // a `>` inside the comment must not leave its tail visible
+        assert_eq!(html_text("<p>a</p><!-- ignore this > and that --><p>b</p>"), "a\nb");
+        assert_eq!(html_text("<p>a</p><!-- two\nlines <b>x</b> --><p>b</p>"), "a\nb");
+        assert_eq!(html_text("a<!-->b"), "a b"); // `<!-->` is an empty comment
+        assert_eq!(html_text("a<!--->b"), "a b");
+        assert_eq!(html_text("a<!---->b"), "a b");
+        assert_eq!(html_text("<p>a</p><!-- never closed <p>hidden</p>"), "a");
+        assert_eq!(drop_comments("x <!-- y --> z <!-- w -->"), "x   z  ");
+    }
+
+    #[test]
+    fn markdown_comments_dropped_text_files_untouched() {
+        let dir = std::env::temp_dir().join(format!("researcher-comments-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let body = "one\n<!-- hidden > tail -->\ntwo <!--\nmulti\n--> three\n";
+        let (md, txt) = (dir.join("n.md"), dir.join("n.txt"));
+        fs::write(&md, body).unwrap();
+        fs::write(&txt, body).unwrap();
+        let text = convert(md.to_str().unwrap()).unwrap().1;
+        assert!(!text.contains("hidden") && text.contains("one") && text.contains("three"), "{text}");
+        assert!(convert(txt.to_str().unwrap()).unwrap().1.contains("hidden")); // a .txt has no comments
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

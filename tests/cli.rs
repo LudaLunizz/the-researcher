@@ -1032,9 +1032,12 @@ fn same_text_copies_as_python() {
     let lib = repo().join("examples/library");
     write(
         &e.lib.join("extra/entities.html"),
-        "<p>caf&eacute; &amp; &#8211; &nbsp;x</p><table><tr><td>a</td><td>b</td></tr></table>",
+        "<p>caf&eacute; &amp; &#8211; &nbsp;x</p><table><tr><td>a</td><td>b</td></tr></table><!-- hidden > tail --><p>y</p><!-->z<!-- never closed <p>w</p>",
     );
-    write(&e.lib.join("extra/rules.md"), "Title\r\n=====\r\n\r\n\r\n- a\n    - b\n\u{200b}----------\n");
+    write(
+        &e.lib.join("extra/rules.md"),
+        "Title\r\n=====\r\n\r\n\r\n- a\n    - b\n\u{200b}----------\n<!-- hidden > tail -->after\n<!--\nmulti\nline\n-->end\n",
+    );
     for (name, l) in [("rs", lib.as_path()), ("rs2", e.lib.as_path())] {
         let rs_out = e.tmp.join(name);
         let py_out = e.tmp.join(format!("{name}-py"));
