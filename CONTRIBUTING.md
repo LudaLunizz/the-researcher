@@ -32,6 +32,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 python3 -I -m unittest discover -s tests -v
 (cd worker && npm test)              # only when worker/ changed
+cargo install cargo-audit --locked && cargo audit   # only when Cargo.lock changed (the Audit workflow)
 ```
 
 **Never open the popup from a test or script**: set `RESEARCHER_NO_POPUP=1`.

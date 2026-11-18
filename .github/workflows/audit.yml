@@ -1,0 +1,22 @@
+name: Audit
+# Checks Cargo.lock against the RustSec advisory database. Vulnerabilities fail the
+# job; "unmaintained" notices are only warnings. The weekly run catches advisories
+# that are published after the last commit.
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.lock, Cargo.toml, .github/workflows/audit.yml]
+  pull_request:
+    paths: [Cargo.lock, Cargo.toml, .github/workflows/audit.yml]
+  schedule:
+    - cron: "17 5 * * 1"
+permissions:
+  contents: read
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo install cargo-audit --locked --version 0.23.0
+      - run: cargo audit
