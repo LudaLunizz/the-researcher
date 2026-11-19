@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
 use crate::library::{self, Choices, Config, ConfigError, Section, SetKind};
-use crate::popup::{self, Look, Outcome, POPUP_TIMEOUT};
+use crate::popup;
 use crate::usage::CHARS_PER_K;
 use crate::util::{self, chars, py_strip};
 
@@ -538,13 +538,7 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
         match &action {
             Action::Rename { id, name } => {
                 let sid = find_session(&reg, id)?;
-                let name = clean_name(name);
-                if name.is_empty() {
-                    return Err(ConfigError("the new name is empty".into()));
-                }
-                let rec = sessions_mut(&mut reg).get_mut(&sid).and_then(Value::as_object_mut).expect("found");
-                rec.insert("name".into(), Value::String(name));
-                rec.insert("name_source".into(), "manual".into());
+                set_name(&mut reg, &sid, name); // an empty name gives it its automatic name back
                 save_registry(reg_path, &reg).map_err(io)?;
                 println!("RENAMED {}", label(&sid, &sessions(&reg)[&sid]));
                 return Ok(Some(0));
@@ -743,12 +737,12 @@ fn chat_sections(names: &[String], catalog: &[String], presets: &Choices, setup:
 pub struct ContextArgs<'a> {
     pub names: &'a [String],
     pub setup: bool,
-    pub no_popup: bool,
     pub list: bool,
     pub reg_path: &'a str,
     pub presets_path: &'a str,
     pub out_dir: &'a str,
     pub cfg_path: &'a str,
+    pub ui_path: &'a str,
 }
 
 fn chat_chars(rec: &Value) -> u64 {
@@ -764,16 +758,31 @@ fn usage_of_chats(cfg: &Config, cfg_path: &str, loaded: &[(usize, u64)], lib: (u
     crate::usage::finish(cfg, cfg_path, &rec)
 }
 
-/// `--context [PRESET ...]`: pick earlier chats (all folders) in the popup and write each as a
-/// .txt to load as context. Presets are saved like custom sets, in their own file.
-pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
-    let Some(st) = settings(cfg) else {
-        println!(
-            "SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to load earlier chats; nothing done"
-        );
-        return 7;
+/// The chats side of a load, ready for the popup.
+pub struct Chats {
+    presets: Choices,
+    names: Vec<String>,
+    reg: Map<String, Value>,
+    catalog: Vec<String>,
+    pub secs: Vec<Section>,
+    /// The other tab of a load that started on research: quiet, and only loaded when ticked.
+    secondary: bool,
+}
+
+/// Find the chats for `--context [PRESET ...]` (or, as the second tab, the preset `default`).
+/// Err(code) = stop with that exit code (the message is printed, unless secondary).
+pub fn prep(cfg: &Config, a: &ContextArgs, secondary: bool) -> Result<Chats, i32> {
+    let say = |m: String| {
+        if !secondary {
+            println!("{m}");
+        }
     };
-    let mut presets = library::load_choices(a.presets_path);
+    let Some(st) = settings(cfg) else {
+        say("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to load earlier chats; nothing done"
+            .into());
+        return Err(7);
+    };
+    let presets = library::load_choices(a.presets_path);
     if a.list {
         if presets.is_empty() {
             println!("no context presets saved yet");
@@ -782,7 +791,7 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
             let k = str_set(Some(rec), "selected").len();
             println!("{n:20} {k:>4} chats");
         }
-        return 0;
+        return Err(0);
     }
     let names: Vec<String> = if a.names.is_empty() {
         vec![DEFAULT_PRESET.to_string()]
@@ -791,8 +800,8 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
     };
     let bad: Vec<&str> = names.iter().filter(|n| !PRESET_RE.is_match(n)).map(String::as_str).collect();
     if !bad.is_empty() {
-        println!("bad preset name(s): {} (use lowercase letters, digits, . _ -)", bad.join(", "));
-        return 2;
+        say(format!("bad preset name(s): {} (use lowercase letters, digits, . _ -)", bad.join(", ")));
+        return Err(2);
     }
 
     // the chat that runs this is never offered; chats closed a moment ago are
@@ -800,49 +809,103 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
     let mut reg = load_registry(a.reg_path);
     scan_sessions(&mut reg, &st, 0.0, &me, a.reg_path, std::env::var_os("OPENCODE").is_some());
     if let Err(e) = save_registry(a.reg_path, &reg) {
-        println!("could not save the session registry to {}: {e}", a.reg_path);
+        say(format!("could not save the session registry to {}: {e}", a.reg_path));
     }
     let catalog = chat_catalog(&reg, &me);
     if catalog.is_empty() {
         if st.opencode {
-            println!("NO CHATS: no earlier Claude Code ({}) or opencode chats; nothing loaded", st.projects_dir);
+            say(format!("NO CHATS: no earlier Claude Code ({}) or opencode chats; nothing loaded", st.projects_dir));
         } else {
-            println!("NO CHATS: no earlier Claude Code chats in {}; nothing loaded", st.projects_dir);
+            say(format!("NO CHATS: no earlier Claude Code chats in {}; nothing loaded", st.projects_dir));
         }
-        return 0;
+        return Err(0);
     }
-    let map = sessions(&reg);
-    let secs = chat_sections(&names, &catalog, &presets, a.setup);
+    let mut secs = chat_sections(&names, &catalog, &presets, a.setup);
+    if secondary {
+        for s in &mut secs {
+            s.remember = false; // a second tab never saves a preset unless the user asks
+        }
+    }
+    Ok(Chats { presets, names, reg, catalog, secs, secondary })
+}
 
-    let mut picks: Option<Vec<(String, BTreeSet<String>, bool)>> = None;
-    if !a.no_popup {
-        let mut look = Look { chats: true, ..Look::default() };
-        let mut sizes = popup::Sizes::new();
-        for sid in &catalog {
-            let rec = &map[sid];
-            look.labels.insert(sid.clone(), shown_name(rec));
-            look.groups.insert(sid.clone(), chat_folder(rec));
-            look.notes.insert(sid.clone(), util::take_chars(&last_of(rec), 10).to_string());
-            sizes.insert(sid.clone(), rec.get("chars").and_then(Value::as_u64).unwrap_or(0) as usize);
+/// The popup tab of the chats.
+pub fn tab(c: &Chats, ui_path: &str) -> popup::Tab {
+    let (chip, by_time) = crate::state::ui(ui_path, true);
+    let mut look = popup::Look { chats: true, chip, by_time, ..popup::Look::default() };
+    look.taken = c.presets.keys().cloned().collect();
+    let map = sessions(&c.reg);
+    let mut sizes = popup::Sizes::new();
+    for sid in &c.catalog {
+        let rec = &map[sid];
+        look.labels.insert(sid.clone(), shown_name(rec));
+        if let Some(first) = rec.get("first").and_then(Value::as_str).filter(|f| !f.is_empty()) {
+            look.defaults.insert(sid.clone(), first.to_string());
         }
-        let command = format!("researcher --context {}", names.join(" "));
-        match popup::popup(&secs, sizes, a.setup, &command, &look) {
-            Err(e) => println!("NO POPUP ({e}): using the saved presets"),
-            Ok(Outcome::Cancelled) => {
-                println!("CANCELLED: the user closed the popup, nothing loaded");
-                return 3;
-            }
-            Ok(Outcome::Timeout) => {
-                println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
-                return 4;
-            }
-            Ok(Outcome::Picked(p)) => picks = Some(p),
+        look.groups.insert(sid.clone(), chat_folder(rec));
+        look.notes.insert(sid.clone(), util::take_chars(&last_of(rec), 10).to_string());
+        let when = crate::bands::parse_iso(&last_of(rec))
+            .or_else(|| rec.get("mtime").and_then(Value::as_f64).map(|m| m as i64));
+        if let Some(w) = when {
+            look.times.insert(sid.clone(), w);
         }
+        sizes.insert(sid.clone(), chat_chars(rec) as usize);
     }
+    popup::Tab { sections: c.secs.clone(), sizes, look }
+}
+
+/// Give a chat its automatic name back (its title or first prompt, as a rescan would).
+fn reset_name(reg: &mut Map<String, Value>, sid: &str) {
+    let Some(rec) = sessions_mut(reg).get_mut(sid).and_then(Value::as_object_mut) else { return };
+    rec.insert("name_source".into(), "auto".into());
+    let get = |k: &str| rec.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let (file, proj, source) = (get("file"), get("project"), get("source"));
+    let mtime = rec.get("mtime").and_then(Value::as_f64).unwrap_or(0.0);
+    let entries = read_transcript(&file);
+    register(reg, sid, &file, mtime, &proj, Some(source.as_str()).filter(|s| !s.is_empty()), &entries);
+}
+
+/// Name a chat (an empty name gives it its automatic name back).
+fn set_name(reg: &mut Map<String, Value>, sid: &str, name: &str) {
+    let name = clean_name(name);
+    if name.is_empty() {
+        reset_name(reg, sid);
+        return;
+    }
+    if let Some(rec) = sessions_mut(reg).get_mut(sid).and_then(Value::as_object_mut) {
+        rec.insert("name".into(), Value::String(name));
+        rec.insert("name_source".into(), "manual".into());
+    }
+}
+
+/// Put the remembered picks into the presets (a new name moves the ticks: the old name goes).
+/// Returns true when something changed.
+fn save_presets(presets: &mut Choices, picks: &[popup::Pick], catalog: &[String], setup: bool) -> bool {
+    let mut saved_any = false;
+    for p in picks.iter().filter(|p| p.remember || setup) {
+        let selected: Vec<&String> = catalog.iter().filter(|d| p.ticked.contains(*d)).collect();
+        let to = if p.save_as.is_empty() { p.name.clone() } else { p.save_as.clone() };
+        if to != p.name && presets.remove(&p.name).is_some() {
+            println!("RENAMED context preset {} to {to}", p.name);
+        }
+        presets.insert(to.clone(), json!({"selected": selected, "known": catalog}));
+        println!("SAVED context preset {to}: {} of {} chats", p.ticked.len(), catalog.len());
+        saved_any = true;
+    }
+    saved_any
+}
+
+/// Save and load what was picked (`picks` None: no popup, the saved presets). Returns the exit
+/// code.
+pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabPick>) -> i32 {
+    let Chats { mut presets, names, mut reg, catalog, secs, secondary } = c;
     let unsaved: Vec<&str> = names.iter().filter(|n| !presets.contains_key(*n)).map(String::as_str).collect();
     if picks.is_none() && !unsaved.is_empty() {
-        println!("NO POPUP: context preset {} has no saved choice yet; nothing loaded", unsaved.join(", "));
-        return 5;
+        if !secondary {
+            println!("NO POPUP: context preset {} has no saved choice yet; nothing loaded", unsaved.join(", "));
+            return 5;
+        }
+        return 0;
     }
     // a saved preset can name a chat whose transcript was deleted since (the popup just drops it)
     let gone: Vec<String> = if picks.is_none() {
@@ -852,17 +915,38 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
     } else {
         Vec::new()
     };
-    let picks = picks.unwrap_or_else(|| secs.iter().map(|s| (s.name.clone(), s.ticked.clone(), false)).collect());
-
-    let mut saved_any = false;
-    for (n, ticked, keep) in &picks {
-        if *keep || a.setup {
-            let selected: Vec<&String> = catalog.iter().filter(|d| ticked.contains(*d)).collect();
-            presets.insert(n.clone(), json!({"selected": selected, "known": catalog}));
-            println!("SAVED context preset {n}: {} of {} chats", ticked.len(), catalog.len());
-            saved_any = true;
+    let picks = match picks {
+        Some(t) => {
+            if let Err(e) = crate::state::save_ui(a.ui_path, true, t.chip, t.by_time) {
+                println!("could not save the window settings to {}: {e}", a.ui_path);
+            }
+            if !t.renames.is_empty() {
+                for (sid, name) in &t.renames {
+                    set_name(&mut reg, sid, name);
+                    println!("RENAMED {}", chat_label(sid, &sessions(&reg)[sid]));
+                }
+                if let Err(e) = save_registry(a.reg_path, &reg) {
+                    println!("could not save the session registry to {}: {e}", a.reg_path);
+                }
+            }
+            t.picks
         }
+        None => secs
+            .iter()
+            .map(|s| popup::Pick {
+                name: s.name.clone(),
+                ticked: s.ticked.clone(),
+                remember: false,
+                save_as: s.name.clone(),
+                title: None,
+            })
+            .collect(),
+    };
+    if secondary && picks.iter().all(|p| p.ticked.is_empty()) {
+        return 0; // the other tab, left alone
     }
+
+    let saved_any = save_presets(&mut presets, &picks, &catalog, a.setup);
     if saved_any && let Err(e) = library::save_choices(a.presets_path, &presets) {
         println!("could not save the presets to {}: {e}", a.presets_path);
     }
@@ -871,7 +955,8 @@ pub fn context(cfg: &Config, a: &ContextArgs) -> i32 {
         return 0;
     }
 
-    let chosen: BTreeSet<&String> = picks.iter().flat_map(|(_, t, _)| t.iter()).collect();
+    let map = sessions(&reg);
+    let chosen: BTreeSet<&String> = picks.iter().flat_map(|p| p.ticked.iter()).collect();
     let mut docs = Vec::new();
     let mut labels = Vec::new();
     for sid in catalog.iter().filter(|d| chosen.contains(d)) {
@@ -921,5 +1006,27 @@ mod tests {
         let c = clean_name(&long);
         assert_eq!(chars(&c), NAME_MAX);
         assert!(c.ends_with('…'));
+    }
+
+    #[test]
+    fn a_renamed_preset_moves_its_ticks() {
+        let mut presets: Choices =
+            serde_json::from_str(r#"{"old": {"selected": ["a"], "known": ["a"]}, "keep": {}}"#).unwrap();
+        let pick = |name: &str, save_as: &str, remember: bool| popup::Pick {
+            name: name.into(),
+            ticked: ["b".to_string()].into(),
+            remember,
+            save_as: save_as.into(),
+            title: None,
+        };
+        let catalog = ["a".to_string(), "b".to_string()];
+        assert!(!save_presets(&mut presets, &[pick("old", "new", false)], &catalog, false)); // not remembered
+        assert!(presets.contains_key("old"));
+        assert!(save_presets(&mut presets, &[pick("old", "new", true)], &catalog, false));
+        assert!(!presets.contains_key("old"));
+        assert_eq!(presets["new"]["selected"], serde_json::json!(["b"]));
+        assert!(presets.contains_key("keep"));
+        assert!(save_presets(&mut presets, &[pick("fresh", "fresh", true)], &catalog, false));
+        assert_eq!(presets["fresh"]["known"], serde_json::json!(["a", "b"]));
     }
 }
