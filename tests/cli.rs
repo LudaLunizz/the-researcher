@@ -1018,6 +1018,104 @@ fn context_list_and_bad_names() {
     assert_eq!(s.e.run(&["--context", "a/b"]).0, 2);
 }
 
+#[test]
+fn an_empty_rename_gives_the_automatic_name_back() {
+    let s = sessions_env();
+    s.e.run(&["--sessions"]);
+    s.e.run(&["--rename", SID1, "popup crash"]);
+    let (code, out) = s.e.run(&["--rename", SID1, "  "]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("\"Fix the popup crash on start-up\" ({SID1})")), "{out}");
+    let reg: Value = serde_json::from_str(&read(&s.reg)).unwrap();
+    assert_eq!(reg["sessions"][SID1]["name_source"], "auto");
+    // and a later title is followed again, as for any automatic name
+    let (_, out) = s.e.run(&["--sessions"]);
+    assert!(out.contains(&format!("{SID1}  2026-11-16 10:01  Fix the popup crash on start-up")), "{out}");
+}
+
+// ---------------------------------------------------------------- one window, two tabs
+
+/// Saved research defaults for `rust` and a saved chat preset `default`.
+fn both_env() -> (Sess, PathBuf) {
+    let (s, presets) = context_env();
+    write(
+        &s.e.conf_dir.join("choices.json"),
+        r#"{"rust": {"selected": ["rust/memory-a"], "known": ["rust/linux", "rust/memory-a", "rust/memory-b"]}}"#,
+    );
+    save_preset(&presets, "default", &[SID2]);
+    (s, presets)
+}
+
+/// Line numbers of the first research path and the first CHAT line.
+fn first_lines(out: &str) -> (usize, usize) {
+    let doc = out.lines().position(|l| l.contains("chars  ") && l.contains("memory-a")).expect("a research line");
+    let chat = out.lines().position(|l| l.starts_with("CHAT ")).expect("a chat line");
+    (doc, chat)
+}
+
+#[test]
+fn a_research_load_also_loads_the_saved_chat_preset_research_first() {
+    let (s, _) = both_env();
+    let (code, out) = s.e.run(&["rust"]);
+    assert_eq!(code, 0, "{out}");
+    let (doc, chat) = first_lines(&out);
+    assert!(doc < chat, "{out}");
+    assert!(out.contains(&format!("CHAT \"Second one\" ({SID2})")), "{out}");
+    assert!(out.contains("total: 1 docs") && out.contains("total: 1 chats"), "{out}");
+    // one popup that loads both writes two records: library + chat
+    let recs = s.e.records();
+    assert_eq!(recs.len(), 2, "{out}");
+    assert_eq!(recs[0]["fmt"]["chat"], 0);
+    assert_eq!(recs[1]["fmt"]["chat"], 1);
+}
+
+#[test]
+fn start_decides_which_side_prints_first() {
+    let (s, _) = both_env();
+    let (code, out) = s.e.run(&["rust", "--start", "chats"]);
+    assert_eq!(code, 0, "{out}");
+    let (doc, chat) = first_lines(&out);
+    assert!(chat < doc, "{out}");
+    let (code, out) = s.e.run(&["--context", "default"]);
+    assert_eq!(code, 0, "{out}");
+    let (doc, chat) = first_lines(&out);
+    assert!(chat < doc, "{out}"); // --context opens on Chats
+    let (_, out) = s.e.run(&["--context", "--start", "research"]);
+    let (doc, chat) = first_lines(&out);
+    assert!(doc < chat, "{out}");
+    assert_eq!(s.e.run(&["rust", "--start", "nope"]).0, 2); // clap refuses it
+}
+
+#[test]
+fn the_other_side_loads_only_a_saved_choice() {
+    let (s, presets) = context_env();
+    // no saved chat preset `default`, no saved research default: each side loads only its own
+    let (code, out) = s.e.run(&["rust"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("CHAT ") && !out.contains("chats"), "{out}");
+    save_preset(&presets, "work", &[SID2]);
+    let (code, out) = s.e.run(&["--context", "work"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("docs"), "{out}");
+    assert!(!s.e.conf_dir.join("choices.json").exists()); // and saves nothing for it
+    // a problem on the other side is not this command's problem
+    write(&s.e.cfg, &(read(&s.e.cfg).replace("default_set = \"rust\"", "default_set = \"ghost\"")));
+    assert_eq!(s.e.run(&["--context", "work"]).0, 0);
+}
+
+#[test]
+fn a_display_name_shows_before_the_path() {
+    let (s, _) = both_env();
+    write(&s.e.conf_dir.join("names.json"), r#"{"docs": {"rust/memory-a": "Memory, part A"}}"#);
+    let (code, out) = s.e.run(&["rust"]);
+    assert_eq!(code, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let i = lines.iter().position(|l| *l == "DOC \"Memory, part A\" (rust/memory-a)").expect("DOC line");
+    assert!(lines[i + 1].contains("chars  ") && lines[i + 1].ends_with(".txt"), "{out}");
+    assert!(!s.e.lib.join("rust/memory-a.md").to_string_lossy().is_empty());
+    assert_eq!(read(&s.e.lib.join("rust/memory-a.md")), "# A"); // the library is never touched
+}
+
 // ---------------------------------------------------------------- parity with the Python version
 
 /// Both versions share the text copy (same TEXT_VERSION), so they must write the same text.

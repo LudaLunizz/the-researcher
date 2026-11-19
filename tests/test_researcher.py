@@ -33,6 +33,13 @@ class Env(unittest.TestCase):
         self.data = os.path.join(self.tmp.name, "data")  # the usage log must never reach a real home
         os.environ["XDG_DATA_HOME"] = self.data
         self.addCleanup(os.environ.pop, "XDG_DATA_HOME", None)
+        # chat loads of a second tab go to the cache; nothing may reach a real home
+        for k, d in (("XDG_CACHE_HOME", "xdg-cache"), ("XDG_CONFIG_HOME", "xdg-config")):
+            self.addCleanup(os.environ.__setitem__, k, os.environ[k]) if k in os.environ else \
+                self.addCleanup(os.environ.pop, k, None)
+            os.environ[k] = os.path.join(self.tmp.name, d)
+        if "CLAUDE_CODE_SESSION_ID" in os.environ:  # the tests may run inside Claude Code
+            self.addCleanup(os.environ.__setitem__, "CLAUDE_CODE_SESSION_ID", os.environ.pop("CLAUDE_CODE_SESSION_ID"))
         self.lib = os.path.join(self.tmp.name, "lib")
         self.conf_dir = os.path.join(self.tmp.name, "conf")
         self.out = os.path.join(self.tmp.name, "out")
@@ -817,6 +824,162 @@ class ContextTests(SessionEnv):
         self.assertIn("1 chats", out)
         code, out = self.run_main("--context", "a/b")
         self.assertEqual(code, 2)
+
+    def test_an_empty_rename_gives_the_automatic_name_back(self):
+        self.run_main("--sessions")
+        self.run_main("--rename", SID1, "popup crash")
+        code, out = self.run_main("--rename", SID1, "  ")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f'"Fix the popup crash on start-up" ({SID1})', out)
+        self.assertEqual(json.loads(read(self.reg))["sessions"][SID1]["name_source"], "auto")
+
+
+class TwoTabTests(ContextTests.__base__):
+    """One window, two tabs: the other side loads its saved choice; --start orders the output."""
+
+    def setUp(self):
+        super().setUp()
+        self.presets = os.path.join(self.conf_dir, "contexts.json")
+        jl(os.path.join(self.proj, "-work-web", SID4 + ".jsonl"),
+           [user("Newest chat, other folder", ts="2026-11-17T09:00:00Z", cwd="/work/web")])
+
+    def save_both(self):
+        write(os.path.join(self.conf_dir, "choices.json"), json.dumps(
+            {"rust": {"selected": ["rust/memory-a"], "known": ["rust/linux", "rust/memory-a", "rust/memory-b"]}}))
+        write(self.presets, json.dumps({"default": {"selected": [SID2], "known": []}}))
+
+    def first_lines(self, out):
+        lines = out.splitlines()
+        doc = next(i for i, l in enumerate(lines) if "chars  " in l and "memory-a" in l)
+        chat = next(i for i, l in enumerate(lines) if l.startswith("CHAT "))
+        return doc, chat
+
+    def test_research_load_also_loads_the_saved_chat_preset_research_first(self):
+        self.save_both()
+        code, out = self.run_main("rust")
+        self.assertEqual(code, 0, out)
+        doc, chat = self.first_lines(out)
+        self.assertLess(doc, chat, out)
+        self.assertIn(f'CHAT "Second one" ({SID2})', out)
+        recs = R.read_usage()
+        self.assertEqual(len(recs), 2, out)  # one load of both writes a library and a chat record
+        self.assertEqual([r["fmt"]["chat"] for r in recs], [0, 1])
+
+    def test_start_decides_which_side_prints_first(self):
+        self.save_both()
+        doc, chat = self.first_lines(self.run_main("rust", "--start", "chats")[1])
+        self.assertLess(chat, doc)
+        doc, chat = self.first_lines(self.run_main("--context", "default")[1])
+        self.assertLess(chat, doc)
+        doc, chat = self.first_lines(self.run_main("--context", "--start", "research")[1])
+        self.assertLess(doc, chat)
+
+    def test_the_other_side_loads_only_a_saved_choice(self):
+        code, out = self.run_main("rust")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("CHAT ", out)
+        write(self.presets, json.dumps({"work": {"selected": [SID2], "known": []}}))
+        code, out = self.run_main("--context", "work")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("docs", out)
+        self.assertFalse(os.path.exists(os.path.join(self.conf_dir, "choices.json")))
+        write(self.cfg, read(self.cfg).replace('default_set = "rust"', 'default_set = "ghost"'))
+        self.assertEqual(self.run_main("--context", "work")[0], 0)
+
+    def test_a_display_name_shows_before_the_path(self):
+        self.save_both()
+        write(os.path.join(self.conf_dir, "names.json"), json.dumps({"docs": {"rust/memory-a": "Memory, part A"}}))
+        code, out = self.run_main("rust")
+        self.assertEqual(code, 0, out)
+        lines = out.splitlines()
+        i = lines.index('DOC "Memory, part A" (rust/memory-a)')
+        self.assertTrue(lines[i + 1].endswith(".txt"), out)
+        self.assertEqual(read(os.path.join(self.lib, "rust", "memory-a.md")), "# A")
+
+
+class WindowLogicTests(unittest.TestCase):
+    """The parts of the window that are plain logic: time bands, chips, names, presets."""
+
+    def at(self, s):
+        return R.datetime.datetime.fromisoformat(s)
+
+    def test_bands_follow_local_midnight_then_age(self):
+        now = self.at("2026-11-19T10:00:00+01:00")
+        for t, want in (("2026-11-19T00:00:00+01:00", "Today"), ("2026-11-20T08:00:00+01:00", "Today"),
+                        ("2026-11-18T23:59:59+01:00", "Yesterday"), ("2026-11-18T00:00:00+01:00", "Yesterday"),
+                        ("2026-11-17T23:59:59+01:00", "Earlier this week"),
+                        ("2026-11-12T10:00:01+01:00", "Earlier this week"),
+                        ("2026-11-12T10:00:00+01:00", "Earlier this month"),
+                        ("2026-10-20T10:00:01+01:00", "Earlier this month"),
+                        ("2026-10-20T10:00:00+01:00", "Older")):
+            self.assertEqual(R.band(now, self.at(t)), want, t)
+        # 23:30 UTC on the 18th is already the 19th at +01:00
+        self.assertEqual(R.band(now, self.at("2026-11-18T23:30:00+00:00").astimezone(now.tzinfo)), "Today")
+
+    def test_chips_are_24h_7d_30d(self):
+        now = self.at("2026-11-19T10:00:00+01:00")
+        for chip, inside, outside in (("day", "2026-11-18T10:00:01+01:00", "2026-11-18T10:00:00+01:00"),
+                                      ("week", "2026-11-12T10:00:01+01:00", "2026-11-12T10:00:00+01:00"),
+                                      ("month", "2026-10-20T10:00:01+01:00", "2026-10-20T10:00:00+01:00")):
+            self.assertTrue(R.chip_holds(chip, now, self.at(inside)), chip)
+            self.assertFalse(R.chip_holds(chip, now, self.at(outside)), chip)
+        self.assertTrue(R.chip_holds("all", now, self.at("2000-01-01T00:00:00+00:00")))
+        self.assertEqual(R.parse_iso("2026-11-16T10:00:00Z"), 1794823200)
+        self.assertIsNone(R.parse_iso("nope"))
+
+    def test_ticks_survive_a_chip_switch_and_hidden_ones_are_counted(self):
+        now = R.datetime.datetime.now().astimezone()
+        ts = int(now.timestamp())
+        sec = {"name": "a", "kind": "custom", "docs": [], "main": ["new", "old", "none"], "other": [],
+               "new": set(), "ticked": {"new", "old"}, "remember": False, "first": False}
+        st = R.tab_state({"sections": [sec], "sizes": {"new": 1, "old": 1, "none": 1},
+                          "look": {"chats": True, "chip": "week", "times": {"new": ts, "old": ts - 40 * 86400}}})
+        self.assertEqual((len(R.tab_chosen(st)), R.tab_hidden(st, now)), (2, 1))
+        self.assertEqual((R.chip_count(st, "week", now), R.chip_count(st, "all", now)), (1, 3))
+        st["chip"] = "all"
+        self.assertEqual((len(R.tab_chosen(st)), R.tab_hidden(st, now)), (2, 0))
+
+    def test_a_cleared_name_falls_back(self):
+        st = {"renames": {}}
+        r = {"doc": "rust/linux", "label": "Saved", "default": None}
+        self.assertEqual(R.row_shown(st, r, True), "Saved")
+        st["renames"]["rust/linux"] = "New"
+        self.assertEqual(R.row_shown(st, r, True), "New")
+        st["renames"]["rust/linux"] = ""
+        self.assertEqual(R.row_shown(st, r, True), "linux")
+        self.assertEqual(R.row_shown(st, r, False), "rust/linux")
+
+    def test_preset_names_and_a_renamed_preset_moves_its_ticks(self):
+        secs = [{"name": "a", "save_as": "a", "remember": False}]
+        self.assertIsNone(R.bad_preset_name(secs, {"b"}))
+        secs[0]["remember"] = True
+        secs[0]["save_as"] = "Bad Name"
+        self.assertIn("cannot be a preset name", R.bad_preset_name(secs, {"b"}))
+        secs[0]["save_as"] = "b"
+        self.assertIn("exists already", R.bad_preset_name(secs, {"b"}))
+        presets = {"old": {"selected": ["a"], "known": ["a"]}, "keep": {}}
+        pick = lambda remember: {"name": "old", "ticked": {"b"}, "remember": remember, "save_as": "new"}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(R.save_presets(presets, [pick(False)], ["a", "b"], False))
+            self.assertTrue(R.save_presets(presets, [pick(True)], ["a", "b"], False))
+        self.assertNotIn("old", presets)
+        self.assertEqual(presets["new"]["selected"], ["b"])
+        self.assertIn("keep", presets)
+
+    def test_names_and_ui_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            n, u = os.path.join(d, "names.json"), os.path.join(d, "ui.json")
+            self.assertEqual(R.ui_state(u, True), ("week", True))
+            self.assertEqual(R.ui_state(u, False), ("all", False))
+            R.save_ui(u, True, "month", False)
+            self.assertEqual(R.ui_state(u, True), ("month", False))
+            R.state_rename(n, "docs", {"rust/linux": "Linux notes"})
+            R.state_rename(n, "sets", {"rust": "Rust"})
+            self.assertEqual(R.state_names(n, "docs"), {"rust/linux": "Linux notes"})
+            R.state_rename(n, "docs", {"rust/linux": ""})
+            self.assertEqual(R.state_names(n, "docs"), {})
+            self.assertEqual(R.state_names(n, "sets"), {"rust": "Rust"})
+
 
 OC1 = "ses_AbC123xyz"
 OC2 = "ses_Def456uvw"

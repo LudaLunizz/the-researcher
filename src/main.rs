@@ -12,9 +12,11 @@
 //!
 //! Same command line, files and exit codes as `skills/researcher/researcher.py`.
 
+mod bands;
 mod library;
 mod popup;
 mod sessions;
+mod state;
 mod text;
 mod usage;
 mod util;
@@ -27,7 +29,7 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use library::{ConfigError, SetKind};
-use popup::{FirstUse, Outcome, POPUP_TIMEOUT};
+use popup::{FirstUse, Outcome, POPUP_TIMEOUT, TabPick};
 use text::Texts;
 use usage::CHARS_PER_K;
 
@@ -64,6 +66,9 @@ struct Args {
     /// pick earlier Claude Code chats (all folders) to load as context; SET names are presets
     #[arg(long)]
     context: bool,
+    /// the tab the window opens on (default: chats with --context, research otherwise)
+    #[arg(long, value_name = "chats|research", value_parser = ["chats", "research"])]
+    start: Option<String>,
     /// sessions shown by --sessions
     #[arg(long, default_value_t = 30)]
     limit: usize,
@@ -413,30 +418,6 @@ fn run(args: Args) -> i32 {
     } else {
         None
     };
-    if args.context {
-        let cfg = match library::load_config(&cfg_path) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("CONFIG ERROR: {e}");
-                return 6;
-            }
-        };
-        let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
-        let out = args.out.clone().unwrap_or_else(cache_home);
-        return sessions::context(
-            &cfg,
-            &sessions::ContextArgs {
-                names: &args.sets,
-                setup: args.setup,
-                no_popup,
-                list: args.list,
-                reg_path: &util::join(&cfg_dir, "sessions.json"),
-                presets_path: &util::join(&cfg_dir, "contexts.json"),
-                out_dir: &out,
-                cfg_path: &cfg_path,
-            },
-        );
-    }
     if let Some(action) = session_action {
         let cfg = match library::load_config(&cfg_path) {
             Ok(c) => c,
@@ -449,49 +430,78 @@ fn run(args: Args) -> i32 {
         return sessions::main(action, &cfg, &cfg_path, &util::join(&cfg_dir, "sessions.json"), &out);
     }
 
-    match load(&args, &cfg_path, &state_path) {
-        Ok(code) => code,
-        Err(e) => {
-            println!("CONFIG ERROR: {e}");
-            6
-        }
-    }
+    load_both(&args, &cfg_path, &state_path)
 }
 
-fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigError> {
-    let cfg = library::load_config(cfg_path)?;
+/// The research side of a load, ready for the popup.
+struct Research {
+    cfg: library::Config,
+    paths: BTreeMap<String, String>,
+    conf: library::Choices,
+    names: Vec<String>,
+    sets: library::Sets,
+    texts: Texts,
+    alldocs: Vec<String>,
+    missing: Vec<String>,
+    secs: Vec<library::Section>,
+    /// The other tab of a load that started on chats: quiet, and only loaded when ticked.
+    secondary: bool,
+}
+
+/// Find the research for `researcher SET ...` (or, as the second tab, the config's
+/// default_set). Err(code) = stop with that exit code (the message is printed, unless
+/// secondary).
+fn research_prep(args: &Args, cfg_path: &str, state_path: &str, secondary: bool) -> Result<Research, i32> {
+    let say = |m: String| {
+        if !secondary {
+            println!("{m}");
+        }
+    };
+    let cfg_err = |e: ConfigError| {
+        say(format!("CONFIG ERROR: {e}"));
+        6
+    };
+    let cfg = library::load_config(cfg_path).map_err(cfg_err)?;
     let env_lib = std::env::var("RESEARCHER_LIBRARY").ok().filter(|s| !s.is_empty());
     let lib_setting = args.library.clone().filter(|s| !s.is_empty()).or(env_lib);
     let lib_setting = match lib_setting {
         Some(l) => Some(l),
-        None => library::cfg_str(&cfg, "library")?.filter(|s| !s.is_empty()).map(str::to_string),
+        None => library::cfg_str(&cfg, "library").map_err(cfg_err)?.filter(|s| !s.is_empty()).map(str::to_string),
     };
     let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
     let Some(lib) = lib_setting.map(|l| util::user_path(&l)) else {
         let asked = std::env::var_os("RESEARCHER_FIRST_USE_DONE").is_some();
-        if !(args.list || args.sync || no_popup || asked) {
-            return Ok(first_use(cfg_path));
+        if !(secondary || args.list || args.sync || no_popup || asked) {
+            return Err(first_use(cfg_path));
         }
-        println!("NO LIBRARY: set `library` in {cfg_path} (or run --init, or set RESEARCHER_LIBRARY); nothing loaded");
-        return Ok(6);
+        say(format!(
+            "NO LIBRARY: set `library` in {cfg_path} (or run --init, or set RESEARCHER_LIBRARY); nothing loaded"
+        ));
+        return Err(6);
     };
     if !std::path::Path::new(&lib).is_dir() {
-        println!("NO LIBRARY: {lib} is not a folder; nothing loaded");
-        return Ok(6);
+        say(format!("NO LIBRARY: {lib} is not a folder; nothing loaded"));
+        return Err(6);
     }
-    let paths = library::scan(&lib, &library::str_list(cfg.get("exclude"), "exclude")?);
+    let paths = library::scan(&lib, &library::str_list(cfg.get("exclude"), "exclude").map_err(cfg_err)?);
     let catalog: Vec<String> = paths.keys().cloned().collect();
-    let mut conf = library::load_choices(state_path);
-    let names = library::resolve_names(&args.sets, &cfg);
-    let sets = library::build_sets(&cfg, &catalog, &conf, &names)?;
+    let conf = library::load_choices(state_path);
+    // the set names on the command line belong to the tab the command is for
+    let names = library::resolve_names(if secondary { &[] } else { &args.sets }, &cfg);
+    let sets = library::build_sets(&cfg, &catalog, &conf, &names).map_err(cfg_err)?;
 
-    let store = match &args.out {
-        Some(o) => o.clone(),
-        None => library::cfg_str(&cfg, "text_dir")?.filter(|s| !s.is_empty()).map_or_else(text_home, str::to_string),
+    // the second tab keeps its text copy where it always is; --out is for the first tab
+    let out = if secondary { None } else { args.out.clone() };
+    let store = match out {
+        Some(o) => o,
+        None => library::cfg_str(&cfg, "text_dir")
+            .map_err(cfg_err)?
+            .filter(|s| !s.is_empty())
+            .map_or_else(text_home, str::to_string),
     };
     let store = util::user_path(&store);
 
-    if args.sync {
+    if args.sync && !secondary {
         let mut texts = Texts::new(&paths, &store);
         let ok: Vec<&String> = catalog.iter().filter(|d| texts.has(d)).collect();
         texts.flush();
@@ -507,10 +517,10 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
             paths.len(),
             chars / CHARS_PER_K
         );
-        return Ok(0);
+        return Err(0);
     }
 
-    if args.list {
+    if args.list && !secondary {
         println!("library: {lib} ({} documents)", paths.len());
         for n in &sets.order {
             let kind = sets.kinds[n];
@@ -529,29 +539,29 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
                 .collect();
             println!("aliases: {}", pairs.join(", "));
         }
-        return Ok(0);
+        return Err(0);
     }
 
     if paths.is_empty() {
-        println!(
+        say(format!(
             "EMPTY LIBRARY: {lib} has no documents yet (.html, .md, .txt, .pdf); save or copy research into it; \
              nothing loaded"
-        );
-        return Ok(6);
+        ));
+        return Err(6);
     }
     if names.is_empty() {
-        println!("NO SET: name a set, or set `default_set` in the config; known: {}", sets.order.join(", "));
-        return Ok(2);
+        say(format!("NO SET: name a set, or set `default_set` in the config; known: {}", sets.order.join(", ")));
+        return Err(2);
     }
     let bad: Vec<&String> = names.iter().filter(|n| !sets.contains(n)).collect();
     if !bad.is_empty() {
         let bad: Vec<&str> = bad.iter().map(|s| s.as_str()).collect();
-        println!(
+        say(format!(
             "unknown set(s): {} (names use lowercase letters, digits, . _ -); known: {}",
             bad.join(", "),
             sets.order.join(", ")
-        );
-        return Ok(2);
+        ));
+        return Err(2);
     }
 
     let alldocs: Vec<String> = library::dedupe(names.iter().flat_map(|n| sets.docs[n].iter().cloned()));
@@ -564,55 +574,89 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
             missing.push(format!("UNREADABLE  {} ({})", paths[d], texts.error(d)));
         }
     }
-    let secs = library::sections_for(&names, &sets, &conf, &mut texts, args.setup);
-
-    let mut picks: Option<Vec<(String, BTreeSet<String>, bool)>> = None;
-    if !no_popup {
-        let mut sizes = BTreeMap::new();
-        for s in &secs {
-            for d in s.main.iter().chain(&s.other) {
-                if texts.has(d) {
-                    sizes.insert(d.clone(), texts.len(d));
-                }
+    let mut secs = library::sections_for(&names, &sets, &conf, &mut texts, args.setup && !secondary);
+    if secondary {
+        for s in &mut secs {
+            s.remember = false; // a second tab never saves a preset unless the user asks
+            if s.first {
+                s.ticked.clear(); // nor loads a whole set nobody chose yet
             }
-        }
-        texts.flush();
-        match popup::popup(
-            &secs,
-            sizes,
-            args.setup,
-            &format!("researcher {}", names.join(" ")),
-            &popup::Look::default(),
-        ) {
-            Err(e) => println!("NO POPUP ({e}): using the saved defaults"),
-            Ok(Outcome::Cancelled) => {
-                println!("CANCELLED: the user closed the popup, nothing loaded");
-                return Ok(3);
-            }
-            Ok(Outcome::Timeout) => {
-                println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
-                return Ok(4);
-            }
-            Ok(Outcome::Picked(p)) => picks = Some(p),
         }
     }
-    let new_custom: Vec<&str> = names
+    Ok(Research { cfg, paths, conf, names, sets, texts, alldocs, missing, secs, secondary })
+}
+
+/// The popup tab of the research.
+fn research_tab(r: &mut Research, names_path: &str, ui_path: &str) -> popup::Tab {
+    let (chip, by_time) = state::ui(ui_path, false);
+    let mut look = popup::Look { chip, by_time, ..popup::Look::default() };
+    look.labels = state::names(names_path, "docs");
+    look.titles = state::names(names_path, "sets");
+    let mut sizes = BTreeMap::new();
+    for s in &r.secs {
+        for d in s.main.iter().chain(&s.other) {
+            if r.texts.has(d) {
+                sizes.insert(d.clone(), r.texts.len(d));
+            }
+            if let Some(m) = r.paths.get(d).and_then(|p| std::fs::metadata(p).ok()) {
+                look.times.insert(d.clone(), util::mtime_secs(&m) as i64);
+            }
+        }
+    }
+    r.texts.flush();
+    popup::Tab { sections: r.secs.clone(), sizes, look }
+}
+
+/// Save and load what was picked (`picks` None: no popup, the saved defaults). Returns the exit
+/// code.
+fn research_finish(
+    r: Research,
+    picks: Option<TabPick>,
+    setup: bool,
+    cfg_path: &str,
+    state_path: &str,
+    names_path: &str,
+    ui_path: &str,
+) -> i32 {
+    let Research { cfg, paths, mut conf, names, sets, mut texts, alldocs, missing, secs, secondary } = r;
+    let unsaved: Vec<&str> = names
         .iter()
-        .filter(|n| sets.kinds[*n] == SetKind::Custom && !conf.contains_key(*n))
+        .filter(|n| (secondary || sets.kinds[*n] == SetKind::Custom) && !conf.contains_key(*n))
         .map(String::as_str)
         .collect();
-    if picks.is_none() && !new_custom.is_empty() {
-        println!("NO POPUP: {} has no saved choice yet; nothing loaded", new_custom.join(", "));
-        return Ok(5);
+    if picks.is_none() && !unsaved.is_empty() {
+        if secondary {
+            return 0; // no popup: the second tab loads only a choice saved earlier
+        }
+        println!("NO POPUP: {} has no saved choice yet; nothing loaded", unsaved.join(", "));
+        return 5;
     }
-    // --no-popup or no display: the saved defaults, nothing saved
-    let picks = picks.unwrap_or_else(|| secs.iter().map(|s| (s.name.clone(), s.ticked.clone(), false)).collect());
+    let picks = match picks {
+        Some(t) => {
+            if let Err(e) = state::save_ui(ui_path, false, t.chip, t.by_time) {
+                println!("could not save the window settings to {ui_path}: {e}");
+            }
+            let titles: BTreeMap<String, String> =
+                t.picks.iter().filter_map(|p| Some((p.name.clone(), p.title.clone()?))).collect();
+            for (key, changes) in [("docs", &t.renames), ("sets", &titles)] {
+                if let Err(e) = state::rename(names_path, key, changes) {
+                    println!("could not save the names to {names_path}: {e}");
+                }
+            }
+            t.picks.into_iter().map(|p| (p.name, p.ticked, p.remember)).collect()
+        }
+        // --no-popup or no display: the saved defaults, nothing saved
+        None => secs.iter().map(|s| (s.name.clone(), s.ticked.clone(), false)).collect::<Vec<_>>(),
+    };
+    if secondary && picks.iter().all(|(_, t, _)| t.is_empty()) {
+        return 0; // the other tab, left alone
+    }
 
     let order: BTreeMap<&str, Vec<&String>> =
         secs.iter().map(|s| (s.name.as_str(), s.main.iter().chain(&s.other).collect())).collect();
     let mut saved_any = false;
     for (n, ticked, keep) in &picks {
-        if *keep || args.setup {
+        if *keep || setup {
             let selected: Vec<&String> = order[n.as_str()].iter().filter(|d| ticked.contains(**d)).copied().collect();
             let mut rec = json!({"selected": selected, "known": sets.docs[n]});
             if sets.kinds[n] == SetKind::Custom {
@@ -626,9 +670,9 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     if saved_any && let Err(e) = library::save_choices(state_path, &conf) {
         println!("could not save the defaults to {state_path}: {e}");
     }
-    if args.setup {
+    if setup {
         println!("setup only: nothing loaded");
-        return Ok(0);
+        return 0;
     }
 
     let chosen: BTreeSet<&String> = picks.iter().flat_map(|(_, t, _)| t.iter()).collect();
@@ -646,10 +690,14 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     {
         share_note = usage::finish(&cfg, cfg_path, &rec); // the log must never break a load
     }
+    let shown_names = state::names(names_path, "docs");
     let mut total = 0;
     for (d, dst) in docs.iter().zip(&written) {
         let n = texts.len(d);
         total += n;
+        if let Some(name) = shown_names.get(d) {
+            println!("DOC \"{name}\" ({d})");
+        }
         println!("{n:>7} chars  {dst}");
     }
     for line in &missing {
@@ -667,7 +715,110 @@ fn load(args: &Args, cfg_path: &str, state_path: &str) -> Result<i32, ConfigErro
     if let Some(note) = share_note {
         println!("{note}");
     }
-    Ok(0)
+    0
+}
+
+/// A load: research (`researcher SET ...`) or chats (`--context PRESET ...`) in one window with
+/// a tab for each; the other tab shows the default set or the preset `default`. The tab the
+/// window opens on prints first.
+fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
+    let cfg_dir = util::dirname(cfg_path);
+    let names_path = util::join(&cfg_dir, "names.json");
+    let ui_path = util::join(&cfg_dir, "ui.json");
+    let reg_path = util::join(&cfg_dir, "sessions.json");
+    let presets_path = util::join(&cfg_dir, "contexts.json");
+    let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
+    let chats_first = args.start.as_deref().map_or(args.context, |s| s == "chats");
+    let alone = args.setup || args.list || args.sync; // these work on one side only
+    let chat_out = if args.context { args.out.clone().unwrap_or_else(cache_home) } else { cache_home() };
+    let none: Vec<String> = Vec::new();
+    let cargs = sessions::ContextArgs {
+        names: if args.context { &args.sets } else { &none },
+        setup: args.setup,
+        list: args.list,
+        reg_path: &reg_path,
+        presets_path: &presets_path,
+        out_dir: &chat_out,
+        cfg_path,
+        ui_path: &ui_path,
+    };
+    let (mut research, chats) = if args.context {
+        let cfg = match library::load_config(cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("CONFIG ERROR: {e}");
+                return 6;
+            }
+        };
+        let chats = match sessions::prep(&cfg, &cargs, false) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        let research = if alone { None } else { research_prep(args, cfg_path, state_path, true).ok() };
+        (research, Some((cfg, chats)))
+    } else {
+        let research = match research_prep(args, cfg_path, state_path, false) {
+            Ok(r) => r,
+            Err(code) => return code,
+        };
+        let chats = if alone { None } else { sessions::prep(&research.cfg, &cargs, true).ok() };
+        let cfg = research.cfg.clone();
+        (Some(research), chats.map(|c| (cfg, c)))
+    };
+
+    let mut r_pick: Option<TabPick> = None;
+    let mut c_pick: Option<TabPick> = None;
+    if !no_popup {
+        let mut tabs = Vec::new();
+        if let Some((_, c)) = &chats {
+            tabs.push(sessions::tab(c, &ui_path));
+        }
+        if let Some(r) = research.as_mut() {
+            tabs.push(research_tab(r, &names_path, &ui_path));
+        }
+        let start = if chats_first || research.is_none() { 0 } else { tabs.len() - 1 };
+        let command = if args.context {
+            format!("researcher --context {}", args.sets.join(" "))
+        } else {
+            format!("researcher {}", research.as_ref().map_or(String::new(), |r| r.names.join(" ")))
+        };
+        match popup::popup(&tabs, start, args.setup, command.trim_end()) {
+            Err(e) if args.context => println!("NO POPUP ({e}): using the saved presets"),
+            Err(e) => println!("NO POPUP ({e}): using the saved defaults"),
+            Ok(Outcome::Cancelled) => {
+                println!("CANCELLED: the user closed the popup, nothing loaded");
+                return 3;
+            }
+            Ok(Outcome::Timeout) => {
+                println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
+                return 4;
+            }
+            Ok(Outcome::Picked(picked)) => {
+                let mut it = picked.into_iter();
+                if chats.is_some() {
+                    c_pick = it.next();
+                }
+                if research.is_some() {
+                    r_pick = it.next();
+                }
+            }
+        }
+    }
+
+    let mut research_code = None;
+    if !chats_first {
+        research_code =
+            Some(research.take().map_or(0, |r| {
+                research_finish(r, r_pick.take(), args.setup, cfg_path, state_path, &names_path, &ui_path)
+            }));
+    }
+    let chats_code = chats.map_or(0, |(cfg, c)| sessions::finish(c, &cfg, &cargs, c_pick));
+    let research_code = research_code.unwrap_or_else(|| {
+        research.map_or(0, |r| research_finish(r, r_pick, args.setup, cfg_path, state_path, &names_path, &ui_path))
+    });
+    // the command's own side decides the exit code; the other side only adds to it
+    let (own, other) = if args.context { (chats_code, research_code) } else { (research_code, chats_code) };
+    if own != 0 { own } else { other }
 }
 
 #[cfg(test)]

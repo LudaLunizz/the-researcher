@@ -189,17 +189,18 @@ researcher --usage-share on|off   share the anonymous usage counts with the proj
 researcher --usage-send [--dry-run]  send the usage records not sent yet (only with sharing on)
 researcher --init [LIBRARY]       write a starter config
 researcher --sessions             list tracked closed sessions (opt-in, see Sessions)
-researcher --rename ID NAME       rename a tracked session
+researcher --rename ID NAME       rename a tracked session ("" = back to the automatic name)
 researcher --resume ID            print the command that resumes a session
 researcher --session-load ID      write a session's conversation as a .txt to load as context
 researcher --context [PRESET ...] pick earlier chats in a popup and load them (see Earlier chats)
+researcher --start chats|research  the tab the window opens on (see One window, two tabs)
 researcher --context --setup P    change a context preset, load nothing
 researcher --context --list       list the saved context presets
 ```
 
 It prints one path per ticked document; the skill tells Claude to read each one in full. Exit codes: 0 ok, 2 unknown set, 3 cancelled, 4 popup timed out, 5 custom set with no saved choice and no popup, 6 config or library problem, 7 sessions switched off, 8 session id not found or ambiguous, 9 usage sharing not switched on (`--usage-send`), 1 a send failed (the records stay queued).
 
-Files: config, saved choices, the session registry and context presets in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`, `contexts.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`, `usage-sent`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
+Files: config, saved choices, the session registry and context presets in `~/.config/researcher/` (`config.toml`, `choices.json`, `sessions.json`, `contexts.json`, display names in `names.json`, the last time chip and grouping in `ui.json`), the text copy in `~/.local/share/researcher/text/` (`.index.json` there tracks which source each copy came from), the usage log (`usage.jsonl`, `usage-id`, `usage-sent`) in `~/.local/share/researcher/`, and session loads in `~/.cache/researcher/`.
 
 ## Sessions (optional)
 
@@ -233,6 +234,17 @@ Presets work like custom sets. `/load-context noname` the first time shows every
 Each ticked chat is written like `--session-load` (prompts and replies, no tool traffic) to `~/.cache/researcher/`, and the skill reads them. Presets live in `~/.config/researcher/contexts.json`.
 
 Install the skill next to `researcher`: `cp -r skills/load-context ~/.claude/skills/` (or `ln -s "$PWD/skills/load-context" ~/.claude/skills/load-context`).
+
+## One window, two tabs
+
+When sessions are switched on, every load opens one window with two tabs: **Chats | Research**. `researcher SET` (and `/researcher`) opens on Research, `researcher --context` (and `/load-context`) opens on Chats, and `--start chats|research` picks the tab yourself. The other tab shows your preset `default` (chats) or the config's `default_set` (research), with its saved ticks; a set or preset you never saved starts unticked there. Each tab keeps its own ticks, filter and presets, and one **Load** button loads what is ticked in both ("Load 3 chats + 5 docs"). The tab the window opened on prints first. Without a window (`--no-popup`, no display) both sides load their saved choice; the other side loads nothing when it has none. A load of both writes two usage records, one for the documents and one for the chats.
+
+**Time chips.** Above the list: **Day | Week | Month | All** (the last 24 hours, 7 days, 30 days), each with its count. Chats go by when they were last active, documents by when their file last changed. **Group by: time** puts the rows under Today, Yesterday, Earlier this week, Earlier this month and Older, newest first, with the project folder as a small label on each chat; **folder** is the old view. A ticked row the chip hides keeps its tick and is still loaded; the line above the buttons says how many. The window remembers the chip and the grouping per tab in `ui.json` (first time: chats on Week by time, research on All by folder).
+
+**Names.** ✏ next to a row (or a double-click on it) renames it in place; Enter keeps the name, Esc undoes it.
+- A chat's name goes into `sessions.json`, the same as `--rename`; an empty name gives it its first prompt back.
+- A document's name and a research set's name (✏ next to the set) go into `names.json`; your files are never touched. The window shows the name with the real id in small text, the filter finds both, and the output gets a `DOC "name" (id)` line before the document's path.
+- A chat preset has a name field next to **Remember**: a new name moves the saved ticks to it. Lowercase letters, digits, `.`, `_` and `-`, and not the name of another preset.
 
 ## Safety
 

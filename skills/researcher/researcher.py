@@ -521,6 +521,95 @@ def save_conf(path, conf):
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------- time bands, names, window state
+
+CHIPS = ("day", "week", "month", "all")
+CHIP_LABELS = {"day": "Day", "week": "Week", "month": "Month", "all": "All"}
+CHIP_HOURS = {"day": 24, "week": 7 * 24, "month": 30 * 24}
+
+
+def chip_holds(chip, now, t):
+    """True when `t` falls inside the chip: the last 24 hours, 7 days or 30 days (or always)."""
+    return chip == "all" or now - t < datetime.timedelta(hours=CHIP_HOURS[chip])
+
+
+def band(now, t):
+    """The heading a time sits under (aware datetimes): Today and Yesterday follow local
+    midnight, the rest the age (7 and 30 days). A time in the future counts as Today."""
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if t >= midnight:
+        return "Today"
+    if t >= midnight - datetime.timedelta(days=1):
+        return "Yesterday"
+    age = now - t
+    if age < datetime.timedelta(days=7):
+        return "Earlier this week"
+    return "Earlier this month" if age < datetime.timedelta(days=30) else "Older"
+
+
+def parse_iso(t):
+    """Seconds since the epoch of an ISO time (2026-11-16T10:00:00Z), or None."""
+    try:
+        return int(datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp())
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def local_time(secs):
+    return datetime.datetime.fromtimestamp(secs).astimezone()
+
+
+def state_names(path, key):
+    """{id: name} under `key` ("docs" or "sets") of names.json."""
+    rec = load_conf(path).get(key)
+    return {k: v for k, v in rec.items() if isinstance(v, str)} if isinstance(rec, dict) else {}
+
+
+def state_rename(path, key, changes):
+    """Apply renames under `key` ("" removes the name) and save."""
+    if not changes:
+        return
+    allnames = load_conf(path)
+    m = allnames.get(key) if isinstance(allnames.get(key), dict) else {}
+    for k, v in changes.items():
+        if v:
+            m[k] = v
+        else:
+            m.pop(k, None)
+    allnames[key] = m
+    save_conf(path, allnames)
+
+
+def ui_state(path, chats):
+    """(chip, group by time) last used in a tab; first run: chats on Week by time, research on
+    All by folder."""
+    rec = load_conf(path).get("chats" if chats else "research") or {}
+    chip = rec.get("chip") if rec.get("chip") in CHIPS else ("week" if chats else "all")
+    group = rec.get("group")
+    return chip, (group == "time") if group in ("time", "folder") else chats
+
+
+def save_ui(path, chats, chip, by_time):
+    allui = load_conf(path)
+    allui["chats" if chats else "research"] = {"chip": chip, "group": "time" if by_time else "folder"}
+    save_conf(path, allui)
+
+
+def bad_preset_name(secs, taken):
+    """Why a remembered chat preset name cannot be saved, or None."""
+    seen = set()
+    for s in secs:
+        if not s["remember"]:
+            continue
+        n = s["save_as"].strip()
+        if not PRESET_RE.fullmatch(n):
+            return f'"{n}" cannot be a preset name: use lowercase letters, digits, . _ -'
+        if (n != s["name"] and n in taken) or n in seen:
+            return f'a preset named "{n}" exists already: pick another name'
+        seen.add(n)
+    return None
+
+
 # ---------------------------------------------------------------- popup
 
 
@@ -532,17 +621,85 @@ def host_name():
         return over
     return "opencode" if "OPENCODE" in os.environ else "Claude Code"
 
-def popup(sections, texts, setup, command="", look=None):
-    """Show the chooser. Returns {set: (ticked set, remember)}, None if cancelled or "timeout".
+
+def subtitle(sec, chats):
+    if chats:
+        if sec["first"]:
+            return ("new preset: nothing saved yet. Tick the chats this one needs; tick Remember to "
+                    "keep them as its preset.")
+        return f"saved preset: {len(sec['ticked'])} chats" + (
+            f", {len(sec['new'])} newer chats since (marked NEW)" if sec["new"] else "")
+    if sec["first"]:
+        return ("new set: nothing saved yet. Tick the research this one needs; it is saved as its "
+                "preset." if sec["kind"] == "custom" else
+                f"{len(sec['docs'])} documents (no preset saved yet, all ticked)")
+    return f"saved preset: {len(sec['ticked'] - sec['new'])} documents" + (
+        f", {len(sec['new'])} new in the library" if sec["new"] else "")
+
+
+def tab_state(tab):
+    """The window's working copy of one tab: rows as small dicts."""
+    look, sizes = tab["look"], tab["sizes"]
+    chats = bool(look.get("chats"))
+    labels, defaults = look.get("labels", {}), look.get("defaults", {})
+    notes, groups, times = look.get("notes", {}), look.get("groups", {}), look.get("times", {})
+    titles = look.get("titles", {})
+
+    def row(d, sec):
+        f = d.rpartition("/")[0]
+        return {"doc": d, "label": labels.get(d), "default": defaults.get(d), "note": notes.get(d, ""),
+                "folder": groups[d] if d in groups else (f + "/" if f else "(top level)"),
+                "when": times.get(d), "on": d in sizes and d in sec["ticked"], "readable": d in sizes,
+                "new": d in sec["new"]}
+    secs = [{"name": s["name"], "title": titles.get(s["name"], ""), "title0": titles.get(s["name"], ""),
+             "save_as": s["name"], "sub": subtitle(s, chats),
+             "main": [row(d, s) for d in s["main"]], "other": [row(d, s) for d in s["other"]],
+             "other_open": not s["main"], "saved": set(s["ticked"]), "first": s["first"],
+             "remember": s["remember"]} for s in tab["sections"]]
+    return {"chats": chats, "secs": secs, "sizes": sizes, "filter": "",
+            "chip": look.get("chip", "all"), "by_time": bool(look.get("by_time")), "timed": bool(times),
+            "renames": {}, "taken": set(look.get("taken", ()))}
+
+
+def row_shown(st, r, short):
+    """A rename made in the window, else the saved label, else from the id (`short`: its last
+    part, under its folder heading)."""
+    from_id = r["doc"].rpartition("/")[2] if short else r["doc"]
+    if r["doc"] in st["renames"]:
+        return st["renames"][r["doc"]] or r["default"] or from_id
+    return r["label"] or from_id
+
+
+def tab_rows(st):
+    return [r for s in st["secs"] for r in s["main"] + s["other"]]
+
+
+def in_chip(st, r, now):
+    return st["chip"] == "all" or (r["when"] is not None and chip_holds(st["chip"], now, local_time(r["when"])))
+
+
+def tab_chosen(st):
+    return {r["doc"] for r in tab_rows(st) if r["on"]}
+
+
+def tab_hidden(st, now):
+    """Ticked rows the chip hides (they are still loaded)."""
+    return len({r["doc"] for r in tab_rows(st) if r["on"] and not in_chip(st, r, now)})
+
+
+def chip_count(st, chip, now):
+    whens = {r["doc"]: r["when"] for r in tab_rows(st)}
+    return sum(1 for w in whens.values()
+               if chip == "all" or (w is not None and chip_holds(chip, now, local_time(w))))
+
+
+def popup(tabs, start, setup, command=""):
+    """Show the chooser on tab `start` and wait. Returns one pick per tab ({"picks": [{name, ticked,
+    remember, save_as, title}], "renames", "chip", "by_time"}), None if cancelled or "timeout".
     Raises RuntimeError when no display/GTK 4 is available.
 
-    look (for --context): {"labels": {id: shown}, "notes": {id: small text}, "groups": {id:
-    heading}, "chats": True}; by default rows show the document id under its folder."""
-    look = look or {}
-    labels, notes, groups = look.get("labels", {}), look.get("notes", {}), look.get("groups", {})
-    sizes = look.get("sizes", {})
-    chats = bool(look.get("chats"))
-    noun = "chats" if chats else "documents"
+    A tab is {"sections", "sizes": {id: chars} (readable rows only), "look": {"chats", "labels",
+    "defaults", "notes", "groups", "times", "titles", "taken", "chip", "by_time"}}."""
     try:
         import gi
         gi.require_version("Gtk", "4.0")
@@ -555,154 +712,52 @@ def popup(sections, texts, setup, command="", look=None):
     esc = lambda t: GLib.markup_escape_text(t, -1)
     loop = GLib.MainLoop()
     result = {"value": None}
-    boxes = {}  # set name -> [(doc, CheckButton)]
-    remember = {}
+    states = [tab_state(t) for t in tabs]
+    cur = {"i": min(start, len(states) - 1), "edit": None}  # edit: (tab, section, row id or "", text)
+    now = datetime.datetime.now().astimezone()
+    host = host_name()
 
-    def k(d):
-        return (sizes[d] if d in sizes else len(texts.get(d, ""))) / CHARS_PER_K
+    def clear(box):
+        while (c := box.get_first_child()) is not None:
+            box.remove(c)
 
-    def folder(d):
-        return d.rpartition("/")[0]
-
-    def group(d):
-        if d in groups:
-            return groups[d]
-        return folder(d) + "/" if folder(d) else "(top level)"
-
-    win = Gtk.Window(title="The Researcher - " + ("change saved presets" if setup else
-                     "choose chats to load" if chats else "choose research to load"))
-    win.set_default_size(720, 780)
+    if len(tabs) == 1:
+        what = "choose chats to load" if states[0]["chats"] else "choose research to load"
+    else:
+        what = "choose chats and research to load"
+    win = Gtk.Window(title="The Researcher - " + ("change saved presets" if setup else what))
+    win.set_default_size(760, 800)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for m in ("top", "bottom", "start", "end"):
         getattr(outer, f"set_margin_{m}")(14)
-    names = ", ".join(f"<b>{esc(s['name'])}</b>" for s in sections)
+    tabbar = Gtk.Box(spacing=6)
+    tab_buttons = []
+    if len(states) > 1:
+        group = None
+        for i, st in enumerate(states):
+            b = Gtk.ToggleButton()
+            if group is not None:
+                b.set_group(group)
+            group = group or b
+            b.set_active(i == cur["i"])
+            b.connect("toggled", lambda b, i=i: b.get_active() and switch(i))
+            tabbar.append(b)
+            tab_buttons.append(b)
+        outer.append(tabbar)
     head = Gtk.Label(xalign=0, wrap=True)
-    if setup:
-        head.set_markup(f"<big><b>Change the saved presets</b></big> for {names}\n"
-                        "Tick what each should contain, then press <b>Save presets</b>. "
-                        "Nothing is loaded.")
-    else:
-        what = "earlier chats" if chats else "research"
-        host = host_name()
-        head.set_markup(f"<big><b>{esc(host)} wants to load {what}</b></big> for {names}\n"
-                        "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
-                        f"{esc('Claude' if host == 'Claude Code' else host)} until then; "
-                        "<b>Cancel</b> loads nothing."
-                        + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
     outer.append(head)
-    search = Gtk.SearchEntry(placeholder_text="Filter: words from the first prompt or the folder"
-                             if chats else "Filter: words from the name")
+    chips = Gtk.Box(spacing=6)
+    outer.append(chips)
+    search = Gtk.SearchEntry()
     outer.append(search)
-    rows = []  # (lower-case search text, CheckButton, heading label or None)
     scroll = Gtk.ScrolledWindow(vexpand=True)
     body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     scroll.set_child(body)
     outer.append(scroll)
     total = Gtk.Label(xalign=0)
-
-    def update(*_):
-        c = {d for lst in boxes.values() for d, cb in lst if cb.get_active()}
-        total.set_markup(f"<b>{len(c)} {noun}, ~{sum(k(d) for d in c):.0f}k tokens</b>"
-                         + ("" if setup else " will be loaded"))
-        ok.set_label("Save presets" if setup else f"Load {len(c)} {noun}")
-        ok.set_sensitive(setup or bool(c))
-
-    def add_docs(target, docs, sec, lst):
-        """Check boxes for `docs`, with a small folder heading when more than one folder shows."""
-        grouped = len({group(d) for d in docs}) > 1 or bool(groups)
-        last = h = None
-        for d in docs:
-            if grouped and group(d) != last:
-                last = group(d)
-                h = Gtk.Label(xalign=0)
-                h.set_markup(f"<small><b>{esc(last)}</b></small>")
-                h.set_margin_top(6)
-                h.set_margin_start(12)
-                target.append(h)
-            cb = Gtk.CheckButton()
-            l = Gtk.Label(xalign=0)
-            shown = labels.get(d) or (d.rpartition("/")[2] if grouped else d)
-            rows.append((f"{shown} {group(d)} {d}".lower(), cb, h))
-            if d in texts:
-                note = f"  <small><span alpha='60%'>{esc(notes[d])}</span></small>" if notes.get(d) else ""
-                extra = "  <span foreground='#ffcc33'><b>NEW</b></span>" if d in sec["new"] else ""
-                l.set_markup(f"{esc(shown)}  <small>~{k(d):.0f}k</small>{note}{extra}")
-                cb.set_active(d in sec["ticked"])
-            else:
-                l.set_markup(f"<s>{esc(shown)}</s>  <span foreground='#ff6666'>"
-                             "MISSING or unreadable</span>")
-                cb.set_sensitive(False)
-            cb.set_child(l)
-            cb.set_margin_start(24 if grouped else 12)
-            cb.connect("toggled", update)
-            target.append(cb)
-            lst.append((d, cb))
-
-    expanders = []
-    for sec in sections:
-        n = sec["name"]
-        custom = sec["kind"] == "custom"
-        if chats:
-            sub = ("new preset: nothing saved yet. Tick the chats this one needs; tick Remember to "
-                   "keep them as its preset." if sec["first"] else
-                   f"saved preset: {len(sec['ticked'])} chats" + (
-                       f", {len(sec['new'])} newer chats since (marked NEW)" if sec["new"] else ""))
-        elif sec["first"]:
-            sub = ("new set: nothing saved yet. Tick the research this one needs; it is saved "
-                   "as its preset." if custom else
-                   f"{len(sec['docs'])} documents (no preset saved yet, all ticked)")
-        else:
-            sub = f"saved preset: {len(sec['ticked'] - sec['new'])} documents" + (
-                f", {len(sec['new'])} new in the library" if sec["new"] else "")
-        lbl = Gtk.Label(xalign=0, wrap=True)
-        lbl.set_margin_top(12)
-        lbl.set_markup(f"<big><b>{esc(n)}</b></big>\n<small>{esc(sub)}</small>")
-        body.append(lbl)
-        lst = []
-        row = Gtk.Box(spacing=6)
-        for text, fn in (("Select all", lambda l: [cb.set_active(cb.get_sensitive())
-                                                   for _, cb in l if cb.get_visible()]),
-                         ("Select none", lambda l: [cb.set_active(False)
-                                                    for _, cb in l if cb.get_visible()]),
-                         ("Back to saved preset", None)):
-            b = Gtk.Button(label=text)
-            if fn is None:
-                b.connect("clicked", lambda _b, l=lst, s=sec["ticked"]:
-                          [cb.set_active(d in s) for d, cb in l])
-                b.set_sensitive(not sec["first"])
-            else:
-                b.connect("clicked", lambda _b, l=lst, f=fn: f(l))
-            row.append(b)
-        body.append(row)
-        if sec["main"]:
-            add_docs(body, sec["main"], sec, lst)
-        if sec["other"]:
-            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            if chats:
-                label = ("Your chats: tick the ones to load" if not sec["main"] else
-                         f"Add other chats ({len(sec['other'])} more)")
-            else:
-                label = ("Your library: tick the research to use" if not sec["main"] else
-                         f"Add other research from your library ({len(sec['other'])} more)")
-            ex = Gtk.Expander(label=label)
-            expanders.append(ex)
-            ex.set_margin_start(12)
-            ex.set_margin_top(6)
-            ex.set_expanded(not sec["main"])
-            ex.set_child(inner)
-            body.append(ex)
-            add_docs(inner, sec["other"], sec, lst)
-        boxes[n] = lst
-        rb = Gtk.CheckButton(label=f"Remember this choice as the preset for {n}")
-        rb.set_active(sec["remember"])
-        if setup:
-            rb.set_sensitive(False)
-        rb.set_margin_start(12)
-        rb.set_margin_top(6)
-        body.append(rb)
-        remember[n] = rb
-
     outer.append(total)
+    error = Gtk.Label(xalign=0, wrap=True)
+    outer.append(error)
     bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
     cancel = Gtk.Button(label="Close without saving" if setup else "Cancel (load nothing)")
     ok = Gtk.Button(label="Load")
@@ -711,7 +766,252 @@ def popup(sections, texts, setup, command="", look=None):
     bar.append(ok)
     outer.append(bar)
     win.set_child(outer)
-    win.set_default_widget(ok)
+
+    def later(fn):
+        GLib.idle_add(lambda: (fn(), False)[1])
+
+    def update(*_):
+        parts, short = [], []
+        k = n = hidden = 0
+        for st in states:
+            c = tab_chosen(st)
+            k += sum(st["sizes"].get(d, 0) for d in c) / CHARS_PER_K
+            n += len(c)
+            hidden += tab_hidden(st, now)
+            if c or len(states) == 1:
+                parts.append(f"{len(c)} {'chats' if st['chats'] else 'documents'}")
+                short.append(f"{len(c)} {'chats' if st['chats'] else 'docs'}")
+        line = f"{' + '.join(parts) or 'nothing ticked'}, ~{k:.0f}k tokens" + ("" if setup else " will be loaded")
+        if hidden:
+            line += f" ({hidden} ticked but hidden by the time chip)"
+        total.set_markup(f"<b>{esc(line)}</b>")
+        bad = next((b for st in states if st["chats"] for b in [bad_preset_name(st["secs"], st["taken"])] if b), None)
+        error.set_markup(f"<span foreground='#ff6666'>{esc(bad)}</span>" if bad else "")
+        if setup:
+            ok.set_label("Save presets")
+        elif len(states) == 1:
+            ok.set_label("Load " + "".join(parts))
+        else:
+            ok.set_label("Load " + " + ".join(short) if short else "Load")
+        ok.set_sensitive((setup or n > 0) and not bad and cur["edit"] is None)
+        for b, st in zip(tab_buttons, states):
+            b.set_label(f"{'Chats' if st['chats'] else 'Research'} ({len(tab_chosen(st))} ticked)")
+
+    def visible(st, r, short):
+        if not in_chip(st, r, now):
+            return False
+        q = st["filter"]
+        return not q or q in f"{row_shown(st, r, short)} {r['folder']} {r['doc']}".lower()
+
+    def start_edit(si, doc, text):
+        cur["edit"] = (cur["i"], si, doc, text)
+        later(render)
+
+    def commit(si, doc, entry):
+        if cur["edit"] is None or cur["edit"][:3] != (cur["i"], si, doc):
+            return  # already done (Enter, then the entry lost focus)
+        text = entry.get_text().strip()
+        st = states[cur["i"]]
+        if doc:
+            st["renames"][doc] = text
+        else:
+            st["secs"][si]["title"] = text
+        cur["edit"] = None
+        later(render)
+
+    def edit_entry(si, doc, text, hint):
+        e = Gtk.Entry(text=text, placeholder_text=hint, width_chars=40)
+        e.connect("activate", lambda e: commit(si, doc, e))
+        focus = Gtk.EventControllerFocus()
+        focus.connect("leave", lambda *_: commit(si, doc, e))
+        e.add_controller(focus)
+        later(e.grab_focus)
+        return e
+
+    def add_rows(target, st, si, rows, indent):
+        by_time = st["by_time"]
+        folder_heads = not by_time and (st["chats"] or len({r["folder"] for r in rows}) > 1)
+        short = folder_heads and not st["chats"]
+        order = sorted(rows, key=lambda r: r["when"] if r["when"] is not None else float("-inf"),
+                       reverse=True) if by_time else rows  # stable: ties keep their order
+        last = None
+        for r in order:
+            if not visible(st, r, short):
+                continue
+            if by_time:
+                head = band(now, local_time(r["when"])) if r["when"] is not None else "Unknown time"
+            else:
+                head = r["folder"] if folder_heads else None
+            if head is not None and head != last:
+                h = Gtk.Label(xalign=0)
+                h.set_markup(f"<small><b>{esc(head)}</b></small>")
+                h.set_margin_top(6)
+                h.set_margin_start(indent)
+                target.append(h)
+                last = head
+            line = Gtk.Box(spacing=6)
+            line.set_margin_start(indent + (12 if folder_heads or by_time else 0))
+            shown = row_shown(st, r, short)
+            ed = cur["edit"]
+            if ed and ed[:3] == (cur["i"], si, r["doc"]):
+                line.append(edit_entry(si, r["doc"], ed[3], "empty = the first prompt again" if st["chats"]
+                                       else "empty = the file name again"))
+                hint = Gtk.Label()
+                hint.set_markup("<small><span alpha='60%'>Enter keeps it, Esc undoes</span></small>")
+                line.append(hint)
+            elif r["readable"]:
+                cb = Gtk.CheckButton()
+                l = Gtk.Label(xalign=0)
+                bits = [esc(shown), f"<small>~{st['sizes'].get(r['doc'], 0) / CHARS_PER_K:.0f}k</small>"]
+                if r["note"]:
+                    bits.append(f"<small><span alpha='60%'>{esc(r['note'])}</span></small>")
+                if by_time and st["chats"]:  # the folder heading moves onto the row
+                    bits.append(f"<small><span alpha='60%'>{esc(r['folder'])}</span></small>")
+                if not st["chats"] and shown not in (r["doc"], r["doc"].rpartition("/")[2]) and shown:
+                    bits.append(f"<small><span alpha='60%'><tt>{esc(r['doc'])}</tt></span></small>")
+                if r["new"]:
+                    bits.append("<span foreground='#ffcc33'><b>NEW</b></span>")
+                l.set_markup("  ".join(bits))
+                cb.set_child(l)
+                cb.set_active(r["on"])
+                cb.connect("toggled", lambda cb, r=r: (r.__setitem__("on", cb.get_active()), update()))
+                twice = Gtk.GestureClick()
+                twice.connect("pressed", lambda _g, n, _x, _y, si=si, d=r["doc"], s=shown:
+                              n == 2 and start_edit(si, d, s))
+                cb.add_controller(twice)
+                pen = Gtk.Button(label="✏", tooltip_text="Rename")
+                pen.add_css_class("flat")
+                pen.connect("clicked", lambda _b, si=si, d=r["doc"], s=shown: start_edit(si, d, s))
+                line.append(cb)
+                line.append(pen)
+            else:
+                l = Gtk.Label(xalign=0)
+                l.set_markup(f"<s>{esc(shown)}</s>  <span foreground='#ff6666'>MISSING or unreadable</span>")
+                line.append(l)
+            target.append(line)
+
+    def render():
+        st = states[cur["i"]]
+        names = ", ".join(f"<b>{esc(s['name'])}</b>" for s in st["secs"])
+        if setup:
+            head.set_markup(f"<big><b>Change the saved presets</b></big> for {names}\n"
+                            "Tick what each should contain, then press <b>Save presets</b>. Nothing is loaded.")
+        else:
+            whatnow = "earlier chats" if st["chats"] else "research"
+            head.set_markup(f"<big><b>{esc(host)} wants to load {whatnow}</b></big> for {names}\n"
+                            "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
+                            f"{esc('Claude' if host == 'Claude Code' else host)} until then; "
+                            "<b>Cancel</b> loads nothing."
+                            + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
+        search.set_placeholder_text("Filter: words from the name, the first prompt or the folder"
+                                    if st["chats"] else "Filter: words from the name or the id")
+        clear(chips)
+        if st["timed"]:
+            group = None
+            for chip in CHIPS:
+                b = Gtk.ToggleButton(label=f"{CHIP_LABELS[chip]} ({chip_count(st, chip, now)})")
+                if group is not None:
+                    b.set_group(group)
+                group = group or b
+                b.set_active(st["chip"] == chip)
+                b.connect("toggled", lambda b, c=chip: b.get_active() and set_tab(chip=c))
+                chips.append(b)
+            chips.append(Gtk.Label(label="   Group by:"))
+            tb = Gtk.ToggleButton(label="time")
+            fb = Gtk.ToggleButton(label="folder", group=tb)
+            (tb if st["by_time"] else fb).set_active(True)
+            tb.connect("toggled", lambda b: b.get_active() and set_tab(by_time=True))
+            fb.connect("toggled", lambda b: b.get_active() and set_tab(by_time=False))
+            chips.append(tb)
+            chips.append(fb)
+        clear(body)
+        narrowed = bool(st["filter"]) or st["chip"] != "all"
+        for si, sec in enumerate(st["secs"]):
+            top = Gtk.Box(spacing=6)
+            top.set_margin_top(12)
+            ed = cur["edit"]
+            if ed and ed[:3] == (cur["i"], si, ""):
+                top.append(edit_entry(si, "", ed[3], "empty = its own name again"))
+            else:
+                lbl = Gtk.Label(xalign=0)
+                small = f"  <small><span alpha='60%'><tt>{esc(sec['name'])}</tt></span></small>" if sec["title"] else ""
+                lbl.set_markup(f"<big><b>{esc(sec['title'] or sec['name'])}</b></big>{small}")
+                top.append(lbl)
+                if not st["chats"]:
+                    pen = Gtk.Button(label="✏", tooltip_text="Give this set a display name")
+                    pen.add_css_class("flat")
+                    pen.connect("clicked", lambda _b, si=si, t=sec["title"]: start_edit(si, "", t))
+                    top.append(pen)
+            body.append(top)
+            sub = Gtk.Label(xalign=0, wrap=True)
+            sub.set_markup(f"<small>{esc(sec['sub'])}</small>")
+            body.append(sub)
+            row = Gtk.Box(spacing=6)
+
+            def pick(sec, on):
+                for r in sec["main"] + sec["other"]:
+                    short = not st["chats"]
+                    if visible(st, r, short) or visible(st, r, False):
+                        r["on"] = on and r["readable"]
+                later(render)
+
+            def back(sec):
+                for r in sec["main"] + sec["other"]:
+                    r["on"] = r["doc"] in sec["saved"]
+                later(render)
+            for text, fn in (("Select shown" if narrowed else "Select all", lambda _b, s=sec: pick(s, True)),
+                             ("Unselect shown" if narrowed else "Select none", lambda _b, s=sec: pick(s, False)),
+                             ("Back to saved preset", lambda _b, s=sec: back(s))):
+                b = Gtk.Button(label=text)
+                b.connect("clicked", fn)
+                if text == "Back to saved preset":
+                    b.set_sensitive(not sec["first"])
+                row.append(b)
+            body.append(row)
+            add_rows(body, st, si, sec["main"], 12)
+            if sec["other"]:
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                if st["chats"]:
+                    label = ("Your chats: tick the ones to load" if not sec["main"] else
+                             f"Add other chats ({len(sec['other'])} more)")
+                else:
+                    label = ("Your library: tick the research to use" if not sec["main"] else
+                             f"Add other research from your library ({len(sec['other'])} more)")
+                ex = Gtk.Expander(label=label)
+                ex.set_margin_start(12)
+                ex.set_margin_top(6)
+                ex.set_expanded(sec["other_open"] or bool(st["filter"]))
+                ex.connect("notify::expanded", lambda ex, _p, s=sec: s.__setitem__("other_open", ex.get_expanded())
+                           if not st["filter"] else None)
+                ex.set_child(inner)
+                body.append(ex)
+                add_rows(inner, st, si, sec["other"], 0)
+            rem = Gtk.Box(spacing=6)
+            rem.set_margin_start(12)
+            rem.set_margin_top(6)
+            rb = Gtk.CheckButton(label="Remember this choice as the preset" if st["chats"]
+                                 else f"Remember this choice as the preset for {sec['name']}")
+            rb.set_active(sec["remember"])
+            rb.set_sensitive(not setup)
+            rb.connect("toggled", lambda b, s=sec: (s.__setitem__("remember", b.get_active()), later(render)))
+            rem.append(rb)
+            if st["chats"] and (sec["remember"] or setup):
+                rem.append(Gtk.Label(label="named"))
+                e = Gtk.Entry(text=sec["save_as"], width_chars=16,
+                              tooltip_text="Renaming moves the saved ticks to the new name")
+                e.connect("changed", lambda e, s=sec: (s.__setitem__("save_as", e.get_text()), update()))
+                rem.append(e)
+            body.append(rem)
+        update()
+
+    def set_tab(**kw):
+        states[cur["i"]].update(kw)
+        later(render)
+
+    def switch(i):
+        cur["i"], cur["edit"] = i, None
+        search.set_text(states[i]["filter"])
+        later(render)
 
     def finish(value):
         result["value"] = value
@@ -719,34 +1019,36 @@ def popup(sections, texts, setup, command="", look=None):
         loop.quit()
 
     def done(*_):
-        finish({n: ({d for d, cb in lst if cb.get_active()}, remember[n].get_active())
-                for n, lst in boxes.items()})
+        finish([{"picks": [{"name": s["name"], "ticked": {r["doc"] for r in s["main"] + s["other"] if r["on"]},
+                            "remember": s["remember"], "save_as": s["save_as"].strip(),
+                            "title": s["title"].strip() if s["title"].strip() != s["title0"] else None}
+                           for s in st["secs"]],
+                 "renames": dict(st["renames"]), "chip": st["chip"], "by_time": st["by_time"]}
+                for st in states])
 
     def refilter(*_):
-        q = search.get_text().strip().lower()
-        shown_heads = set()
-        for find, cb, h in rows:
-            hit = not q or q in find
-            cb.set_visible(hit)
-            if hit and h is not None:
-                shown_heads.add(id(h))
-        for _, _, h in rows:
-            if h is not None:
-                h.set_visible(not q or id(h) in shown_heads)
-        if q:
-            for ex in expanders:
-                ex.set_expanded(True)
+        states[cur["i"]]["filter"] = search.get_text().strip().lower()
+        render()
+
+    def key(_c, kv, _kc, _s):
+        if kv != 0xff1b:  # Escape: undoes a rename in progress, otherwise it is Cancel
+            return False
+        if cur["edit"] is not None:
+            cur["edit"] = None
+            later(render)
+        else:
+            finish(None)
+        return True
 
     search.connect("search-changed", refilter)
     cancel.connect("clicked", lambda *_: finish(None))
     ok.connect("clicked", done)
     win.connect("close-request", lambda *_: (finish(None), False)[1])
     keys = Gtk.EventControllerKey()
-    keys.connect("key-pressed", lambda _c, kv, _kc, _s:
-                 (finish(None), True)[1] if kv == 0xff1b else False)  # Escape
+    keys.connect("key-pressed", key)
     win.add_controller(keys)
     GLib.timeout_add_seconds(POPUP_TIMEOUT, lambda: (finish("timeout"), False)[1])
-    update()
+    render()
     win.present()
     loop.run()
     return result["value"]
@@ -1545,10 +1847,7 @@ def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
     try:
         if args.rename:
             sid = find_session(reg, args.rename[0])
-            name = clean_name(args.rename[1])
-            if not name:
-                raise ConfigError("the new name is empty")
-            reg["sessions"][sid].update(name=name, name_source="manual")
+            set_name(reg, sid, args.rename[1])  # an empty name gives it its automatic name back
             save_registry(reg_path, reg)
             print(f"RENAMED {session_label(sid, reg['sessions'][sid])}")
             return 0
@@ -1665,64 +1964,114 @@ def chat_sections(names, catalog, presets, setup):
     return out
 
 
-def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
-    """--context [PRESET ...]: pick earlier chats (all folders) in the popup and write each as a
-    .txt to load as context. Presets are saved like custom sets, in their own file."""
+def reset_name(reg, sid):
+    """Give a chat its automatic name back (its title or first prompt, as a rescan would)."""
+    rec = reg["sessions"].get(sid)
+    if rec is None:
+        return
+    rec["name_source"] = "auto"
+    register(reg, sid, rec.get("file") or "", rec.get("mtime") or 0, rec.get("project") or "",
+             read_transcript(rec.get("file") or ""), rec.get("source"))
+
+
+def set_name(reg, sid, name):
+    """Name a chat (an empty name gives it its automatic name back)."""
+    name = clean_name(name)
+    if not name:
+        reset_name(reg, sid)
+    elif sid in reg["sessions"]:
+        reg["sessions"][sid].update(name=name, name_source="manual")
+
+
+def save_presets(presets, picks, catalog, setup):
+    """Put the remembered picks into the presets (a new name moves the ticks: the old name goes).
+    Returns True when something changed."""
+    saved = False
+    for p in picks:
+        if not (p["remember"] or setup):
+            continue
+        to = p["save_as"] or p["name"]
+        if to != p["name"] and presets.pop(p["name"], None) is not None:
+            print(f"RENAMED context preset {p['name']} to {to}")
+        presets[to] = {"selected": [d for d in catalog if d in p["ticked"]], "known": list(catalog)}
+        print(f"SAVED context preset {to}: {len(p['ticked'])} of {len(catalog)} chats")
+        saved = True
+    return saved
+
+
+def context_prep(args, cfg, paths, names, secondary=False):
+    """Find the chats for --context [PRESET ...] (or, as the second tab, the preset `default`).
+    Returns a dict, or an int exit code (the message is printed, unless secondary)."""
+    say = (lambda m: None) if secondary else print
     settings = sessions_settings(cfg)
     if settings is None:
-        print("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to load earlier "
-              "chats; nothing done")
+        say("SESSIONS OFF: add `[sessions]` with `enabled = true` to the config to load earlier "
+            "chats; nothing done")
         return 7
-    presets = load_conf(presets_path)
-    if args.list:
+    presets = load_conf(paths["presets"])
+    if args.list and not secondary:
         if not presets:
             print("no context presets saved yet")
         for n, rec in presets.items():
             print(f"{n:20} {len(set(rec.get('selected', []))):>4} chats")
         return 0
-    names = list(dict.fromkeys(n.strip().lower() for n in args.sets)) or [DEFAULT_PRESET]
+    names = list(dict.fromkeys(n.strip().lower() for n in names)) or [DEFAULT_PRESET]
     bad = [n for n in names if not PRESET_RE.fullmatch(n)]
     if bad:
-        print(f"bad preset name(s): {', '.join(bad)} (use lowercase letters, digits, . _ -)")
+        say(f"bad preset name(s): {', '.join(bad)} (use lowercase letters, digits, . _ -)")
         return 2
 
     me = os.environ.get("CLAUDE_CODE_SESSION_ID", "").lower()  # never offer the chat running this
-    reg = load_registry(reg_path)
-    scan_sessions(reg, settings, idle=0, skip=me, reg_path=reg_path, in_opencode="OPENCODE" in os.environ)
+    reg = load_registry(paths["reg"])
+    scan_sessions(reg, settings, idle=0, skip=me, reg_path=paths["reg"], in_opencode="OPENCODE" in os.environ)
     try:
-        save_registry(reg_path, reg)
+        save_registry(paths["reg"], reg)
     except OSError as e:
-        print(f"could not save the session registry to {reg_path}: {e}")
+        say(f"could not save the session registry to {paths['reg']}: {e}")
     catalog = chat_catalog(reg, me)
     if not catalog:
         if settings["opencode"]:
-            print(f"NO CHATS: no earlier Claude Code ({settings['projects_dir']}) or opencode chats; "
-                  "nothing loaded")
+            say(f"NO CHATS: no earlier Claude Code ({settings['projects_dir']}) or opencode chats; "
+                "nothing loaded")
         else:
-            print(f"NO CHATS: no earlier Claude Code chats in {settings['projects_dir']}; nothing loaded")
+            say(f"NO CHATS: no earlier Claude Code chats in {settings['projects_dir']}; nothing loaded")
         return 0
-    recs = reg["sessions"]
     secs = chat_sections(names, catalog, presets, args.setup)
+    if secondary:
+        for s in secs:
+            s["remember"] = False  # a second tab never saves a preset unless the user asks
+    return {"presets": presets, "names": names, "reg": reg, "catalog": catalog, "secs": secs,
+            "secondary": secondary}
 
-    picks = None
-    if not (args.no_popup or os.environ.get("RESEARCHER_NO_POPUP")):
-        texts = dict.fromkeys(catalog, "")  # every chat is readable; sizes come from the registry
-        look = {"chats": True, "sizes": {sid: int(recs[sid].get("chars") or 0) for sid in catalog}, "labels": {sid: shown_name(recs[sid]) for sid in catalog},
-                "groups": {sid: chat_folder(recs[sid]) for sid in catalog},
-                "notes": {sid: last_of(recs[sid])[:10] for sid in catalog}}
-        try:
-            picks = popup(secs, texts, args.setup, "researcher --context " + " ".join(names), look)
-        except RuntimeError as e:
-            print(f"NO POPUP ({e}): using the saved presets")
-        else:
-            if picks is None:
-                print("CANCELLED: the user closed the popup, nothing loaded")
-                return 3
-            if picks == "timeout":
-                print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded")
-                return 4
+
+def context_tab(c, ui_path):
+    """The popup tab of the chats."""
+    recs, catalog = c["reg"]["sessions"], c["catalog"]
+    chip, by_time = ui_state(ui_path, True)
+    times = {}
+    for sid in catalog:
+        w = parse_iso(last_of(recs[sid]))
+        if w is None and isinstance(recs[sid].get("mtime"), (int, float)):
+            w = int(recs[sid]["mtime"])
+        if w is not None:
+            times[sid] = w
+    look = {"chats": True, "chip": chip, "by_time": by_time, "taken": set(c["presets"]), "times": times,
+            "labels": {sid: shown_name(recs[sid]) for sid in catalog},
+            "defaults": {sid: recs[sid]["first"] for sid in catalog if recs[sid].get("first")},
+            "groups": {sid: chat_folder(recs[sid]) for sid in catalog},
+            "notes": {sid: last_of(recs[sid])[:10] for sid in catalog}}
+    return {"sections": c["secs"], "sizes": {sid: int(recs[sid].get("chars") or 0) for sid in catalog},
+            "look": look}
+
+
+def context_finish(c, args, cfg, cfg_path, paths, out_dir, picks):
+    """Save and load what was picked (picks None: no popup, the saved presets). Returns the exit
+    code."""
+    presets, names, reg, catalog, secs = c["presets"], c["names"], c["reg"], c["catalog"], c["secs"]
     unsaved = [n for n in names if n not in presets]
     if picks is None and unsaved:
+        if c["secondary"]:
+            return 0
         print(f"NO POPUP: context preset {', '.join(unsaved)} has no saved choice yet; nothing loaded")
         return 5
     gone = []
@@ -1730,22 +2079,36 @@ def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
         have = set(catalog)
         gone = list(dict.fromkeys(d for n in names for d in presets[n].get("selected", [])
                                   if d not in have))
-        picks = {s["name"]: (s["ticked"], False) for s in secs}
-
-    for n, (ticked, keep) in picks.items():
-        if keep or args.setup:
-            presets[n] = {"selected": [d for d in catalog if d in ticked], "known": list(catalog)}
-            print(f"SAVED context preset {n}: {len(ticked)} of {len(catalog)} chats")
-    if any(keep or args.setup for _, keep in picks.values()):
+        chosen_picks = [{"name": s["name"], "ticked": s["ticked"], "remember": False,
+                         "save_as": s["name"], "title": None} for s in secs]
+    else:
         try:
-            save_conf(presets_path, presets)
+            save_ui(paths["ui"], True, picks["chip"], picks["by_time"])
         except OSError as e:
-            print(f"could not save the presets to {presets_path}: {e}")
+            print(f"could not save the window settings to {paths['ui']}: {e}")
+        for sid, name in picks["renames"].items():
+            set_name(reg, sid, name)
+            print(f'RENAMED "{shown_name(reg["sessions"][sid])}" ({sid})')
+        if picks["renames"]:
+            try:
+                save_registry(paths["reg"], reg)
+            except OSError as e:
+                print(f"could not save the session registry to {paths['reg']}: {e}")
+        chosen_picks = picks["picks"]
+    if c["secondary"] and not any(p["ticked"] for p in chosen_picks):
+        return 0  # the other tab, left alone
+
+    if save_presets(presets, chosen_picks, catalog, args.setup):
+        try:
+            save_conf(paths["presets"], presets)
+        except OSError as e:
+            print(f"could not save the presets to {paths['presets']}: {e}")
     if args.setup:
         print("setup only: nothing loaded")
         return 0
 
-    chosen = {d for t, _ in picks.values() for d in t}
+    recs = reg["sessions"]
+    chosen = {d for p in chosen_picks for d in p["ticked"]}
     sids = [d for d in catalog if d in chosen]
     docs = [f"sessions/{sid}" for sid in sids]
     texts = {f"sessions/{sid}": session_text(sid, recs[sid]) for sid in sids}
@@ -1773,6 +2136,7 @@ def context_main(args, cfg, cfg_path, reg_path, presets_path, out_dir):
     return 0
 
 
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None):
@@ -1792,6 +2156,8 @@ def main(argv=None):
     ap.add_argument("--context", action="store_true",
                     help="pick earlier Claude Code chats (all folders) to load as context; "
                          "SET names are presets")
+    ap.add_argument("--start", choices=("chats", "research"),
+                    help="the tab the window opens on (default: chats with --context, research otherwise)")
     ap.add_argument("--limit", type=int, default=30, help="sessions shown by --sessions (default 30)")
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
@@ -1857,16 +2223,6 @@ def main(argv=None):
         lib = args.init or os.path.expanduser("~/research")
         return init_config(cfg_path, lib)
 
-    if args.context:
-        try:
-            cfg = load_config(cfg_path)
-        except ConfigError as e:
-            print(f"CONFIG ERROR: {e}")
-            return 6
-        conf_dir = os.path.dirname(cfg_path)
-        return context_main(args, cfg, cfg_path, os.path.join(conf_dir, "sessions.json"),
-                            os.path.join(conf_dir, "contexts.json"), args.out or cache_home())
-
     if args.sessions or args.rename or args.resume or args.session_load:
         try:
             cfg = load_config(cfg_path)
@@ -1877,27 +2233,38 @@ def main(argv=None):
                              os.path.join(os.path.dirname(cfg_path), "sessions.json"),
                              args.out or cache_home())
 
+    return load_both(args, cfg_path, state_path)
+
+
+def research_prep(args, cfg_path, state_path, secondary=False):
+    """Find the research for `researcher SET ...` (or, as the second tab, the config's
+    default_set). Returns a dict, or an int exit code (the message is printed, unless
+    secondary)."""
+    say = (lambda m: None) if secondary else print
     try:
         cfg = load_config(cfg_path)
         library = library_path(cfg, args.library)
         if not library:
-            print(f"NO LIBRARY: set `library` in {cfg_path} (or run --init, or set "
-                  "RESEARCHER_LIBRARY); nothing loaded")
+            say(f"NO LIBRARY: set `library` in {cfg_path} (or run --init, or set "
+                "RESEARCHER_LIBRARY); nothing loaded")
             return 6
         if not os.path.isdir(library):
-            print(f"NO LIBRARY: {library} is not a folder; nothing loaded")
+            say(f"NO LIBRARY: {library} is not a folder; nothing loaded")
             return 6
         paths = scan(library, cfg.get("exclude", []))
         conf = load_conf(state_path)
-        names = resolve_names(args.sets, cfg)
+        # the set names on the command line belong to the tab the command is for
+        names = resolve_names([] if secondary else args.sets, cfg)
         sets, kinds = build_sets(cfg, list(paths), conf, names)
     except ConfigError as e:
-        print(f"CONFIG ERROR: {e}")
+        say(f"CONFIG ERROR: {e}")
         return 6
 
-    store = os.path.abspath(os.path.expanduser(args.out or cfg.get("text_dir") or text_home()))
+    # the second tab keeps its text copy where it always is; --out is for the first tab
+    store = os.path.abspath(os.path.expanduser((None if secondary else args.out) or cfg.get("text_dir")
+                                               or text_home()))
 
-    if args.sync:
+    if args.sync and not secondary:
         texts = Texts(paths, store)
         ok = [d for d in paths if d in texts]
         texts.flush()
@@ -1909,7 +2276,7 @@ def main(argv=None):
               f"(~{chars // CHARS_PER_K}k tokens)")
         return 0
 
-    if args.list:
+    if args.list and not secondary:
         print(f"library: {library} ({len(paths)} documents)")
         for n, docs in sets.items():
             if n == "all" or kinds[n] != "custom" or n in conf:
@@ -1921,13 +2288,12 @@ def main(argv=None):
         return 0
 
     if not names:
-        print("NO SET: name a set, or set `default_set` in the config; "
-              "known: " + ", ".join(sets))
+        say("NO SET: name a set, or set `default_set` in the config; known: " + ", ".join(sets))
         return 2
     bad = [n for n in names if n not in sets]
     if bad:
-        print(f"unknown set(s): {', '.join(bad)} (names use lowercase letters, digits, . _ -); "
-              f"known: {', '.join(sets)}")
+        say(f"unknown set(s): {', '.join(bad)} (names use lowercase letters, digits, . _ -); "
+            f"known: {', '.join(sets)}")
         return 2
 
     alldocs = list(dict.fromkeys(d for n in names for d in sets[n]))
@@ -1939,43 +2305,74 @@ def main(argv=None):
             missing.append(f"MISSING  {d} (not in {library})")
         elif d not in texts:
             missing.append(f"UNREADABLE  {paths[d]} ({texts.errors[d]})")
-    secs = sections_for(names, sets, kinds, conf, texts, args.setup)
+    secs = sections_for(names, sets, kinds, conf, texts, args.setup and not secondary)
+    if secondary:
+        for s in secs:
+            s["remember"] = False  # a second tab never saves a preset unless the user asks
+            if s["first"]:
+                s["ticked"] = set()  # nor loads a whole set nobody chose yet
+    return {"cfg": cfg, "paths": paths, "conf": conf, "names": names, "sets": sets, "kinds": kinds,
+            "texts": texts, "alldocs": alldocs, "missing": missing, "secs": secs, "secondary": secondary}
 
-    picks = None
-    if not (args.no_popup or os.environ.get("RESEARCHER_NO_POPUP")):
-        try:
-            picks = popup(secs, texts, args.setup, "researcher " + " ".join(names))
-        except RuntimeError as e:
-            print(f"NO POPUP ({e}): using the saved defaults")
-        else:
-            if picks is None:
-                print("CANCELLED: the user closed the popup, nothing loaded")
-                return 3
-            if picks == "timeout":
-                print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, "
-                      "nothing loaded")
-                return 4
-    new_custom = [n for n in names if kinds[n] == "custom" and n not in conf]
-    if picks is None and new_custom:
-        print(f"NO POPUP: {', '.join(new_custom)} has no saved choice yet; nothing loaded")
+
+def research_tab(r, names_path, ui_path):
+    """The popup tab of the research."""
+    chip, by_time = ui_state(ui_path, False)
+    texts, sizes, times = r["texts"], {}, {}
+    for s in r["secs"]:
+        for d in s["main"] + s["other"]:
+            if d in texts:
+                sizes[d] = len(texts[d])
+            try:
+                times[d] = int(os.stat(r["paths"][d]).st_mtime)
+            except (KeyError, OSError):
+                pass
+    texts.flush()
+    look = {"chip": chip, "by_time": by_time, "times": times,
+            "labels": state_names(names_path, "docs"), "titles": state_names(names_path, "sets")}
+    return {"sections": r["secs"], "sizes": sizes, "look": look}
+
+
+def research_finish(r, args, cfg_path, state_path, names_path, ui_path, picks):
+    """Save and load what was picked (picks None: no popup, the saved defaults). Returns the exit
+    code."""
+    cfg, paths, conf, names, sets, kinds = r["cfg"], r["paths"], r["conf"], r["names"], r["sets"], r["kinds"]
+    texts, alldocs, secs, secondary = r["texts"], r["alldocs"], r["secs"], r["secondary"]
+    setup = args.setup and not secondary
+    unsaved = [n for n in names if (secondary or kinds[n] == "custom") and n not in conf]
+    if picks is None and unsaved:
+        if secondary:
+            return 0  # no popup: the second tab loads only a choice saved earlier
+        print(f"NO POPUP: {', '.join(unsaved)} has no saved choice yet; nothing loaded")
         return 5
     if picks is None:  # --no-popup or no display: saved defaults, nothing saved
-        picks = {s["name"]: (s["ticked"], False) for s in secs}
+        chosen_picks = {s["name"]: (s["ticked"], False) for s in secs}
+    else:
+        try:
+            save_ui(ui_path, False, picks["chip"], picks["by_time"])
+            state_rename(names_path, "docs", picks["renames"])
+            state_rename(names_path, "sets", {p["name"]: p["title"] for p in picks["picks"]
+                                              if p["title"] is not None})
+        except OSError as e:
+            print(f"could not save the names or window settings next to {names_path}: {e}")
+        chosen_picks = {p["name"]: (p["ticked"], p["remember"]) for p in picks["picks"]}
+    if secondary and not any(t for t, _ in chosen_picks.values()):
+        return 0  # the other tab, left alone
 
     order = {s["name"]: s["main"] + s["other"] for s in secs}
-    for n, (ticked, keep) in picks.items():
-        if keep or args.setup:
+    for n, (ticked, keep) in chosen_picks.items():
+        if keep or setup:
             conf[n] = {"selected": [d for d in order[n] if d in ticked], "known": list(sets[n])}
             if kinds[n] == "custom":
                 conf[n]["custom"] = True
             print(f"SAVED default for {n}: {len(ticked)} of {len(sets[n])} docs")
-    if any(keep or args.setup for _, keep in picks.values()):
+    if any(keep or setup for _, keep in chosen_picks.values()):
         save_conf(state_path, conf)
-    if args.setup:
+    if setup:
         print("setup only: nothing loaded")
         return 0
 
-    chosen = {d for t, _ in picks.values() for d in t}
+    chosen = {d for t, _ in chosen_picks.values() for d in t}
     docs = [d for d in dict.fromkeys(alldocs + [d for s in secs for d in s["main"] + s["other"]])
             if d in chosen and d in texts]
     written = [texts.path(d) for d in docs]
@@ -1986,11 +2383,14 @@ def main(argv=None):
             share_note = finish_usage(cfg, cfg_path, usage_record(docs, texts, paths))
         except OSError:
             pass
+    shown = state_names(names_path, "docs")
     total = 0
     for d, dst in zip(docs, written):
         total += len(texts[d])
+        if d in shown:
+            print(f'DOC "{shown[d]}" ({d})')
         print(f"{len(texts[d]):>7} chars  {dst}")
-    for line in missing:
+    for line in r["missing"]:
         print(line)
     skipped = [d for d in alldocs if d in texts and d not in chosen]
     if len(skipped) > SKIPPED_NAMED:  # a custom set or `all`: naming it all costs tokens
@@ -2001,6 +2401,78 @@ def main(argv=None):
     if share_note:
         print(share_note)
     return 0
+
+
+def load_both(args, cfg_path, state_path):
+    """A load: research (`researcher SET ...`) or chats (`--context PRESET ...`) in one window with
+    a tab for each; the other tab shows the default set or the preset `default`. The tab the
+    window opens on prints first."""
+    conf_dir = os.path.dirname(cfg_path)
+    names_path, ui_path = os.path.join(conf_dir, "names.json"), os.path.join(conf_dir, "ui.json")
+    cpaths = {"reg": os.path.join(conf_dir, "sessions.json"), "presets": os.path.join(conf_dir, "contexts.json"),
+              "ui": ui_path}
+    no_popup = args.no_popup or bool(os.environ.get("RESEARCHER_NO_POPUP"))
+    chats_first = args.context if args.start is None else args.start == "chats"
+    alone = args.setup or args.list or args.sync  # these work on one side only
+    chat_out = (args.out or cache_home()) if args.context else cache_home()
+    research = chats = None
+    if args.context:
+        try:
+            cfg = load_config(cfg_path)
+        except ConfigError as e:
+            print(f"CONFIG ERROR: {e}")
+            return 6
+        chats = context_prep(args, cfg, cpaths, args.sets)
+        if isinstance(chats, int):
+            return chats
+        if not alone:
+            research = research_prep(args, cfg_path, state_path, secondary=True)
+            research = None if isinstance(research, int) else research
+    else:
+        research = research_prep(args, cfg_path, state_path)
+        if isinstance(research, int):
+            return research
+        cfg = research["cfg"]
+        if not alone:
+            chats = context_prep(args, cfg, cpaths, [], secondary=True)
+            chats = None if isinstance(chats, int) else chats
+
+    r_pick = c_pick = None
+    if not no_popup:
+        tabs = ([context_tab(chats, ui_path)] if chats else []) + \
+               ([research_tab(research, names_path, ui_path)] if research else [])
+        start = 0 if chats_first or research is None else len(tabs) - 1
+        if args.context:
+            command = "researcher --context " + " ".join(args.sets)
+        else:
+            command = "researcher " + " ".join(research["names"])
+        try:
+            picked = popup(tabs, start, args.setup, command.rstrip())
+        except RuntimeError as e:
+            print(f"NO POPUP ({e}): " + ("using the saved presets" if args.context else "using the saved defaults"))
+        else:
+            if picked is None:
+                print("CANCELLED: the user closed the popup, nothing loaded")
+                return 3
+            if picked == "timeout":
+                print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded")
+                return 4
+            picked = list(picked)
+            c_pick = picked.pop(0) if chats else None
+            r_pick = picked.pop(0) if research else None
+
+    def run_research():
+        return research_finish(research, args, cfg_path, state_path, names_path, ui_path, r_pick) if research else 0
+
+    def run_chats():
+        return context_finish(chats, args, cfg, cfg_path, cpaths, chat_out, c_pick) if chats else 0
+    if chats_first:
+        chats_code, research_code = run_chats(), run_research()
+    else:
+        research_code, chats_code = run_research(), run_chats()
+    # the command's own side decides the exit code; the other side only adds to it
+    own, other = (chats_code, research_code) if args.context else (research_code, chats_code)
+    return own or other
 
 
 if __name__ == "__main__":

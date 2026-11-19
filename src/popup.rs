@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 //! The chooser window, in egui (eframe): pure Rust, the same code on Linux, Windows and macOS.
+//! One window, up to two tabs (Chats | Research), each with its own ticks, filter, time chips and
+//! names; one Load button loads what is ticked in both.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32, RichText};
 
+use crate::bands::{self, Chip};
 use crate::library::{Section, SetKind};
 use crate::usage::CHARS_PER_K;
 use crate::util;
@@ -15,10 +19,29 @@ use crate::util;
 /// Seconds for the whole load; the skill runs the program with a 600 s Bash timeout.
 pub const POPUP_TIMEOUT: u64 = 540;
 
-/// What the user did.
+/// What the user picked in one section.
+pub struct Pick {
+    pub name: String,
+    pub ticked: BTreeSet<String>,
+    pub remember: bool,
+    /// The preset name to save under (chats; differs from `name` when renamed).
+    pub save_as: String,
+    /// A new display name for the section (research sets); Some("") = back to its own name.
+    pub title: Option<String>,
+}
+
+/// What the user did in one tab.
+pub struct TabPick {
+    pub picks: Vec<Pick>,
+    /// Row id → new name ("" = back to the automatic name).
+    pub renames: BTreeMap<String, String>,
+    pub chip: Chip,
+    pub by_time: bool,
+}
+
+/// What the user did: one TabPick per tab, in the order the tabs were given.
 pub enum Outcome {
-    /// Set name → (ticked documents, remember as preset), in section order.
-    Picked(Vec<(String, BTreeSet<String>, bool)>),
+    Picked(Vec<TabPick>),
     Cancelled,
     Timeout,
 }
@@ -26,34 +49,90 @@ pub enum Outcome {
 /// Size (characters of the squeezed text) of each readable document; absent = unreadable.
 pub type Sizes = BTreeMap<String, usize>;
 
-/// How the rows read. The default shows research documents by their id; `--context` shows
-/// earlier chats by their first prompt, grouped by project folder.
-#[derive(Default)]
+/// How the rows of a tab read. The default shows research documents by their id; the chats tab
+/// shows earlier chats by their first prompt, under their project folder.
 pub struct Look {
     /// Shown instead of the id.
     pub labels: BTreeMap<String, String>,
+    /// Shown again when a row's name is cleared (default: from its id).
+    pub defaults: BTreeMap<String, String>,
     /// Small text after the size (for chats: the last-active day).
     pub notes: BTreeMap<String, String>,
     /// Heading each row sits under, instead of the folder part of its id.
     pub groups: BTreeMap<String, String>,
-    /// Chats instead of research documents (wording only).
+    /// Seconds since the epoch: last active (chats) or last changed (documents).
+    pub times: BTreeMap<String, i64>,
+    /// Shown instead of a section's name (research sets).
+    pub titles: BTreeMap<String, String>,
+    /// Preset names in use (a preset cannot be renamed onto one).
+    pub taken: BTreeSet<String>,
+    /// Chats instead of research documents.
     pub chats: bool,
+    pub chip: Chip,
+    pub by_time: bool,
+}
+
+impl Default for Look {
+    fn default() -> Look {
+        Look {
+            labels: BTreeMap::new(),
+            defaults: BTreeMap::new(),
+            notes: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            times: BTreeMap::new(),
+            titles: BTreeMap::new(),
+            taken: BTreeSet::new(),
+            chats: false,
+            chip: Chip::All,
+            by_time: false,
+        }
+    }
+}
+
+/// One tab of the window.
+pub struct Tab {
+    pub sections: Vec<Section>,
+    pub sizes: Sizes,
+    pub look: Look,
+}
+
+/// A preset name: lowercase letters, digits, `.`, `_`, `-`.
+pub fn valid_preset(n: &str) -> bool {
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^[a-z0-9][a-z0-9._-]*$").expect("valid"));
+    RE.is_match(n)
 }
 
 struct Row {
     doc: String,
-    shown: String,
+    label: Option<String>,
+    default: Option<String>,
     note: String,
-    /// Lower-case label and heading, for the filter box.
-    find: String,
-    heading: Option<String>,
+    folder: String,
+    when: Option<i64>,
     on: bool,
     readable: bool,
     new: bool,
 }
 
+impl Row {
+    /// The name shown: a rename made in this window, else the saved label, else from the id
+    /// (`short`: only its last part, when it sits under its folder heading).
+    fn shown(&self, renames: &BTreeMap<String, String>, short: bool) -> String {
+        let from_id = || if short { self.doc.rsplit('/').next().unwrap_or(&self.doc) } else { &self.doc }.to_string();
+        match renames.get(&self.doc).map(String::as_str) {
+            Some("") => self.default.clone().unwrap_or_else(from_id),
+            Some(n) => n.to_string(),
+            None => self.label.clone().unwrap_or_else(from_id),
+        }
+    }
+}
+
 struct SectionState {
     name: String,
+    /// Display name (research sets); empty = the name.
+    title: String,
+    /// The preset name to save under (chats).
+    save_as: String,
     sub: String,
     main: Vec<Row>,
     other: Vec<Row>,
@@ -65,56 +144,77 @@ struct SectionState {
 }
 
 impl SectionState {
+    fn rows(&self) -> impl Iterator<Item = &Row> {
+        self.main.iter().chain(&self.other)
+    }
+
     fn rows_mut(&mut self) -> impl Iterator<Item = &mut Row> {
         self.main.iter_mut().chain(self.other.iter_mut())
     }
 }
 
-fn folder(d: &str) -> &str {
-    d.rsplit_once('/').map_or("", |(f, _)| f)
+struct TabState {
+    chats: bool,
+    sections: Vec<SectionState>,
+    sizes: Sizes,
+    filter: String,
+    chip: Chip,
+    by_time: bool,
+    /// Some row has a time: the chips show.
+    timed: bool,
+    renames: BTreeMap<String, String>,
+    titles0: BTreeMap<String, String>,
+    taken: BTreeSet<String>,
 }
 
-/// Rows for `docs`, with a folder heading wherever the folder changes (only when more than one
-/// folder shows).
-fn rows(docs: &[String], sec: &Section, sizes: &Sizes, look: &Look) -> Vec<Row> {
-    let group = |d: &str| -> String {
-        look.groups.get(d).cloned().unwrap_or_else(|| {
-            let f = folder(d);
-            if f.is_empty() { "(top level)".to_string() } else { format!("{f}/") }
-        })
-    };
-    let folders: HashSet<String> = docs.iter().map(|d| group(d)).collect();
-    let grouped = folders.len() > 1 || !look.groups.is_empty();
-    let mut last: Option<String> = None;
-    docs.iter()
-        .map(|d| {
-            let f = group(d);
-            let heading = (grouped && last.as_ref() != Some(&f)).then(|| {
-                last = Some(f.clone());
-                f.clone()
-            });
-            let readable = sizes.contains_key(d);
-            let shown = match look.labels.get(d) {
-                Some(l) => l.clone(),
-                None if grouped => d.rsplit('/').next().unwrap_or(d).to_string(),
-                None => d.clone(),
-            };
-            Row {
-                doc: d.clone(),
-                find: format!("{shown} {f} {d}").to_lowercase(),
-                note: look.notes.get(d).cloned().unwrap_or_default(),
-                shown,
-                heading,
-                on: readable && sec.ticked.contains(d),
-                readable,
-                new: sec.new.contains(d),
+impl TabState {
+    fn chosen(&self) -> BTreeSet<String> {
+        self.sections.iter().flat_map(SectionState::rows).filter(|r| r.on).map(|r| r.doc.clone()).collect()
+    }
+
+    fn in_chip(&self, r: &Row, now: &DateTime<Local>) -> bool {
+        self.chip == Chip::All || r.when.is_some_and(|w| self.chip.holds(now, &bands::local(w)))
+    }
+
+    /// Ticked rows the chip hides (they are still loaded).
+    fn hidden(&self, now: &DateTime<Local>) -> usize {
+        let rows: BTreeMap<&String, &Row> =
+            self.sections.iter().flat_map(SectionState::rows).filter(|r| r.on).map(|r| (&r.doc, r)).collect();
+        rows.values().filter(|r| !self.in_chip(r, now)).count()
+    }
+
+    /// Rows inside each chip (each id once).
+    fn chip_count(&self, chip: Chip, now: &DateTime<Local>) -> usize {
+        let docs: BTreeMap<&String, Option<i64>> =
+            self.sections.iter().flat_map(SectionState::rows).map(|r| (&r.doc, r.when)).collect();
+        docs.values().filter(|w| chip == Chip::All || w.is_some_and(|w| chip.holds(now, &bands::local(w)))).count()
+    }
+
+    /// A chat preset name that cannot be saved, with the reason.
+    fn bad_name(&self) -> Option<String> {
+        if !self.chats {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        for s in self.sections.iter().filter(|s| s.remember) {
+            let n = s.save_as.trim();
+            if !valid_preset(n) {
+                return Some(format!("\"{n}\" cannot be a preset name: use lowercase letters, digits, . _ -"));
             }
-        })
-        .collect()
+            if (n != s.name && self.taken.contains(n)) || !seen.insert(n.to_string()) {
+                return Some(format!("a preset named \"{n}\" exists already: pick another name"));
+            }
+        }
+        None
+    }
+
+    fn noun(&self) -> &'static str {
+        if self.chats { "chats" } else { "documents" }
+    }
 }
 
-fn subtitle(sec: &Section, look: &Look) -> String {
-    if look.chats {
+fn subtitle(sec: &Section, chats: bool) -> String {
+    if chats {
         let kept = sec.ticked.len();
         return if sec.first {
             "new preset: nothing saved yet. Tick the chats this one needs; tick Remember to keep them as its preset."
@@ -141,14 +241,153 @@ fn subtitle(sec: &Section, look: &Look) -> String {
     }
 }
 
-struct App {
-    sections: Vec<SectionState>,
-    sizes: Sizes,
+fn folder(d: &str) -> &str {
+    d.rsplit_once('/').map_or("", |(f, _)| f)
+}
+
+fn rows(docs: &[String], sec: &Section, sizes: &Sizes, look: &Look) -> Vec<Row> {
+    docs.iter()
+        .map(|d| {
+            let readable = sizes.contains_key(d);
+            Row {
+                doc: d.clone(),
+                label: look.labels.get(d).cloned(),
+                default: look.defaults.get(d).cloned(),
+                note: look.notes.get(d).cloned().unwrap_or_default(),
+                folder: look.groups.get(d).cloned().unwrap_or_else(|| {
+                    let f = folder(d);
+                    if f.is_empty() { "(top level)".to_string() } else { format!("{f}/") }
+                }),
+                when: look.times.get(d).copied(),
+                on: readable && sec.ticked.contains(d),
+                readable,
+                new: sec.new.contains(d),
+            }
+        })
+        .collect()
+}
+
+/// A rename in progress: the tab, the section, the row id ("" = the section's own name).
+struct Edit {
+    tab: usize,
+    sec: usize,
+    doc: String,
+    buf: String,
+    focus: bool,
+}
+
+/// What a frame's drawing of the rows asks for.
+#[derive(Default)]
+struct Asked {
+    start: Option<(String, String)>,
+    commit: Option<(String, String)>,
+}
+
+/// Everything a list of rows is drawn with.
+struct View<'a> {
+    filter: &'a str,
+    chip: Chip,
+    by_time: bool,
     chats: bool,
-    filter: String,
+    now: &'a DateTime<Local>,
+    renames: &'a BTreeMap<String, String>,
+    sizes: &'a Sizes,
+    editing: Option<&'a mut Edit>,
+}
+
+impl View<'_> {
+    fn visible(&self, r: &Row, short: bool) -> bool {
+        let chip_ok = self.chip == Chip::All || r.when.is_some_and(|w| self.chip.holds(self.now, &bands::local(w)));
+        if !chip_ok {
+            return false;
+        }
+        if self.filter.is_empty() {
+            return true;
+        }
+        format!("{} {} {}", r.shown(self.renames, short), r.folder, r.doc).to_lowercase().contains(self.filter)
+    }
+}
+
+fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> Asked {
+    let mut asked = Asked::default();
+    let folders: HashSet<&str> = rows.iter().map(|r| r.folder.as_str()).collect();
+    let folder_heads = !v.by_time && (v.chats || folders.len() > 1);
+    let short = folder_heads && !v.chats;
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    if v.by_time {
+        order.sort_by_key(|&i| std::cmp::Reverse(rows[i].when.unwrap_or(i64::MIN))); // stable
+    }
+    let mut last: Option<String> = None;
+    let pad = if folder_heads || v.by_time { indent + 12.0 } else { indent };
+    for i in order {
+        let r = &mut rows[i];
+        if !v.visible(r, short) {
+            continue;
+        }
+        let head = if v.by_time {
+            Some(r.when.map_or("Unknown time", |w| bands::band(v.now, &bands::local(w)).label()).to_string())
+        } else if folder_heads {
+            Some(r.folder.clone())
+        } else {
+            None
+        };
+        if head.is_some() && head != last {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.label(RichText::new(head.as_deref().unwrap_or("")).small().strong());
+            });
+            last = head;
+        }
+        let shown = r.shown(v.renames, short);
+        ui.horizontal(|ui| {
+            ui.add_space(pad);
+            if let Some(e) = v.editing.as_deref_mut().filter(|e| e.doc == r.doc) {
+                let hint = if v.chats { "empty = the first prompt again" } else { "empty = the file name again" };
+                let resp = ui.add(egui::TextEdit::singleline(&mut e.buf).hint_text(hint).desired_width(360.0));
+                if e.focus {
+                    resp.request_focus();
+                    e.focus = false;
+                }
+                if resp.lost_focus() {
+                    asked.commit = Some((r.doc.clone(), util::py_strip(&e.buf).to_string()));
+                }
+                ui.label(RichText::new("Enter keeps it, Esc undoes").small().weak());
+            } else if r.readable {
+                let cb = ui.checkbox(&mut r.on, &shown);
+                let pen = ui.small_button("✏").on_hover_text("Rename");
+                if cb.double_clicked() || pen.clicked() {
+                    asked.start = Some((r.doc.clone(), shown.clone()));
+                }
+                let k = v.sizes.get(&r.doc).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64;
+                ui.label(RichText::new(format!("~{k:.0}k")).small());
+                if !r.note.is_empty() {
+                    ui.label(RichText::new(&r.note).small().weak());
+                }
+                if v.by_time && v.chats {
+                    ui.label(RichText::new(&r.folder).small().weak()); // the folder heading moves onto the row
+                }
+                if !v.chats && shown != r.doc && !shown.is_empty() && r.doc.rsplit('/').next() != Some(shown.as_str()) {
+                    ui.label(RichText::new(&r.doc).small().weak().monospace()); // the real id under a display name
+                }
+                if r.new {
+                    ui.label(RichText::new("NEW").strong().color(Color32::from_rgb(0xff, 0xcc, 0x33)));
+                }
+            } else {
+                ui.add_enabled(false, egui::Checkbox::new(&mut r.on, RichText::new(&shown).strikethrough()));
+                ui.label(RichText::new("MISSING or unreadable").color(Color32::from_rgb(0xff, 0x66, 0x66)));
+            }
+        });
+    }
+    asked
+}
+
+struct App {
+    tabs: Vec<TabState>,
+    active: usize,
     setup: bool,
-    names: String,
     command: String,
+    edit: Option<Edit>,
     until: Instant,
     shot: Option<Shot>,
     result: Arc<Mutex<Option<Outcome>>>,
@@ -156,19 +395,6 @@ struct App {
 }
 
 impl App {
-    fn k(&self, d: &str) -> f64 {
-        self.sizes.get(d).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64
-    }
-
-    fn chosen(&self) -> BTreeSet<String> {
-        self.sections
-            .iter()
-            .flat_map(|s| s.main.iter().chain(&s.other))
-            .filter(|r| r.on)
-            .map(|r| r.doc.clone())
-            .collect()
-    }
-
     fn finish(&mut self, ctx: &egui::Context, value: Outcome) {
         let mut slot = self.result.lock().expect("not poisoned");
         if slot.is_none() {
@@ -180,52 +406,64 @@ impl App {
     }
 
     fn done(&mut self, ctx: &egui::Context) {
-        let picks = self
-            .sections
+        let tabs = self
+            .tabs
             .iter()
-            .map(|s| {
-                let ticked = s.main.iter().chain(&s.other).filter(|r| r.on).map(|r| r.doc.clone()).collect();
-                (s.name.clone(), ticked, s.remember)
+            .map(|t| TabPick {
+                picks: t
+                    .sections
+                    .iter()
+                    .map(|s| {
+                        let title0 = t.titles0.get(&s.name).cloned().unwrap_or_default();
+                        Pick {
+                            name: s.name.clone(),
+                            ticked: s.rows().filter(|r| r.on).map(|r| r.doc.clone()).collect(),
+                            remember: s.remember,
+                            save_as: s.save_as.trim().to_string(),
+                            title: (s.title.trim() != title0).then(|| s.title.trim().to_string()),
+                        }
+                    })
+                    .collect(),
+                renames: t.renames.clone(),
+                chip: t.chip,
+                by_time: t.by_time,
             })
             .collect();
-        self.finish(ctx, Outcome::Picked(picks));
+        self.finish(ctx, Outcome::Picked(tabs));
     }
 
-    fn doc_rows(ui: &mut egui::Ui, rows: &mut [Row], sizes: &Sizes, indent: f32, grouped_indent: f32, filter: &str) {
-        let mut heading: Option<&String> = None;
-        for r in rows {
-            if r.heading.is_some() {
-                heading = r.heading.as_ref();
+    /// The Load button's text and the summary line.
+    fn totals(&self, now: &DateTime<Local>) -> (String, String, usize) {
+        let mut parts = Vec::new();
+        let mut short = Vec::new();
+        let (mut k, mut n, mut hidden) = (0.0, 0, 0);
+        for t in &self.tabs {
+            let c = t.chosen();
+            k += c.iter().map(|d| t.sizes.get(d).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64).sum::<f64>();
+            n += c.len();
+            hidden += t.hidden(now);
+            if !c.is_empty() || self.tabs.len() == 1 {
+                parts.push(format!("{} {}", c.len(), t.noun()));
+                short.push(format!("{} {}", c.len(), if t.chats { "chats" } else { "docs" }));
             }
-            if !filter.is_empty() && !r.find.contains(filter) {
-                continue;
-            }
-            // with a filter on, a heading shows above the first row of its group that matches
-            if let Some(h) = heading.take() {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(indent);
-                    ui.label(RichText::new(h).small().strong());
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(if grouped_indent > indent { grouped_indent } else { indent });
-                if r.readable {
-                    let k = sizes.get(&r.doc).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64;
-                    ui.checkbox(&mut r.on, &r.shown);
-                    ui.label(RichText::new(format!("~{k:.0}k")).small());
-                    if !r.note.is_empty() {
-                        ui.label(RichText::new(&r.note).small().weak());
-                    }
-                    if r.new {
-                        ui.label(RichText::new("NEW").strong().color(Color32::from_rgb(0xff, 0xcc, 0x33)));
-                    }
-                } else {
-                    ui.add_enabled(false, egui::Checkbox::new(&mut r.on, RichText::new(&r.shown).strikethrough()));
-                    ui.label(RichText::new("MISSING or unreadable").color(Color32::from_rgb(0xff, 0x66, 0x66)));
-                }
-            });
         }
+        let k = k + 0.0; // an empty f64 sum is -0.0
+        let what = if parts.is_empty() { "nothing ticked".to_string() } else { parts.join(" + ") };
+        let tail = if self.setup { "" } else { " will be loaded" };
+        let mut line = format!("{what}, ~{k:.0}k tokens{tail}");
+        if hidden > 0 {
+            line.push_str(&format!(" ({hidden} ticked but hidden by the time chip)"));
+        }
+        let button = if self.setup {
+            "Save presets".to_string()
+        } else if self.tabs.len() == 1 {
+            format!("Load {}", parts.join(""))
+        } else if short.is_empty() {
+            "Load".to_string()
+        } else {
+            format!("Load {}", short.join(" + "))
+        };
+        (button, line, n)
     }
 }
 
@@ -246,30 +484,49 @@ impl eframe::App for App {
         if self.closing {
             return;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Esc undoes a rename in progress; otherwise it is Cancel
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.edit.take().is_none() {
             self.finish(&ctx, Outcome::Cancelled);
             return;
         }
-        let chosen = self.chosen();
-        let can_ok = self.setup || !chosen.is_empty();
+        let now = Local::now();
+        let (button, line, n) = self.totals(&now);
+        let bad = self.tabs.iter().find_map(TabState::bad_name);
+        let can_ok = (self.setup || n > 0) && bad.is_none() && self.edit.is_none();
         if can_ok && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && ctx.memory(|m| m.focused().is_none()) {
             self.done(&ctx);
             return;
         }
         let margin = egui::Frame::central_panel(ui.style()).inner_margin(14.0);
+        let host = host_name();
 
         egui::Panel::top("head").frame(margin).show(ui, |ui| {
+            if self.tabs.len() > 1 {
+                ui.horizontal(|ui| {
+                    for (i, t) in self.tabs.iter().enumerate() {
+                        let c = t.chosen().len();
+                        let name = if t.chats { "Chats" } else { "Research" };
+                        let text = RichText::new(format!("{name} ({c} ticked)")).heading();
+                        if ui.selectable_label(self.active == i, text).clicked() {
+                            self.active = i;
+                            self.edit = None;
+                        }
+                    }
+                });
+                ui.separator();
+            }
+            let tab = &mut self.tabs[self.active];
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let host = host_name();
-                let title = match (self.setup, self.chats) {
+                let title = match (self.setup, tab.chats) {
                     (true, _) => "Change the saved presets".to_string(),
                     (false, true) => format!("{host} wants to load earlier chats"),
                     (false, false) => format!("{host} wants to load research"),
                 };
+                let names = tab.sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
                 ui.label(RichText::new(&title).heading().strong());
                 ui.label(RichText::new(" for ").heading());
-                ui.label(RichText::new(&self.names).heading().strong());
+                ui.label(RichText::new(names).heading().strong());
             });
             ui.label(if self.setup {
                 "Tick what each should contain, then press Save presets. Nothing is loaded.".to_string()
@@ -284,19 +541,37 @@ impl eframe::App for App {
                 ui.label(RichText::new(format!("Asked by: {}", self.command)).small().monospace());
             }
             ui.add_space(4.0);
+            if tab.timed {
+                ui.horizontal(|ui| {
+                    for chip in Chip::EVERY {
+                        let text = format!("{} ({})", chip.label(), tab.chip_count(chip, &now));
+                        if ui.selectable_label(tab.chip == chip, text).clicked() {
+                            tab.chip = chip;
+                        }
+                    }
+                    ui.add_space(16.0);
+                    ui.label("Group by:");
+                    if ui.selectable_label(tab.by_time, "time").clicked() {
+                        tab.by_time = true;
+                    }
+                    if ui.selectable_label(!tab.by_time, "folder").clicked() {
+                        tab.by_time = false;
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Filter:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text(if self.chats {
-                            "words from the first prompt or the folder"
+                    egui::TextEdit::singleline(&mut tab.filter)
+                        .hint_text(if tab.chats {
+                            "words from the name, the first prompt or the folder"
                         } else {
-                            "words from the name"
+                            "words from the name or the id"
                         })
                         .desired_width(ui.available_width() - 70.0),
                 );
-                if !self.filter.is_empty() && ui.button("Clear").clicked() {
-                    self.filter.clear();
+                if !tab.filter.is_empty() && ui.button("Clear").clicked() {
+                    tab.filter.clear();
                 }
             });
         });
@@ -304,15 +579,13 @@ impl eframe::App for App {
         let mut ok_clicked = false;
         let mut cancel_clicked = false;
         egui::Panel::bottom("bar").frame(margin).show(ui, |ui| {
-            let k = chosen.iter().map(|d| self.k(d)).fold(0.0, |a, b| a + b); // an empty f64 sum is -0.0
-            let tail = if self.setup { "" } else { " will be loaded" };
-            let noun = if self.chats { "chats" } else { "documents" };
-            ui.label(RichText::new(format!("{} {noun}, ~{k:.0}k tokens{tail}", chosen.len())).strong());
+            ui.label(RichText::new(&line).strong());
+            if let Some(b) = &bad {
+                ui.label(RichText::new(b).color(Color32::from_rgb(0xff, 0x66, 0x66)));
+            }
             ui.add_space(6.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label =
-                    if self.setup { "Save presets".to_string() } else { format!("Load {} {noun}", chosen.len()) };
-                let ok = egui::Button::new(RichText::new(label).strong()).fill(if can_ok {
+                let ok = egui::Button::new(RichText::new(&button).strong()).fill(if can_ok {
                     ui.visuals().selection.bg_fill
                 } else {
                     ui.visuals().widgets.inactive.weak_bg_fill
@@ -323,68 +596,129 @@ impl eframe::App for App {
             });
         });
 
+        let active = self.active;
+        let setup = self.setup;
+        let mut start: Option<(usize, String, String)> = None;
+        let mut commit: Option<(usize, String, String)> = None;
         egui::CentralPanel::default().frame(margin).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let sizes = self.sizes.clone();
-                let setup = self.setup;
-                let filter = self.filter.trim().to_lowercase();
-                for sec in &mut self.sections {
+                let tab = &mut self.tabs[active];
+                let filter = tab.filter.trim().to_lowercase();
+                let (chip, by_time, chats) = (tab.chip, tab.by_time, tab.chats);
+                let narrowed = !filter.is_empty() || chip != Chip::All;
+                for (si, sec) in tab.sections.iter_mut().enumerate() {
+                    let mut editing = self.edit.as_mut().filter(|e| e.tab == active && e.sec == si);
                     ui.add_space(12.0);
-                    ui.label(RichText::new(&sec.name).heading().strong());
-                    ui.label(RichText::new(&sec.sub).small());
-                    ui.horizontal(|ui| {
-                        // with a filter on, the buttons act on the rows that show
-                        let hit = |r: &Row| filter.is_empty() || r.find.contains(&filter);
-                        if ui.button(if filter.is_empty() { "Select all" } else { "Select shown" }).clicked() {
-                            sec.rows_mut().filter(|r| hit(r)).for_each(|r| r.on = r.readable);
+                    ui.horizontal(|ui| match editing.as_deref_mut().filter(|e| e.doc.is_empty()) {
+                        Some(e) => {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut e.buf)
+                                    .hint_text("empty = its own name again")
+                                    .desired_width(300.0),
+                            );
+                            if e.focus {
+                                resp.request_focus();
+                                e.focus = false;
+                            }
+                            if resp.lost_focus() {
+                                sec.title = util::py_strip(&e.buf).to_string();
+                                commit = Some((si, String::new(), String::new()));
+                            }
                         }
-                        if ui.button(if filter.is_empty() { "Select none" } else { "Unselect shown" }).clicked() {
-                            sec.rows_mut().filter(|r| hit(r)).for_each(|r| r.on = false);
+                        None => {
+                            let shown = if sec.title.is_empty() { &sec.name } else { &sec.title };
+                            ui.label(RichText::new(shown).heading().strong());
+                            if !sec.title.is_empty() {
+                                ui.label(RichText::new(&sec.name).small().weak().monospace());
+                            }
+                            if !chats && ui.small_button("✏").on_hover_text("Give this set a display name").clicked()
+                            {
+                                start = Some((si, String::new(), sec.title.clone()));
+                            }
+                        }
+                    });
+                    ui.label(RichText::new(&sec.sub).small());
+                    let in_view = |r: &Row| {
+                        let chip_ok = chip == Chip::All || r.when.is_some_and(|w| chip.holds(&now, &bands::local(w)));
+                        chip_ok
+                            && (filter.is_empty()
+                                || format!("{} {} {}", r.shown(&tab.renames, false), r.folder, r.doc)
+                                    .to_lowercase()
+                                    .contains(&filter))
+                    };
+                    ui.horizontal(|ui| {
+                        // with a filter or a chip on, the buttons act on the rows that show
+                        if ui.button(if narrowed { "Select shown" } else { "Select all" }).clicked() {
+                            sec.rows_mut().filter(|r| in_view(r)).for_each(|r| r.on = r.readable);
+                        }
+                        if ui.button(if narrowed { "Unselect shown" } else { "Select none" }).clicked() {
+                            sec.rows_mut().filter(|r| in_view(r)).for_each(|r| r.on = false);
                         }
                         if ui.add_enabled(!sec.first, egui::Button::new("Back to saved preset")).clicked() {
                             let saved = sec.saved.clone();
                             sec.rows_mut().for_each(|r| r.on = saved.contains(&r.doc));
                         }
                     });
-                    let grouped = sec.main.iter().any(|r| r.heading.is_some());
-                    App::doc_rows(ui, &mut sec.main, &sizes, 12.0, if grouped { 24.0 } else { 12.0 }, &filter);
+                    let mut view = View {
+                        filter: &filter,
+                        chip,
+                        by_time,
+                        chats,
+                        now: &now,
+                        renames: &tab.renames,
+                        sizes: &tab.sizes,
+                        editing: editing.filter(|e| !e.doc.is_empty()),
+                    };
+                    let mut asks = vec![draw_rows(ui, &mut sec.main, &mut view, 12.0)];
                     if !sec.other.is_empty() {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
-                            let id = ui.make_persistent_id(("other", &sec.name));
+                            let id = ui.make_persistent_id(("other", chats, &sec.name));
                             egui::CollapsingHeader::new(&sec.other_label)
                                 .id_salt(id)
                                 .default_open(sec.other_open)
                                 .open((!filter.is_empty()).then_some(true))
-                                .show(ui, |ui| {
-                                    let grouped = sec.other.iter().any(|r| r.heading.is_some());
-                                    App::doc_rows(
-                                        ui,
-                                        &mut sec.other,
-                                        &sizes,
-                                        0.0,
-                                        if grouped { 12.0 } else { 0.0 },
-                                        &filter,
-                                    );
-                                });
+                                .show(ui, |ui| asks.push(draw_rows(ui, &mut sec.other, &mut view, 0.0)));
                         });
+                    }
+                    for a in asks {
+                        if let Some((doc, shown)) = a.start {
+                            start = Some((si, doc, shown));
+                        }
+                        if let Some((doc, name)) = a.commit {
+                            commit = Some((si, doc, name));
+                        }
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        ui.add_enabled(
-                            !setup,
-                            egui::Checkbox::new(
-                                &mut sec.remember,
-                                format!("Remember this choice as the preset for {}", sec.name),
-                            ),
-                        );
+                        let what = if chats {
+                            "Remember this choice as the preset"
+                        } else {
+                            "Remember this choice as the preset for"
+                        };
+                        let label = if chats { what.to_string() } else { format!("{what} {}", sec.name) };
+                        ui.add_enabled(!setup, egui::Checkbox::new(&mut sec.remember, label));
+                        if chats && (sec.remember || setup) {
+                            ui.label("named");
+                            ui.add(egui::TextEdit::singleline(&mut sec.save_as).desired_width(160.0))
+                                .on_hover_text("Renaming moves the saved ticks to the new name");
+                        }
                     });
                 }
             });
         });
 
+        if let Some((si, doc, buf)) = start {
+            self.edit = Some(Edit { tab: active, sec: si, doc, buf, focus: true });
+        }
+        if let Some((_, doc, name)) = commit {
+            if !doc.is_empty() {
+                self.tabs[active].renames.insert(doc, name);
+            }
+            self.edit = None;
+        }
         if cancel_clicked {
             self.finish(&ctx, Outcome::Cancelled);
         } else if ok_clicked {
@@ -405,18 +739,20 @@ fn have_display() -> Result<(), String> {
     Ok(())
 }
 
-/// Show the chooser and wait for the user. Err when no window can be shown.
-pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str, look: &Look) -> Result<Outcome, String> {
-    have_display()?;
-    let states = sections
+fn tab_state(t: &Tab) -> TabState {
+    let look = &t.look;
+    let sections = t
+        .sections
         .iter()
         .map(|sec| {
             let other_open = sec.main.is_empty();
             SectionState {
                 name: sec.name.clone(),
-                sub: subtitle(sec, look),
-                main: rows(&sec.main, sec, &sizes, look),
-                other: rows(&sec.other, sec, &sizes, look),
+                title: look.titles.get(&sec.name).cloned().unwrap_or_default(),
+                save_as: sec.name.clone(),
+                sub: subtitle(sec, look.chats),
+                main: rows(&sec.main, sec, &t.sizes, look),
+                other: rows(&sec.other, sec, &t.sizes, look),
                 other_label: match (other_open, look.chats) {
                     (true, true) => "Your chats: tick the ones to load".into(),
                     (true, false) => "Your library: tick the research to use".into(),
@@ -430,27 +766,136 @@ pub fn popup(sections: &[Section], sizes: Sizes, setup: bool, command: &str, loo
             }
         })
         .collect();
-    let names = sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+    TabState {
+        chats: look.chats,
+        sections,
+        sizes: t.sizes.clone(),
+        filter: String::new(),
+        chip: look.chip,
+        by_time: look.by_time,
+        timed: !look.times.is_empty(),
+        renames: BTreeMap::new(),
+        titles0: look.titles.clone(),
+        taken: look.taken.clone(),
+    }
+}
+
+/// Show the chooser on tab `start` and wait for the user. Err when no window can be shown.
+pub fn popup(tabs: &[Tab], start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
+    have_display()?;
     let result = Arc::new(Mutex::new(None));
     let app = App {
-        sections: states,
-        sizes,
-        chats: look.chats,
-        filter: String::new(),
+        tabs: tabs.iter().map(tab_state).collect(),
+        active: start.min(tabs.len().saturating_sub(1)),
         setup,
-        names,
         command: command.to_string(),
+        edit: None,
         until: Instant::now() + remaining(),
         shot: Shot::from_env(),
         result: Arc::clone(&result),
         closing: false,
     };
-    let what = if look.chats { "choose chats to load" } else { "choose research to load" };
+    let what = match (tabs.len(), tabs.first().is_some_and(|t| t.look.chats)) {
+        (1, true) => "choose chats to load",
+        (1, false) => "choose research to load",
+        _ => "choose chats and research to load",
+    };
     let title = format!("The Researcher - {}", if setup { "change saved presets" } else { what });
-    let size = if app.shot.is_some() { [720.0, 560.0] } else { [720.0, 780.0] };
+    let size = if app.shot.is_some() { [720.0, 560.0] } else { [760.0, 800.0] };
     run(&title, size, Box::new(app))?;
     let out = result.lock().expect("not poisoned").take();
     Ok(out.unwrap_or(Outcome::Cancelled))
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    fn tab(docs: &[(&str, Option<i64>, bool)], chip: Chip) -> TabState {
+        let row = |(d, w, on): &(&str, Option<i64>, bool)| Row {
+            doc: d.to_string(),
+            label: None,
+            default: None,
+            note: String::new(),
+            folder: String::new(),
+            when: *w,
+            on: *on,
+            readable: true,
+            new: false,
+        };
+        TabState {
+            chats: true,
+            sections: vec![SectionState {
+                name: "a".into(),
+                title: String::new(),
+                save_as: "a".into(),
+                sub: String::new(),
+                main: docs.iter().map(row).collect(),
+                other: Vec::new(),
+                other_label: String::new(),
+                other_open: false,
+                saved: BTreeSet::new(),
+                first: false,
+                remember: false,
+            }],
+            sizes: Sizes::new(),
+            filter: String::new(),
+            chip,
+            by_time: true,
+            timed: true,
+            renames: BTreeMap::new(),
+            titles0: BTreeMap::new(),
+            taken: ["b".to_string()].into(),
+        }
+    }
+
+    #[test]
+    fn ticks_survive_a_chip_switch_and_hidden_ones_are_counted() {
+        let now = Local::now();
+        let old = now.timestamp() - 40 * 86400;
+        let mut t =
+            tab(&[("new", Some(now.timestamp()), true), ("old", Some(old), true), ("none", None, false)], Chip::Week);
+        assert_eq!(t.chosen().len(), 2);
+        assert_eq!(t.hidden(&now), 1);
+        assert_eq!(t.chip_count(Chip::Week, &now), 1);
+        assert_eq!(t.chip_count(Chip::All, &now), 3);
+        t.chip = Chip::All;
+        assert_eq!((t.chosen().len(), t.hidden(&now)), (2, 0));
+    }
+
+    #[test]
+    fn preset_names_are_checked_before_saving() {
+        let mut t = tab(&[], Chip::All);
+        assert_eq!(t.bad_name(), None); // Remember off: nothing is saved
+        t.sections[0].remember = true;
+        assert_eq!(t.bad_name(), None);
+        t.sections[0].save_as = "Bad Name".into();
+        assert!(t.bad_name().unwrap().contains("cannot be a preset name"));
+        t.sections[0].save_as = "b".into();
+        assert!(t.bad_name().unwrap().contains("exists already"));
+    }
+
+    #[test]
+    fn a_cleared_name_falls_back() {
+        let mut renames = BTreeMap::new();
+        let r = Row {
+            doc: "rust/linux".into(),
+            label: Some("Saved".into()),
+            default: None,
+            note: String::new(),
+            folder: "rust/".into(),
+            when: None,
+            on: false,
+            readable: true,
+            new: false,
+        };
+        assert_eq!(r.shown(&renames, true), "Saved");
+        renames.insert("rust/linux".to_string(), "New".to_string());
+        assert_eq!(r.shown(&renames, true), "New");
+        renames.insert("rust/linux".to_string(), String::new());
+        assert_eq!(r.shown(&renames, true), "linux");
+        assert_eq!(r.shown(&renames, false), "rust/linux");
+    }
 }
 
 // ---------------------------------------------------------------- shared window plumbing
