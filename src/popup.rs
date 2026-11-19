@@ -420,7 +420,7 @@ fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> 
                 ui.label(RichText::new("Enter keeps it, Esc undoes").small().weak());
             } else if r.readable {
                 let cb = ui.checkbox(&mut r.on, &shown);
-                let pen = ui.small_button("✏").on_hover_text("Rename");
+                let pen = ui.small_button("rename").on_hover_text("Rename (or double-click the name)");
                 if cb.double_clicked() || pen.clicked() {
                     asked.start = Some((r.doc.clone(), shown.clone()));
                 }
@@ -721,7 +721,8 @@ impl eframe::App for App {
                             if !sec.title.is_empty() {
                                 ui.label(RichText::new(&sec.name).small().weak().monospace());
                             }
-                            if !chats && ui.small_button("✏").on_hover_text("Give this set a display name").clicked()
+                            if !chats
+                                && ui.small_button("rename").on_hover_text("Give this set a display name").clicked()
                             {
                                 start = Some((si, String::new(), sec.title.clone()));
                             }
@@ -872,15 +873,8 @@ fn tab_state(t: &Tab) -> TabState {
     }
 }
 
-/// Show the chooser on tab `start` and wait for the user. Err when no window can be shown.
-pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
-    have_display()?;
-    let result = Arc::new(Mutex::new(None));
-    let what = match (tabs.len(), &tabs.first()) {
-        (1, Some(TabSlot::Ready(t))) if t.look.chats => "choose chats to load",
-        (1, _) => "choose research to load",
-        _ => "choose chats and research to load",
-    };
+/// The window's state, before it runs (the start tab opened, so loaded if it waited).
+fn new_app(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str, result: Arc<Mutex<Option<Outcome>>>) -> App {
     let active = start.min(tabs.len().saturating_sub(1));
     let mut app = App {
         tabs: tabs.into_iter().map(Slot::new).collect(),
@@ -890,12 +884,25 @@ pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Re
         edit: None,
         until: Instant::now() + remaining(),
         shot: Shot::from_env(),
-        result: Arc::clone(&result),
+        result,
         closing: false,
     };
     if let Some(slot) = app.tabs.get_mut(active) {
         slot.open(); // --start on the other side: that tab is wanted, load it now
     }
+    app
+}
+
+/// Show the chooser on tab `start` and wait for the user. Err when no window can be shown.
+pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
+    have_display()?;
+    let result = Arc::new(Mutex::new(None));
+    let what = match (tabs.len(), &tabs.first()) {
+        (1, Some(TabSlot::Ready(t))) if t.look.chats => "choose chats to load",
+        (1, _) => "choose research to load",
+        _ => "choose chats and research to load",
+    };
+    let app = new_app(tabs, start, setup, command, Arc::clone(&result));
     let title = format!("The Researcher - {}", if setup { "change saved presets" } else { what });
     let size = if app.shot.is_some() { [720.0, 560.0] } else { [760.0, 800.0] };
     run(&title, size, Box::new(app))?;
@@ -994,6 +1001,74 @@ mod tab_tests {
         assert_eq!(slot.status(), "0 ticked");
         slot.open(); // a second click loads nothing again
         assert!(slot.loading.is_none());
+    }
+
+    fn section(name: &str, docs: &[&str], ticked: &[&str]) -> Section {
+        let docs: Vec<String> = docs.iter().map(|d| d.to_string()).collect();
+        Section {
+            name: name.into(),
+            kind: SetKind::Set,
+            main: docs.clone(),
+            docs,
+            other: Vec::new(),
+            new: BTreeSet::new(),
+            ticked: ticked.iter().map(|d| d.to_string()).collect(),
+            remember: false,
+            first: false,
+        }
+    }
+
+    /// The real window, driven headless by egui's test harness (nothing shows on screen): the
+    /// Chats tab is only listed until its button is clicked, then it waits for its loader.
+    #[test]
+    fn the_window_loads_the_other_tab_only_on_its_click() {
+        use egui_kittest::kittest::Queryable;
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let load: Loader = Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300)); // a slow scan
+            let mut look = Look { chats: true, by_time: false, ..Look::default() };
+            look.labels.insert("chat-1".into(), "Fix the popup crash".into());
+            look.groups.insert("chat-1".into(), "~/work".into());
+            Some(Tab {
+                sections: vec![section("default", &["chat-1"], &["chat-1"])],
+                sizes: [("chat-1".to_string(), 2400)].into(),
+                look,
+            })
+        });
+        let research = Tab {
+            sections: vec![section("rust", &["rust/linux"], &["rust/linux"])],
+            sizes: [("rust/linux".to_string(), 4800)].into(),
+            look: Look::default(),
+        };
+        let tabs = vec![TabSlot::Later { chats: true, load }, TabSlot::Ready(Box::new(research))];
+        let result = Arc::new(Mutex::new(None));
+        let app = new_app(tabs, 1, false, "researcher rust", Arc::clone(&result));
+        let mut h = egui_kittest::Harness::builder().with_size([760.0, 800.0]).build_eframe(|_| app);
+        h.run_steps(10);
+        // opened on Research: its row shows, the Chats tab waits and its loader has not run
+        assert!(h.query_by_label_contains("rust/linux").is_some());
+        assert!(h.query_by_label("Chats (click to load)").is_some());
+        assert!(h.query_by_label("Load 1 docs").is_some());
+        std::thread::sleep(Duration::from_millis(400));
+        h.run_steps(5);
+        assert!(!called.load(Ordering::SeqCst), "the chats loaded before the click");
+        // the click starts the load; the window keeps drawing and says it is loading
+        h.get_by_label("Chats (click to load)").click();
+        h.run_steps(3);
+        assert!(called.load(Ordering::SeqCst) || h.query_by_label("Chats (loading…)").is_some());
+        assert!(h.query_by_label_contains("Loading earlier chats").is_some(), "no loading message");
+        let t0 = Instant::now();
+        while h.query_by_label_contains("Fix the popup crash").is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the chats never showed");
+            std::thread::sleep(Duration::from_millis(20));
+            h.run_steps(1);
+        }
+        assert!(called.load(Ordering::SeqCst));
+        assert!(h.query_by_label("Chats (1 ticked)").is_some());
+        assert!(h.query_by_label("Load 1 chats + 1 docs").is_some());
+        assert!(result.lock().unwrap().is_none()); // nothing loaded or cancelled by the test
     }
 
     #[test]
