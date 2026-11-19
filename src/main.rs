@@ -24,6 +24,7 @@ mod util;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::process::{Command, ExitCode};
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use serde_json::{Value, json};
@@ -37,7 +38,7 @@ pub const APP: &str = "researcher";
 /// Up to this many left-out documents are named in the output; more are only counted.
 const SKIPPED_NAMED: usize = 20;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "researcher", version, about = "Load saved research documents into Claude Code.")]
 struct Args {
     #[arg(value_name = "SET")]
@@ -719,8 +720,10 @@ fn research_finish(
 }
 
 /// A load: research (`researcher SET ...`) or chats (`--context PRESET ...`) in one window with
-/// a tab for each; the other tab shows the default set or the preset `default`. The tab the
-/// window opens on prints first.
+/// a tab for each. The command's own side is ready when the window opens; the other tab (the
+/// preset `default`, or the config's default_set) is only listed, and loads when the user clicks
+/// it, so a load never waits for a scan nobody asked for. Without a window only the own side
+/// loads. The tab the window opens on prints first.
 fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
     let cfg_dir = util::dirname(cfg_path);
     let names_path = util::join(&cfg_dir, "names.json");
@@ -729,20 +732,24 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
     let presets_path = util::join(&cfg_dir, "contexts.json");
     let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
     let chats_first = args.start.as_deref().map_or(args.context, |s| s == "chats");
-    let alone = args.setup || args.list || args.sync; // these work on one side only
-    let chat_out = if args.context { args.out.clone().unwrap_or_else(cache_home) } else { cache_home() };
+    // --setup, --list and --sync work on one side; without a window there is no tab to click
+    let other_side = !(args.setup || args.list || args.sync || no_popup);
+    let own_out = if args.context { args.out.clone().unwrap_or_else(cache_home) } else { cache_home() };
     let none: Vec<String> = Vec::new();
-    let cargs = sessions::ContextArgs {
-        names: if args.context { &args.sets } else { &none },
+    let own_cargs = sessions::ContextArgs {
+        names: &args.sets,
         setup: args.setup,
         list: args.list,
         reg_path: &reg_path,
         presets_path: &presets_path,
-        out_dir: &chat_out,
+        out_dir: &own_out,
         cfg_path,
         ui_path: &ui_path,
     };
-    let (mut research, chats) = if args.context {
+    let other_cargs = sessions::ContextArgs { names: &none, setup: false, list: false, out_dir: &own_out, ..own_cargs };
+
+    // the command's own side, ready now
+    let (cfg, mut research, mut chats) = if args.context {
         let cfg = match library::load_config(cfg_path) {
             Ok(c) => c,
             Err(e) => {
@@ -750,39 +757,74 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
                 return 6;
             }
         };
-        let chats = match sessions::prep(&cfg, &cargs, false) {
-            Ok(c) => c,
+        match sessions::prep(&cfg, &own_cargs, false) {
+            Ok(c) => (cfg, None, Some(c)),
             Err(code) => return code,
-        };
-        let research = if alone { None } else { research_prep(args, cfg_path, state_path, true).ok() };
-        (research, Some((cfg, chats)))
+        }
     } else {
-        let research = match research_prep(args, cfg_path, state_path, false) {
-            Ok(r) => r,
+        match research_prep(args, cfg_path, state_path, false) {
+            Ok(r) => (r.cfg.clone(), Some(r), None),
             Err(code) => return code,
-        };
-        let chats = if alone { None } else { sessions::prep(&research.cfg, &cargs, true).ok() };
-        let cfg = research.cfg.clone();
-        (Some(research), chats.map(|c| (cfg, c)))
+        }
     };
 
+    // the other side: a loader that runs on the first click of its tab
+    let later_research: Arc<Mutex<Option<Research>>> = Arc::new(Mutex::new(None));
+    let later_chats: Arc<Mutex<Option<sessions::Chats>>> = Arc::new(Mutex::new(None));
     let mut r_pick: Option<TabPick> = None;
     let mut c_pick: Option<TabPick> = None;
+    let mut other_pick: Option<TabPick> = None;
     if !no_popup {
-        let mut tabs = Vec::new();
-        if let Some((_, c)) = &chats {
-            tabs.push(sessions::tab(c, &ui_path));
+        let mut tabs: Vec<popup::TabSlot> = Vec::new();
+        let other_chats = other_side && !args.context && sessions::settings(&cfg).is_some();
+        let other_research = other_side && args.context && !library::resolve_names(&[], &cfg).is_empty();
+        if let Some(c) = &chats {
+            tabs.push(popup::TabSlot::Ready(Box::new(sessions::tab(c, &ui_path))));
+        } else if other_chats {
+            let (got, cfg) = (Arc::clone(&later_chats), cfg.clone());
+            let (reg, pre, out, cp, ui) =
+                (reg_path.clone(), presets_path.clone(), own_out.clone(), cfg_path.to_string(), ui_path.clone());
+            let load = move || {
+                let none: Vec<String> = Vec::new();
+                let a = sessions::ContextArgs {
+                    names: &none,
+                    setup: false,
+                    list: false,
+                    reg_path: &reg,
+                    presets_path: &pre,
+                    out_dir: &out,
+                    cfg_path: &cp,
+                    ui_path: &ui,
+                };
+                let c = sessions::prep(&cfg, &a, true).ok()?;
+                let tab = sessions::tab(&c, &ui);
+                *got.lock().ok()? = Some(c);
+                Some(tab)
+            };
+            tabs.push(popup::TabSlot::Later { chats: true, load: Box::new(load) });
         }
         if let Some(r) = research.as_mut() {
-            tabs.push(research_tab(r, &names_path, &ui_path));
+            tabs.push(popup::TabSlot::Ready(Box::new(research_tab(r, &names_path, &ui_path))));
+        } else if other_research {
+            let got = Arc::clone(&later_research);
+            let (a, cp, sp, np, ui) =
+                (args.clone(), cfg_path.to_string(), state_path.to_string(), names_path.clone(), ui_path.clone());
+            let load = move || {
+                let mut r = research_prep(&a, &cp, &sp, true).ok()?;
+                let tab = research_tab(&mut r, &np, &ui);
+                *got.lock().ok()? = Some(r);
+                Some(tab)
+            };
+            tabs.push(popup::TabSlot::Later { chats: false, load: Box::new(load) });
         }
-        let start = if chats_first || research.is_none() { 0 } else { tabs.len() - 1 };
+        let start = if chats_first { 0 } else { tabs.len() - 1 };
         let command = if args.context {
             format!("researcher --context {}", args.sets.join(" "))
         } else {
             format!("researcher {}", research.as_ref().map_or(String::new(), |r| r.names.join(" ")))
         };
-        match popup::popup(&tabs, start, args.setup, command.trim_end()) {
+        let both = tabs.len() > 1;
+        match popup::popup(tabs, start, args.setup, command.trim_end()) {
             Err(e) if args.context => println!("NO POPUP ({e}): using the saved presets"),
             Err(e) => println!("NO POPUP ({e}): using the saved defaults"),
             Ok(Outcome::Cancelled) => {
@@ -794,30 +836,43 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
                 return 4;
             }
             Ok(Outcome::Picked(picked)) => {
+                // tabs went in as [chats, research]
                 let mut it = picked.into_iter();
-                if chats.is_some() {
-                    c_pick = it.next();
-                }
-                if research.is_some() {
-                    r_pick = it.next();
+                let first = it.next().flatten();
+                let second = if both { it.next().flatten() } else { None };
+                let (c, r) = if both || chats.is_some() { (first, second) } else { (None, first) };
+                if args.context {
+                    (c_pick, other_pick) = (c, r);
+                } else {
+                    (other_pick, r_pick) = (c, r);
                 }
             }
         }
     }
+    // the other tab counts only when it was opened (and so loaded)
+    let mut other_research = later_research.lock().ok().and_then(|mut g| g.take());
+    let mut other_chats = later_chats.lock().ok().and_then(|mut g| g.take());
 
-    let mut research_code = None;
-    if !chats_first {
-        research_code =
-            Some(research.take().map_or(0, |r| {
+    let mut codes = Vec::new(); // (own side?, exit code), in print order
+    for chats_turn in if chats_first { [true, false] } else { [false, true] } {
+        let own = chats_turn == args.context;
+        let code = match (chats_turn, own) {
+            (true, true) => chats.take().map_or(0, |c| sessions::finish(c, &cfg, &own_cargs, c_pick.take())),
+            (true, false) => {
+                other_chats.take().map_or(0, |c| sessions::finish(c, &cfg, &other_cargs, other_pick.take()))
+            }
+            (false, true) => research.take().map_or(0, |r| {
                 research_finish(r, r_pick.take(), args.setup, cfg_path, state_path, &names_path, &ui_path)
-            }));
+            }),
+            (false, false) => other_research.take().map_or(0, |r| {
+                research_finish(r, other_pick.take(), false, cfg_path, state_path, &names_path, &ui_path)
+            }),
+        };
+        codes.push((own, code));
     }
-    let chats_code = chats.map_or(0, |(cfg, c)| sessions::finish(c, &cfg, &cargs, c_pick));
-    let research_code = research_code.unwrap_or_else(|| {
-        research.map_or(0, |r| research_finish(r, r_pick, args.setup, cfg_path, state_path, &names_path, &ui_path))
-    });
     // the command's own side decides the exit code; the other side only adds to it
-    let (own, other) = if args.context { (chats_code, research_code) } else { (research_code, chats_code) };
+    let own = codes.iter().find(|(o, _)| *o).map_or(0, |(_, c)| *c);
+    let other = codes.iter().find(|(o, _)| !*o).map_or(0, |(_, c)| *c);
     if own != 0 { own } else { other }
 }
 

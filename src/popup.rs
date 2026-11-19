@@ -39,9 +39,10 @@ pub struct TabPick {
     pub by_time: bool,
 }
 
-/// What the user did: one TabPick per tab, in the order the tabs were given.
+/// What the user did: one TabPick per tab, in the order the tabs were given (None: a tab
+/// that was never opened, so never loaded).
 pub enum Outcome {
-    Picked(Vec<TabPick>),
+    Picked(Vec<Option<TabPick>>),
     Cancelled,
     Timeout,
 }
@@ -94,6 +95,70 @@ pub struct Tab {
     pub sections: Vec<Section>,
     pub sizes: Sizes,
     pub look: Look,
+}
+
+/// Makes a tab when it is first opened (it may take a while: chats are scanned then). None =
+/// nothing to show.
+pub type Loader = Box<dyn FnOnce() -> Option<Tab> + Send>;
+
+/// A tab ready to show, or one that loads only when the user clicks it.
+pub enum TabSlot {
+    Ready(Box<Tab>),
+    Later { chats: bool, load: Loader },
+}
+
+/// One tab of the window as it runs.
+struct Slot {
+    chats: bool,
+    state: Option<TabState>,
+    load: Option<Loader>,
+    loading: Option<std::sync::mpsc::Receiver<Option<Tab>>>,
+}
+
+impl Slot {
+    fn new(t: TabSlot) -> Slot {
+        match t {
+            TabSlot::Ready(tab) => {
+                Slot { chats: tab.look.chats, state: Some(tab_state(&tab)), load: None, loading: None }
+            }
+            TabSlot::Later { chats, load } => Slot { chats, state: None, load: Some(load), loading: None },
+        }
+    }
+
+    /// Start loading a tab that waits for its first click (in a thread: the window keeps
+    /// drawing).
+    fn open(&mut self) {
+        if let Some(load) = self.load.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(load());
+            });
+            self.loading = Some(rx);
+        }
+    }
+
+    /// Pick up a finished load; true when one came in.
+    fn poll(&mut self) -> bool {
+        let Some(rx) = &self.loading else { return false };
+        let got = match rx.try_recv() {
+            Ok(t) => t,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None, // the loader panicked
+        };
+        self.state = got.as_ref().map(tab_state);
+        self.loading = None;
+        true
+    }
+
+    /// What the tab button says after the name.
+    fn status(&self) -> String {
+        match (&self.state, &self.load, &self.loading) {
+            (Some(t), ..) => format!("{} ticked", t.chosen().len()),
+            (None, Some(_), _) => "click to load".into(),
+            (None, None, Some(_)) => "loading…".into(),
+            _ => "nothing to show".into(),
+        }
+    }
 }
 
 /// A preset name: lowercase letters, digits, `.`, `_`, `-`.
@@ -383,7 +448,7 @@ fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> 
 }
 
 struct App {
-    tabs: Vec<TabState>,
+    tabs: Vec<Slot>,
     active: usize,
     setup: bool,
     command: String,
@@ -409,24 +474,27 @@ impl App {
         let tabs = self
             .tabs
             .iter()
-            .map(|t| TabPick {
-                picks: t
-                    .sections
-                    .iter()
-                    .map(|s| {
-                        let title0 = t.titles0.get(&s.name).cloned().unwrap_or_default();
-                        Pick {
-                            name: s.name.clone(),
-                            ticked: s.rows().filter(|r| r.on).map(|r| r.doc.clone()).collect(),
-                            remember: s.remember,
-                            save_as: s.save_as.trim().to_string(),
-                            title: (s.title.trim() != title0).then(|| s.title.trim().to_string()),
-                        }
-                    })
-                    .collect(),
-                renames: t.renames.clone(),
-                chip: t.chip,
-                by_time: t.by_time,
+            .map(|slot| slot.state.as_ref())
+            .map(|t| {
+                t.map(|t| TabPick {
+                    picks: t
+                        .sections
+                        .iter()
+                        .map(|s| {
+                            let title0 = t.titles0.get(&s.name).cloned().unwrap_or_default();
+                            Pick {
+                                name: s.name.clone(),
+                                ticked: s.rows().filter(|r| r.on).map(|r| r.doc.clone()).collect(),
+                                remember: s.remember,
+                                save_as: s.save_as.trim().to_string(),
+                                title: (s.title.trim() != title0).then(|| s.title.trim().to_string()),
+                            }
+                        })
+                        .collect(),
+                    renames: t.renames.clone(),
+                    chip: t.chip,
+                    by_time: t.by_time,
+                })
             })
             .collect();
         self.finish(ctx, Outcome::Picked(tabs));
@@ -437,7 +505,7 @@ impl App {
         let mut parts = Vec::new();
         let mut short = Vec::new();
         let (mut k, mut n, mut hidden) = (0.0, 0, 0);
-        for t in &self.tabs {
+        for t in self.tabs.iter().filter_map(|s| s.state.as_ref()) {
             let c = t.chosen();
             k += c.iter().map(|d| t.sizes.get(d).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64).sum::<f64>();
             n += c.len();
@@ -476,7 +544,11 @@ impl eframe::App for App {
         if !self.closing && (ctx.input(|i| i.viewport().close_requested()) || shot_taken(&mut self.shot, ctx)) {
             self.finish(ctx, Outcome::Cancelled);
         }
-        ctx.request_repaint_after(Duration::from_millis(if self.shot.is_some() { 50 } else { 1000 }));
+        if self.tabs.iter_mut().map(Slot::poll).filter(|got| *got).count() > 0 {
+            ctx.request_repaint();
+        }
+        let busy = self.tabs.iter().any(|s| s.loading.is_some());
+        ctx.request_repaint_after(Duration::from_millis(if self.shot.is_some() || busy { 50 } else { 1000 }));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -491,7 +563,7 @@ impl eframe::App for App {
         }
         let now = Local::now();
         let (button, line, n) = self.totals(&now);
-        let bad = self.tabs.iter().find_map(TabState::bad_name);
+        let bad = self.tabs.iter().filter_map(|s| s.state.as_ref()).find_map(TabState::bad_name);
         let can_ok = (self.setup || n > 0) && bad.is_none() && self.edit.is_none();
         if can_ok && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && ctx.memory(|m| m.focused().is_none()) {
             self.done(&ctx);
@@ -503,19 +575,19 @@ impl eframe::App for App {
         egui::Panel::top("head").frame(margin).show(ui, |ui| {
             if self.tabs.len() > 1 {
                 ui.horizontal(|ui| {
-                    for (i, t) in self.tabs.iter().enumerate() {
-                        let c = t.chosen().len();
+                    for (i, t) in self.tabs.iter_mut().enumerate() {
                         let name = if t.chats { "Chats" } else { "Research" };
-                        let text = RichText::new(format!("{name} ({c} ticked)")).heading();
+                        let text = RichText::new(format!("{name} ({})", t.status())).heading();
                         if ui.selectable_label(self.active == i, text).clicked() {
                             self.active = i;
                             self.edit = None;
+                            t.open(); // a tab that waited for this click loads now
                         }
                     }
                 });
                 ui.separator();
             }
-            let tab = &mut self.tabs[self.active];
+            let Some(tab) = self.tabs[self.active].state.as_mut() else { return };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let title = match (self.setup, tab.chats) {
@@ -601,8 +673,26 @@ impl eframe::App for App {
         let mut start: Option<(usize, String, String)> = None;
         let mut commit: Option<(usize, String, String)> = None;
         egui::CentralPanel::default().frame(margin).show(ui, |ui| {
+            let slot = &mut self.tabs[active];
+            let Some(tab) = slot.state.as_mut() else {
+                ui.add_space(24.0);
+                ui.horizontal(|ui| {
+                    if slot.loading.is_some() {
+                        ui.spinner();
+                        let what =
+                            if slot.chats { "earlier chats (the first time can take a while)" } else { "research" };
+                        ui.label(format!("Loading {what}…"));
+                    } else {
+                        ui.label(if slot.chats {
+                            "No earlier chats to show."
+                        } else {
+                            "No research to show: set `default_set` (and a library) in the config."
+                        });
+                    }
+                });
+                return;
+            };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let tab = &mut self.tabs[active];
                 let filter = tab.filter.trim().to_lowercase();
                 let (chip, by_time, chats) = (tab.chip, tab.by_time, tab.chats);
                 let narrowed = !filter.is_empty() || chip != Chip::All;
@@ -714,8 +804,10 @@ impl eframe::App for App {
             self.edit = Some(Edit { tab: active, sec: si, doc, buf, focus: true });
         }
         if let Some((_, doc, name)) = commit {
-            if !doc.is_empty() {
-                self.tabs[active].renames.insert(doc, name);
+            if !doc.is_empty()
+                && let Some(t) = self.tabs[active].state.as_mut()
+            {
+                t.renames.insert(doc, name);
             }
             self.edit = None;
         }
@@ -781,12 +873,18 @@ fn tab_state(t: &Tab) -> TabState {
 }
 
 /// Show the chooser on tab `start` and wait for the user. Err when no window can be shown.
-pub fn popup(tabs: &[Tab], start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
+pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
     have_display()?;
     let result = Arc::new(Mutex::new(None));
-    let app = App {
-        tabs: tabs.iter().map(tab_state).collect(),
-        active: start.min(tabs.len().saturating_sub(1)),
+    let what = match (tabs.len(), &tabs.first()) {
+        (1, Some(TabSlot::Ready(t))) if t.look.chats => "choose chats to load",
+        (1, _) => "choose research to load",
+        _ => "choose chats and research to load",
+    };
+    let active = start.min(tabs.len().saturating_sub(1));
+    let mut app = App {
+        tabs: tabs.into_iter().map(Slot::new).collect(),
+        active,
         setup,
         command: command.to_string(),
         edit: None,
@@ -795,11 +893,9 @@ pub fn popup(tabs: &[Tab], start: usize, setup: bool, command: &str) -> Result<O
         result: Arc::clone(&result),
         closing: false,
     };
-    let what = match (tabs.len(), tabs.first().is_some_and(|t| t.look.chats)) {
-        (1, true) => "choose chats to load",
-        (1, false) => "choose research to load",
-        _ => "choose chats and research to load",
-    };
+    if let Some(slot) = app.tabs.get_mut(active) {
+        slot.open(); // --start on the other side: that tab is wanted, load it now
+    }
     let title = format!("The Researcher - {}", if setup { "change saved presets" } else { what });
     let size = if app.shot.is_some() { [720.0, 560.0] } else { [760.0, 800.0] };
     run(&title, size, Box::new(app))?;
@@ -873,6 +969,31 @@ mod tab_tests {
         assert!(t.bad_name().unwrap().contains("cannot be a preset name"));
         t.sections[0].save_as = "b".into();
         assert!(t.bad_name().unwrap().contains("exists already"));
+    }
+
+    #[test]
+    fn a_later_tab_loads_only_when_opened() {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let load: Loader = Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            Some(Tab { sections: Vec::new(), sizes: Sizes::new(), look: Look { chats: true, ..Look::default() } })
+        });
+        let mut slot = Slot::new(TabSlot::Later { chats: true, load });
+        assert_eq!(slot.status(), "click to load");
+        assert!(!slot.poll());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!called.load(Ordering::SeqCst)); // nothing ran before the click
+        slot.open();
+        let t0 = Instant::now();
+        while !slot.poll() {
+            assert!(t0.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(slot.status(), "0 ticked");
+        slot.open(); // a second click loads nothing again
+        assert!(slot.loading.is_none());
     }
 
     #[test]

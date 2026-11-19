@@ -848,43 +848,53 @@ class TwoTabTests(ContextTests.__base__):
             {"rust": {"selected": ["rust/memory-a"], "known": ["rust/linux", "rust/memory-a", "rust/memory-b"]}}))
         write(self.presets, json.dumps({"default": {"selected": [SID2], "known": []}}))
 
-    def first_lines(self, out):
+    def test_without_a_window_only_the_own_side_loads_and_no_chat_is_scanned(self):
+        self.save_both()
+        # the Chats tab only loads when it is clicked: no window, no click, no scan
+        code, out = self.run_main("rust")
+        self.assertEqual(code, 0, out)
+        self.assertIn("total: 1 docs", out)
+        self.assertNotIn("CHAT ", out)
+        self.assertFalse(os.path.exists(self.reg), "a research load scanned the chats")
+        self.assertEqual(len(R.read_usage()), 1)
+        # and the other way round: a chat load does not touch the research
+        code, out = self.run_main("--context", "default", "--start", "research")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f'CHAT "Second one" ({SID2})', out)
+        self.assertNotIn("docs", out)
+        self.assertEqual(len(R.read_usage()), 2)
+        write(self.cfg, read(self.cfg).replace('default_set = "rust"', 'default_set = "ghost"'))
+        self.assertEqual(self.run_main("--context", "default")[0], 0)
+
+    def test_the_other_tab_loads_only_when_clicked(self):
+        """With a window: the other side is a loader that has not run when the window opens."""
+        self.save_both()
+        seen = {}
+
+        def fake_popup(tabs, start, setup, command=""):
+            seen["tabs"] = tabs
+            self.assertFalse(os.path.exists(self.reg))  # not scanned yet
+            tab = tabs[0]["loader"]()  # the user clicks Chats
+            sec = tab["sections"][0]
+            return [{"picks": [{"name": sec["name"], "ticked": set(sec["ticked"]), "remember": False,
+                                "save_as": sec["name"], "title": None}], "renames": {}, "chip": "all",
+                     "by_time": False},
+                    {"picks": [{"name": "rust", "ticked": {"rust/memory-a"}, "remember": False,
+                                "save_as": "rust", "title": None}], "renames": {}, "chip": "all",
+                     "by_time": False}]
+        os.environ.pop("RESEARCHER_NO_POPUP")
+        self.addCleanup(os.environ.__setitem__, "RESEARCHER_NO_POPUP", "1")
+        orig = R.popup
+        R.popup = fake_popup
+        self.addCleanup(setattr, R, "popup", orig)
+        code, out = self.run_main("rust")
+        self.assertEqual(code, 0, out)
+        self.assertIn("loader", seen["tabs"][0])
         lines = out.splitlines()
         doc = next(i for i, l in enumerate(lines) if "chars  " in l and "memory-a" in l)
         chat = next(i for i, l in enumerate(lines) if l.startswith("CHAT "))
-        return doc, chat
-
-    def test_research_load_also_loads_the_saved_chat_preset_research_first(self):
-        self.save_both()
-        code, out = self.run_main("rust")
-        self.assertEqual(code, 0, out)
-        doc, chat = self.first_lines(out)
-        self.assertLess(doc, chat, out)
-        self.assertIn(f'CHAT "Second one" ({SID2})', out)
-        recs = R.read_usage()
-        self.assertEqual(len(recs), 2, out)  # one load of both writes a library and a chat record
-        self.assertEqual([r["fmt"]["chat"] for r in recs], [0, 1])
-
-    def test_start_decides_which_side_prints_first(self):
-        self.save_both()
-        doc, chat = self.first_lines(self.run_main("rust", "--start", "chats")[1])
-        self.assertLess(chat, doc)
-        doc, chat = self.first_lines(self.run_main("--context", "default")[1])
-        self.assertLess(chat, doc)
-        doc, chat = self.first_lines(self.run_main("--context", "--start", "research")[1])
-        self.assertLess(doc, chat)
-
-    def test_the_other_side_loads_only_a_saved_choice(self):
-        code, out = self.run_main("rust")
-        self.assertEqual(code, 0, out)
-        self.assertNotIn("CHAT ", out)
-        write(self.presets, json.dumps({"work": {"selected": [SID2], "known": []}}))
-        code, out = self.run_main("--context", "work")
-        self.assertEqual(code, 0, out)
-        self.assertNotIn("docs", out)
-        self.assertFalse(os.path.exists(os.path.join(self.conf_dir, "choices.json")))
-        write(self.cfg, read(self.cfg).replace('default_set = "rust"', 'default_set = "ghost"'))
-        self.assertEqual(self.run_main("--context", "work")[0], 0)
+        self.assertLess(doc, chat, out)  # opened on Research: research prints first
+        self.assertEqual([r["fmt"]["chat"] for r in R.read_usage()], [0, 1])  # two records
 
     def test_a_display_name_shows_before_the_path(self):
         self.save_both()

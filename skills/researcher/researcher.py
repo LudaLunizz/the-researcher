@@ -699,7 +699,10 @@ def popup(tabs, start, setup, command=""):
     Raises RuntimeError when no display/GTK 4 is available.
 
     A tab is {"sections", "sizes": {id: chars} (readable rows only), "look": {"chats", "labels",
-    "defaults", "notes", "groups", "times", "titles", "taken", "chip", "by_time"}}."""
+    "defaults", "notes", "groups", "times", "titles", "taken", "chip", "by_time"}}, or
+    {"chats": bool, "loader": fn} for a tab that loads only when it is first clicked (fn returns
+    a tab or None; it runs in a thread so the window keeps drawing). A tab never opened gives
+    None in the result."""
     try:
         import gi
         gi.require_version("Gtk", "4.0")
@@ -712,7 +715,11 @@ def popup(tabs, start, setup, command=""):
     esc = lambda t: GLib.markup_escape_text(t, -1)
     loop = GLib.MainLoop()
     result = {"value": None}
-    states = [tab_state(t) for t in tabs]
+    import threading
+    states = [None if "loader" in t else tab_state(t) for t in tabs]
+    kinds = [bool(t["chats"]) if "loader" in t else bool(t["look"].get("chats")) for t in tabs]
+    loaders = [t.get("loader") for t in tabs]
+    loading = [False] * len(tabs)
     cur = {"i": min(start, len(states) - 1), "edit": None}  # edit: (tab, section, row id or "", text)
     now = datetime.datetime.now().astimezone()
     host = host_name()
@@ -722,7 +729,7 @@ def popup(tabs, start, setup, command=""):
             box.remove(c)
 
     if len(tabs) == 1:
-        what = "choose chats to load" if states[0]["chats"] else "choose research to load"
+        what = "choose chats to load" if kinds[0] else "choose research to load"
     else:
         what = "choose chats and research to load"
     win = Gtk.Window(title="The Researcher - " + ("change saved presets" if setup else what))
@@ -773,7 +780,7 @@ def popup(tabs, start, setup, command=""):
     def update(*_):
         parts, short = [], []
         k = n = hidden = 0
-        for st in states:
+        for st in (st for st in states if st):
             c = tab_chosen(st)
             k += sum(st["sizes"].get(d, 0) for d in c) / CHARS_PER_K
             n += len(c)
@@ -785,7 +792,7 @@ def popup(tabs, start, setup, command=""):
         if hidden:
             line += f" ({hidden} ticked but hidden by the time chip)"
         total.set_markup(f"<b>{esc(line)}</b>")
-        bad = next((b for st in states if st["chats"] for b in [bad_preset_name(st["secs"], st["taken"])] if b), None)
+        bad = next((b for st in states if st and st["chats"] for b in [bad_preset_name(st["secs"], st["taken"])] if b), None)
         error.set_markup(f"<span foreground='#ff6666'>{esc(bad)}</span>" if bad else "")
         if setup:
             ok.set_label("Save presets")
@@ -794,8 +801,11 @@ def popup(tabs, start, setup, command=""):
         else:
             ok.set_label("Load " + " + ".join(short) if short else "Load")
         ok.set_sensitive((setup or n > 0) and not bad and cur["edit"] is None)
-        for b, st in zip(tab_buttons, states):
-            b.set_label(f"{'Chats' if st['chats'] else 'Research'} ({len(tab_chosen(st))} ticked)")
+        for i, b in enumerate(tab_buttons):
+            st = states[i]
+            status = (f"{len(tab_chosen(st))} ticked" if st else "loading…" if loading[i]
+                      else "click to load" if loaders[i] else "nothing to show")
+            b.set_label(f"{'Chats' if kinds[i] else 'Research'} ({status})")
 
     def visible(st, r, short):
         if not in_chip(st, r, now):
@@ -892,6 +902,18 @@ def popup(tabs, start, setup, command=""):
 
     def render():
         st = states[cur["i"]]
+        if st is None:  # a tab that loads on its first click: loading, or nothing in it
+            clear(chips)
+            clear(body)
+            if loading[cur["i"]]:
+                what = "earlier chats (the first time can take a while)" if kinds[cur["i"]] else "research"
+                head.set_markup(f"<big><b>Loading {what}…</b></big>")
+            else:
+                head.set_markup("<big><b>" + ("No earlier chats to show." if kinds[cur["i"]] else
+                                "No research to show: set `default_set` (and a library) in the config.")
+                                + "</b></big>")
+            update()
+            return
         names = ", ".join(f"<b>{esc(s['name'])}</b>" for s in st["secs"])
         if setup:
             head.set_markup(f"<big><b>Change the saved presets</b></big> for {names}\n"
@@ -1005,16 +1027,41 @@ def popup(tabs, start, setup, command=""):
         update()
 
     def set_tab(**kw):
+        if states[cur["i"]] is None:
+            return
         states[cur["i"]].update(kw)
         later(render)
 
+    def open_tab(i):
+        """Load a tab that waited for its first click."""
+        load, loaders[i] = loaders[i], None
+        if load is None:
+            return
+        loading[i] = True
+
+        def loaded(tab):
+            loading[i] = False
+            states[i] = tab_state(tab) if tab else None
+            if not cur.get("closed"):
+                render()
+
+        def work():
+            try:
+                tab = load()
+            except Exception:  # noqa: BLE001 - a failed load shows as "nothing to show"
+                tab = None
+            GLib.idle_add(lambda: (loaded(tab), False)[1])
+        threading.Thread(target=work, daemon=True).start()
+
     def switch(i):
         cur["i"], cur["edit"] = i, None
-        search.set_text(states[i]["filter"])
+        open_tab(i)
+        search.set_text(states[i]["filter"] if states[i] else "")
         later(render)
 
     def finish(value):
         result["value"] = value
+        cur["closed"] = True
         win.destroy()
         loop.quit()
 
@@ -1023,10 +1070,12 @@ def popup(tabs, start, setup, command=""):
                             "remember": s["remember"], "save_as": s["save_as"].strip(),
                             "title": s["title"].strip() if s["title"].strip() != s["title0"] else None}
                            for s in st["secs"]],
-                 "renames": dict(st["renames"]), "chip": st["chip"], "by_time": st["by_time"]}
+                 "renames": dict(st["renames"]), "chip": st["chip"], "by_time": st["by_time"]} if st else None
                 for st in states])
 
     def refilter(*_):
+        if states[cur["i"]] is None:
+            return
         states[cur["i"]]["filter"] = search.get_text().strip().lower()
         render()
 
@@ -1048,6 +1097,7 @@ def popup(tabs, start, setup, command=""):
     keys.connect("key-pressed", key)
     win.add_controller(keys)
     GLib.timeout_add_seconds(POPUP_TIMEOUT, lambda: (finish("timeout"), False)[1])
+    open_tab(cur["i"])  # --start on the other side: that tab is wanted, load it now
     render()
     win.present()
     loop.run()
@@ -2405,15 +2455,18 @@ def research_finish(r, args, cfg_path, state_path, names_path, ui_path, picks):
 
 def load_both(args, cfg_path, state_path):
     """A load: research (`researcher SET ...`) or chats (`--context PRESET ...`) in one window with
-    a tab for each; the other tab shows the default set or the preset `default`. The tab the
-    window opens on prints first."""
+    a tab for each. The command's own side is ready when the window opens; the other tab (the
+    preset `default`, or the config's default_set) is only listed, and loads when the user clicks
+    it, so a load never waits for a scan nobody asked for. Without a window only the own side
+    loads. The tab the window opens on prints first."""
     conf_dir = os.path.dirname(cfg_path)
     names_path, ui_path = os.path.join(conf_dir, "names.json"), os.path.join(conf_dir, "ui.json")
     cpaths = {"reg": os.path.join(conf_dir, "sessions.json"), "presets": os.path.join(conf_dir, "contexts.json"),
               "ui": ui_path}
     no_popup = args.no_popup or bool(os.environ.get("RESEARCHER_NO_POPUP"))
     chats_first = args.context if args.start is None else args.start == "chats"
-    alone = args.setup or args.list or args.sync  # these work on one side only
+    # --setup, --list and --sync work on one side; without a window there is no tab to click
+    other_side = not (args.setup or args.list or args.sync or no_popup)
     chat_out = (args.out or cache_home()) if args.context else cache_home()
     research = chats = None
     if args.context:
@@ -2425,23 +2478,37 @@ def load_both(args, cfg_path, state_path):
         chats = context_prep(args, cfg, cpaths, args.sets)
         if isinstance(chats, int):
             return chats
-        if not alone:
-            research = research_prep(args, cfg_path, state_path, secondary=True)
-            research = None if isinstance(research, int) else research
     else:
         research = research_prep(args, cfg_path, state_path)
         if isinstance(research, int):
             return research
         cfg = research["cfg"]
-        if not alone:
-            chats = context_prep(args, cfg, cpaths, [], secondary=True)
-            chats = None if isinstance(chats, int) else chats
 
-    r_pick = c_pick = None
+    later = {}  # the other side, filled by its loader on the first click of its tab
+    own_pick = other_pick = None
     if not no_popup:
-        tabs = ([context_tab(chats, ui_path)] if chats else []) + \
-               ([research_tab(research, names_path, ui_path)] if research else [])
-        start = 0 if chats_first or research is None else len(tabs) - 1
+        tabs = []
+        if chats:
+            tabs.append(context_tab(chats, ui_path))
+        elif other_side and sessions_settings(cfg) is not None:
+            def load_chats():
+                c = context_prep(args, cfg, cpaths, [], secondary=True)
+                if isinstance(c, int):
+                    return None
+                later["chats"] = c
+                return context_tab(c, ui_path)
+            tabs.append({"chats": True, "loader": load_chats})
+        if research:
+            tabs.append(research_tab(research, names_path, ui_path))
+        elif other_side and resolve_names([], cfg):
+            def load_research():
+                r = research_prep(args, cfg_path, state_path, secondary=True)
+                if isinstance(r, int):
+                    return None
+                later["research"] = r
+                return research_tab(r, names_path, ui_path)
+            tabs.append({"chats": False, "loader": load_research})
+        start = 0 if chats_first else len(tabs) - 1
         if args.context:
             command = "researcher --context " + " ".join(args.sets)
         else:
@@ -2457,22 +2524,22 @@ def load_both(args, cfg_path, state_path):
             if picked == "timeout":
                 print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded")
                 return 4
-            picked = list(picked)
-            c_pick = picked.pop(0) if chats else None
-            r_pick = picked.pop(0) if research else None
+            # tabs went in as [chats, research]; the own side is the one that was ready
+            picked = list(picked) + [None]
+            c, r = (picked[0], picked[1]) if len(tabs) > 1 or chats else (None, picked[0])
+            own_pick, other_pick = (c, r) if args.context else (r, c)
 
-    def run_research():
-        return research_finish(research, args, cfg_path, state_path, names_path, ui_path, r_pick) if research else 0
-
-    def run_chats():
-        return context_finish(chats, args, cfg, cfg_path, cpaths, chat_out, c_pick) if chats else 0
-    if chats_first:
-        chats_code, research_code = run_chats(), run_research()
-    else:
-        research_code, chats_code = run_research(), run_chats()
+    def side(chats_turn):
+        own = chats_turn == args.context
+        pick = own_pick if own else other_pick
+        if chats_turn:
+            c = chats if own else later.get("chats")
+            return context_finish(c, args, cfg, cfg_path, cpaths, chat_out, pick) if c else 0
+        r = research if own else later.get("research")
+        return research_finish(r, args, cfg_path, state_path, names_path, ui_path, pick) if r else 0
+    codes = {t: side(t) for t in ((True, False) if chats_first else (False, True))}
     # the command's own side decides the exit code; the other side only adds to it
-    own, other = (chats_code, research_code) if args.context else (research_code, chats_code)
-    return own or other
+    return codes[args.context] or codes[not args.context]
 
 
 if __name__ == "__main__":
