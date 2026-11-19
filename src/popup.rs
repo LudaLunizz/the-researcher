@@ -42,7 +42,8 @@ pub struct TabPick {
 /// What the user did: one TabPick per tab, in the order the tabs were given (None: a tab
 /// that was never opened, so never loaded).
 pub enum Outcome {
-    Picked(Vec<Option<TabPick>>),
+    /// The picks, and the name of the profile preset to save them as (if asked).
+    Picked(Vec<Option<TabPick>>, Option<String>),
     Cancelled,
     Timeout,
 }
@@ -69,6 +70,10 @@ pub struct Look {
     pub taken: BTreeSet<String>,
     /// Chats instead of research documents.
     pub chats: bool,
+    /// Source files of a project profile (no renaming, no Remember).
+    pub code: bool,
+    /// No Remember box (a profile saves its presets itself).
+    pub no_remember: bool,
     pub chip: Chip,
     pub by_time: bool,
 }
@@ -84,6 +89,8 @@ impl Default for Look {
             titles: BTreeMap::new(),
             taken: BTreeSet::new(),
             chats: false,
+            code: false,
+            no_remember: false,
             chip: Chip::All,
             by_time: false,
         }
@@ -97,6 +104,15 @@ pub struct Tab {
     pub look: Look,
 }
 
+/// A project profile: named presets that tick all tabs at once. Each preset holds one set of
+/// row ids per tab, in the order of the tabs.
+pub struct ProfileUi {
+    pub name: String,
+    pub presets: Vec<(String, Vec<BTreeSet<String>>)>,
+    /// The preset to apply when the window opens.
+    pub selected: Option<usize>,
+}
+
 /// Makes a tab when it is first opened (it may take a while: chats are scanned then). None =
 /// nothing to show.
 pub type Loader = Box<dyn FnOnce() -> Option<Tab> + Send>;
@@ -104,12 +120,15 @@ pub type Loader = Box<dyn FnOnce() -> Option<Tab> + Send>;
 /// A tab ready to show, or one that loads only when the user clicks it.
 pub enum TabSlot {
     Ready(Box<Tab>),
-    Later { chats: bool, load: Loader },
+    Later { chats: bool, code: bool, load: Loader },
 }
 
 /// One tab of the window as it runs.
 struct Slot {
     chats: bool,
+    code: bool,
+    /// Ticks a profile preset asked for before the tab was loaded.
+    want: Option<BTreeSet<String>>,
     state: Option<TabState>,
     load: Option<Loader>,
     loading: Option<std::sync::mpsc::Receiver<Option<Tab>>>,
@@ -118,10 +137,17 @@ struct Slot {
 impl Slot {
     fn new(t: TabSlot) -> Slot {
         match t {
-            TabSlot::Ready(tab) => {
-                Slot { chats: tab.look.chats, state: Some(tab_state(&tab)), load: None, loading: None }
+            TabSlot::Ready(tab) => Slot {
+                chats: tab.look.chats,
+                code: tab.look.code,
+                want: None,
+                state: Some(tab_state(&tab)),
+                load: None,
+                loading: None,
+            },
+            TabSlot::Later { chats, code, load } => {
+                Slot { chats, code, want: None, state: None, load: Some(load), loading: None }
             }
-            TabSlot::Later { chats, load } => Slot { chats, state: None, load: Some(load), loading: None },
         }
     }
 
@@ -147,7 +173,34 @@ impl Slot {
         };
         self.state = got.as_ref().map(tab_state);
         self.loading = None;
+        if let (Some(t), Some(want)) = (self.state.as_mut(), self.want.take()) {
+            t.tick_only(&want);
+        }
         true
+    }
+
+    /// Tick exactly `want` (a profile preset); a tab not loaded yet keeps it for later and loads
+    /// now when the preset needs it.
+    fn apply(&mut self, want: &BTreeSet<String>) {
+        match self.state.as_mut() {
+            Some(t) => t.tick_only(want),
+            None => {
+                if !want.is_empty() {
+                    self.open();
+                }
+                self.want = Some(want.clone());
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        if self.code {
+            "Code"
+        } else if self.chats {
+            "Chats"
+        } else {
+            "Research"
+        }
     }
 
     /// What the tab button says after the name.
@@ -220,6 +273,8 @@ impl SectionState {
 
 struct TabState {
     chats: bool,
+    code: bool,
+    no_remember: bool,
     sections: Vec<SectionState>,
     sizes: Sizes,
     filter: String,
@@ -233,6 +288,12 @@ struct TabState {
 }
 
 impl TabState {
+    fn tick_only(&mut self, want: &BTreeSet<String>) {
+        for s in &mut self.sections {
+            s.rows_mut().for_each(|r| r.on = r.readable && want.contains(&r.doc));
+        }
+    }
+
     fn chosen(&self) -> BTreeSet<String> {
         self.sections.iter().flat_map(SectionState::rows).filter(|r| r.on).map(|r| r.doc.clone()).collect()
     }
@@ -274,7 +335,13 @@ impl TabState {
     }
 
     fn noun(&self) -> &'static str {
-        if self.chats { "chats" } else { "documents" }
+        if self.code {
+            "files"
+        } else if self.chats {
+            "chats"
+        } else {
+            "documents"
+        }
     }
 }
 
@@ -354,6 +421,7 @@ struct View<'a> {
     chip: Chip,
     by_time: bool,
     chats: bool,
+    code: bool,
     now: &'a DateTime<Local>,
     renames: &'a BTreeMap<String, String>,
     sizes: &'a Sizes,
@@ -420,9 +488,11 @@ fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> 
                 ui.label(RichText::new("Enter keeps it, Esc undoes").small().weak());
             } else if r.readable {
                 let cb = ui.checkbox(&mut r.on, &shown);
-                let pen = ui.small_button("rename").on_hover_text("Rename (or double-click the name)");
-                if cb.double_clicked() || pen.clicked() {
-                    asked.start = Some((r.doc.clone(), shown.clone()));
+                if !v.code {
+                    let pen = ui.small_button("rename").on_hover_text("Rename (or double-click the name)");
+                    if cb.double_clicked() || pen.clicked() {
+                        asked.start = Some((r.doc.clone(), shown.clone()));
+                    }
                 }
                 let k = v.sizes.get(&r.doc).copied().unwrap_or(0) as f64 / CHARS_PER_K as f64;
                 ui.label(RichText::new(format!("~{k:.0}k")).small());
@@ -450,6 +520,12 @@ fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> 
 struct App {
     tabs: Vec<Slot>,
     active: usize,
+    profile: Option<ProfileUi>,
+    /// The profile preset last clicked.
+    picked: Option<usize>,
+    /// Save the ticks as a profile preset, under `save_name`.
+    save: bool,
+    save_name: String,
     setup: bool,
     command: String,
     edit: Option<Edit>,
@@ -497,7 +573,25 @@ impl App {
                 })
             })
             .collect();
-        self.finish(ctx, Outcome::Picked(tabs));
+        let save = (self.profile.is_some() && self.save).then(|| self.save_name.trim().to_string());
+        self.finish(ctx, Outcome::Picked(tabs, save));
+    }
+
+    /// Tick what profile preset `i` holds, in every tab (loading the tabs it needs).
+    fn apply_preset(&mut self, i: usize) {
+        let Some((name, sets)) = self.profile.as_ref().and_then(|p| p.presets.get(i)).cloned() else { return };
+        for (slot, want) in self.tabs.iter_mut().zip(&sets) {
+            slot.apply(want);
+        }
+        self.picked = Some(i);
+        self.save_name = name;
+    }
+
+    /// Why the profile preset cannot be saved, or None.
+    fn bad_save(&self) -> Option<String> {
+        let n = self.save_name.trim();
+        (self.profile.is_some() && self.save && !valid_preset(n))
+            .then(|| format!("\"{n}\" cannot be a preset name: use lowercase letters, digits, . _ -"))
     }
 
     /// The Load button's text and the summary line.
@@ -512,7 +606,17 @@ impl App {
             hidden += t.hidden(now);
             if !c.is_empty() || self.tabs.len() == 1 {
                 parts.push(format!("{} {}", c.len(), t.noun()));
-                short.push(format!("{} {}", c.len(), if t.chats { "chats" } else { "docs" }));
+                short.push(format!(
+                    "{} {}",
+                    c.len(),
+                    if t.code {
+                        "files"
+                    } else if t.chats {
+                        "chats"
+                    } else {
+                        "docs"
+                    }
+                ));
             }
         }
         let k = k + 0.0; // an empty f64 sum is -0.0
@@ -563,8 +667,9 @@ impl eframe::App for App {
         }
         let now = Local::now();
         let (button, line, n) = self.totals(&now);
-        let bad = self.tabs.iter().filter_map(|s| s.state.as_ref()).find_map(TabState::bad_name);
-        let can_ok = (self.setup || n > 0) && bad.is_none() && self.edit.is_none();
+        let bad = self.tabs.iter().filter_map(|s| s.state.as_ref()).find_map(TabState::bad_name).or(self.bad_save());
+        let loading = self.tabs.iter().any(|s| s.loading.is_some());
+        let can_ok = (self.setup || n > 0) && bad.is_none() && self.edit.is_none() && !loading;
         if can_ok && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && ctx.memory(|m| m.focused().is_none()) {
             self.done(&ctx);
             return;
@@ -572,12 +677,33 @@ impl eframe::App for App {
         let margin = egui::Frame::central_panel(ui.style()).inner_margin(14.0);
         let host = host_name();
 
+        let mut preset_clicked = None;
+        if let Some(p) = &self.profile {
+            egui::Panel::top("profile").frame(margin).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Profile {}:", p.name)).heading().strong());
+                    for (i, (name, _)) in p.presets.iter().enumerate() {
+                        if ui.selectable_label(self.picked == Some(i), RichText::new(name).heading()).clicked() {
+                            preset_clicked = Some(i);
+                        }
+                    }
+                    if p.presets.is_empty() {
+                        ui.label(
+                            RichText::new("no presets yet: tick what you need, then save it below").small().weak(),
+                        );
+                    }
+                });
+            });
+        }
+        if let Some(i) = preset_clicked {
+            self.apply_preset(i);
+            self.edit = None;
+        }
         egui::Panel::top("head").frame(margin).show(ui, |ui| {
             if self.tabs.len() > 1 {
                 ui.horizontal(|ui| {
                     for (i, t) in self.tabs.iter_mut().enumerate() {
-                        let name = if t.chats { "Chats" } else { "Research" };
-                        let text = RichText::new(format!("{name} ({})", t.status())).heading();
+                        let text = RichText::new(format!("{} ({})", t.name(), t.status())).heading();
                         if ui.selectable_label(self.active == i, text).clicked() {
                             self.active = i;
                             self.edit = None;
@@ -590,10 +716,11 @@ impl eframe::App for App {
             let Some(tab) = self.tabs[self.active].state.as_mut() else { return };
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let title = match (self.setup, tab.chats) {
-                    (true, _) => "Change the saved presets".to_string(),
-                    (false, true) => format!("{host} wants to load earlier chats"),
-                    (false, false) => format!("{host} wants to load research"),
+                let title = match (self.setup, tab.chats, tab.code) {
+                    (true, ..) => "Change the saved presets".to_string(),
+                    (false, _, true) => format!("{host} wants to load source files"),
+                    (false, true, _) => format!("{host} wants to load earlier chats"),
+                    (false, false, _) => format!("{host} wants to load research"),
                 };
                 let names = tab.sections.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
                 ui.label(RichText::new(&title).heading().strong());
@@ -635,7 +762,9 @@ impl eframe::App for App {
                 ui.label("Filter:");
                 ui.add(
                     egui::TextEdit::singleline(&mut tab.filter)
-                        .hint_text(if tab.chats {
+                        .hint_text(if tab.code {
+                            "words from the path"
+                        } else if tab.chats {
                             "words from the name, the first prompt or the folder"
                         } else {
                             "words from the name or the id"
@@ -652,6 +781,13 @@ impl eframe::App for App {
         let mut cancel_clicked = false;
         egui::Panel::bottom("bar").frame(margin).show(ui, |ui| {
             ui.label(RichText::new(&line).strong());
+            if self.profile.is_some() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.save, "Save these ticks as the profile preset");
+                    ui.add(egui::TextEdit::singleline(&mut self.save_name).desired_width(160.0))
+                        .on_hover_text("An existing name is replaced");
+                });
+            }
             if let Some(b) = &bad {
                 ui.label(RichText::new(b).color(Color32::from_rgb(0xff, 0x66, 0x66)));
             }
@@ -694,7 +830,8 @@ impl eframe::App for App {
             };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let filter = tab.filter.trim().to_lowercase();
-                let (chip, by_time, chats) = (tab.chip, tab.by_time, tab.chats);
+                let (chip, by_time, chats, code, no_remember) =
+                    (tab.chip, tab.by_time, tab.chats, tab.code, tab.no_remember);
                 let narrowed = !filter.is_empty() || chip != Chip::All;
                 for (si, sec) in tab.sections.iter_mut().enumerate() {
                     let mut editing = self.edit.as_mut().filter(|e| e.tab == active && e.sec == si);
@@ -722,6 +859,7 @@ impl eframe::App for App {
                                 ui.label(RichText::new(&sec.name).small().weak().monospace());
                             }
                             if !chats
+                                && !code
                                 && ui.small_button("rename").on_hover_text("Give this set a display name").clicked()
                             {
                                 start = Some((si, String::new(), sec.title.clone()));
@@ -755,6 +893,7 @@ impl eframe::App for App {
                         chip,
                         by_time,
                         chats,
+                        code,
                         now: &now,
                         renames: &tab.renames,
                         sizes: &tab.sizes,
@@ -780,6 +919,9 @@ impl eframe::App for App {
                         if let Some((doc, name)) = a.commit {
                             commit = Some((si, doc, name));
                         }
+                    }
+                    if no_remember {
+                        continue;
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -861,6 +1003,8 @@ fn tab_state(t: &Tab) -> TabState {
         .collect();
     TabState {
         chats: look.chats,
+        code: look.code,
+        no_remember: look.no_remember,
         sections,
         sizes: t.sizes.clone(),
         filter: String::new(),
@@ -874,11 +1018,23 @@ fn tab_state(t: &Tab) -> TabState {
 }
 
 /// The window's state, before it runs (the start tab opened, so loaded if it waited).
-fn new_app(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str, result: Arc<Mutex<Option<Outcome>>>) -> App {
+fn new_app(
+    tabs: Vec<TabSlot>,
+    start: usize,
+    setup: bool,
+    command: &str,
+    profile: Option<ProfileUi>,
+    result: Arc<Mutex<Option<Outcome>>>,
+) -> App {
     let active = start.min(tabs.len().saturating_sub(1));
+    let selected = profile.as_ref().and_then(|p| p.selected);
     let mut app = App {
         tabs: tabs.into_iter().map(Slot::new).collect(),
         active,
+        profile,
+        picked: None,
+        save: false,
+        save_name: String::new(),
         setup,
         command: command.to_string(),
         edit: None,
@@ -890,11 +1046,20 @@ fn new_app(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str, result:
     if let Some(slot) = app.tabs.get_mut(active) {
         slot.open(); // --start on the other side: that tab is wanted, load it now
     }
+    if let Some(i) = selected {
+        app.apply_preset(i); // the preset named on the command line
+    }
     app
 }
 
 /// Show the chooser on tab `start` and wait for the user. Err when no window can be shown.
-pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Result<Outcome, String> {
+pub fn popup(
+    tabs: Vec<TabSlot>,
+    start: usize,
+    setup: bool,
+    command: &str,
+    profile: Option<ProfileUi>,
+) -> Result<Outcome, String> {
     have_display()?;
     let result = Arc::new(Mutex::new(None));
     let what = match (tabs.len(), &tabs.first()) {
@@ -902,7 +1067,8 @@ pub fn popup(tabs: Vec<TabSlot>, start: usize, setup: bool, command: &str) -> Re
         (1, _) => "choose research to load",
         _ => "choose chats and research to load",
     };
-    let app = new_app(tabs, start, setup, command, Arc::clone(&result));
+    let what = if profile.is_some() { "choose code, chats and research to load" } else { what };
+    let app = new_app(tabs, start, setup, command, profile, Arc::clone(&result));
     let title = format!("The Researcher - {}", if setup { "change saved presets" } else { what });
     let size = if app.shot.is_some() { [720.0, 560.0] } else { [760.0, 800.0] };
     run(&title, size, Box::new(app))?;
@@ -928,6 +1094,8 @@ mod tab_tests {
         };
         TabState {
             chats: true,
+            code: false,
+            no_remember: false,
             sections: vec![SectionState {
                 name: "a".into(),
                 title: String::new(),
@@ -986,7 +1154,7 @@ mod tab_tests {
             flag.store(true, Ordering::SeqCst);
             Some(Tab { sections: Vec::new(), sizes: Sizes::new(), look: Look { chats: true, ..Look::default() } })
         });
-        let mut slot = Slot::new(TabSlot::Later { chats: true, load });
+        let mut slot = Slot::new(TabSlot::Later { chats: true, code: false, load });
         assert_eq!(slot.status(), "click to load");
         assert!(!slot.poll());
         std::thread::sleep(Duration::from_millis(50));
@@ -1042,9 +1210,9 @@ mod tab_tests {
             sizes: [("rust/linux".to_string(), 4800)].into(),
             look: Look::default(),
         };
-        let tabs = vec![TabSlot::Later { chats: true, load }, TabSlot::Ready(Box::new(research))];
+        let tabs = vec![TabSlot::Later { chats: true, code: false, load }, TabSlot::Ready(Box::new(research))];
         let result = Arc::new(Mutex::new(None));
-        let app = new_app(tabs, 1, false, "researcher rust", Arc::clone(&result));
+        let app = new_app(tabs, 1, false, "researcher rust", None, Arc::clone(&result));
         let mut h = egui_kittest::Harness::builder().with_size([760.0, 800.0]).build_eframe(|_| app);
         h.run_steps(10);
         // opened on Research: its row shows, the Chats tab waits and its loader has not run
@@ -1069,6 +1237,69 @@ mod tab_tests {
         assert!(h.query_by_label("Chats (1 ticked)").is_some());
         assert!(h.query_by_label("Load 1 chats + 1 docs").is_some());
         assert!(result.lock().unwrap().is_none()); // nothing loaded or cancelled by the test
+    }
+
+    /// A profile preset ticks every tab at once and loads the waiting Chats tab it needs.
+    #[test]
+    fn a_profile_preset_ticks_all_tabs_and_loads_what_it_needs() {
+        use egui_kittest::kittest::Queryable;
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&called);
+        let load: Loader = Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+            let mut look = Look { chats: true, no_remember: true, ..Look::default() };
+            look.labels.insert("chat-1".into(), "GUI work".into());
+            look.groups.insert("chat-1".into(), "~/app".into());
+            Some(Tab {
+                sections: vec![section("app", &["chat-1", "chat-2"], &[])],
+                sizes: [("chat-1".to_string(), 2400), ("chat-2".to_string(), 2400)].into(),
+                look,
+            })
+        });
+        let code = Tab {
+            sections: vec![section("code", &["src/gui.rs", "src/main.rs"], &[])],
+            sizes: [("src/gui.rs".to_string(), 100), ("src/main.rs".to_string(), 100)].into(),
+            look: Look { code: true, no_remember: true, ..Look::default() },
+        };
+        let set = |ids: &[&str]| ids.iter().map(|d| d.to_string()).collect::<BTreeSet<String>>();
+        let profile = ProfileUi {
+            name: "app".into(),
+            presets: vec![("gui".into(), vec![set(&["src/gui.rs"]), set(&["chat-1"])])],
+            selected: None,
+        };
+        let tabs = vec![TabSlot::Ready(Box::new(code)), TabSlot::Later { chats: true, code: false, load }];
+        let result = Arc::new(Mutex::new(None));
+        let app = new_app(tabs, 0, false, "researcher --profile app", Some(profile), Arc::clone(&result));
+        let mut h = egui_kittest::Harness::builder().with_size([760.0, 800.0]).build_eframe(|_| app);
+        h.run_steps(5);
+        assert!(h.query_by_label("Code (0 ticked)").is_some());
+        assert!(h.query_by_label("Chats (click to load)").is_some());
+        assert!(!called.load(Ordering::SeqCst));
+        h.get_by_label("gui").click(); // the preset button
+        h.run_steps(2);
+        assert!(h.query_by_label("Code (1 ticked)").is_some());
+        let t0 = Instant::now();
+        while h.query_by_label("Chats (1 ticked)").is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the preset's chats never loaded");
+            std::thread::sleep(Duration::from_millis(20));
+            h.run_steps(1);
+        }
+        assert!(called.load(Ordering::SeqCst));
+        assert!(h.query_by_label("Load 1 files + 1 chats").is_some());
+        // save the ticks back as the preset, then Load
+        h.get_by_label("Save these ticks as the profile preset").click();
+        h.run_steps(2);
+        h.get_by_label("Load 1 files + 1 chats").click();
+        h.run_steps(3);
+        match result.lock().unwrap().take() {
+            Some(Outcome::Picked(tabs, save)) => {
+                assert_eq!(save.as_deref(), Some("gui"));
+                let ticked: Vec<BTreeSet<String>> =
+                    tabs.into_iter().map(|t| t.unwrap().picks.into_iter().flat_map(|p| p.ticked).collect()).collect();
+                assert_eq!(ticked, [set(&["src/gui.rs"]), set(&["chat-1"])]);
+            }
+            _ => panic!("the window did not load"),
+        }
     }
 
     #[test]

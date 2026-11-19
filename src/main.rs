@@ -13,6 +13,7 @@
 //! Same command line, files and exit codes as `skills/researcher/researcher.py`.
 
 mod bands;
+mod code;
 mod library;
 mod popup;
 mod sessions;
@@ -67,9 +68,13 @@ struct Args {
     /// pick earlier Claude Code chats (all folders) to load as context; SET names are presets
     #[arg(long)]
     context: bool,
-    /// the tab the window opens on (default: chats with --context, research otherwise)
-    #[arg(long, value_name = "chats|research", value_parser = ["chats", "research"])]
+    /// the tab the window opens on (default: chats with --context, code with --profile, research
+    /// otherwise)
+    #[arg(long, value_name = "code|chats|research", value_parser = ["code", "chats", "research"])]
     start: Option<String>,
+    /// a project profile: code, chats and research in one window, with presets; SET = the preset
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
     /// sessions shown by --sessions
     #[arg(long, default_value_t = 30)]
     limit: usize,
@@ -431,6 +436,9 @@ fn run(args: Args) -> i32 {
         return sessions::main(action, &cfg, &cfg_path, &util::join(&cfg_dir, "sessions.json"), &out);
     }
 
+    if let Some(name) = &args.profile {
+        return load_profile(&args, name, &cfg_path, &state_path);
+    }
     load_both(&args, &cfg_path, &state_path)
 }
 
@@ -801,7 +809,7 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
                 *got.lock().ok()? = Some(c);
                 Some(tab)
             };
-            tabs.push(popup::TabSlot::Later { chats: true, load: Box::new(load) });
+            tabs.push(popup::TabSlot::Later { chats: true, code: false, load: Box::new(load) });
         }
         if let Some(r) = research.as_mut() {
             tabs.push(popup::TabSlot::Ready(Box::new(research_tab(r, &names_path, &ui_path))));
@@ -815,7 +823,7 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
                 *got.lock().ok()? = Some(r);
                 Some(tab)
             };
-            tabs.push(popup::TabSlot::Later { chats: false, load: Box::new(load) });
+            tabs.push(popup::TabSlot::Later { chats: false, code: false, load: Box::new(load) });
         }
         let start = if chats_first { 0 } else { tabs.len() - 1 };
         let command = if args.context {
@@ -824,7 +832,7 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
             format!("researcher {}", research.as_ref().map_or(String::new(), |r| r.names.join(" ")))
         };
         let both = tabs.len() > 1;
-        match popup::popup(tabs, start, args.setup, command.trim_end()) {
+        match popup::popup(tabs, start, args.setup, command.trim_end(), None) {
             Err(e) if args.context => println!("NO POPUP ({e}): using the saved presets"),
             Err(e) => println!("NO POPUP ({e}): using the saved defaults"),
             Ok(Outcome::Cancelled) => {
@@ -835,7 +843,7 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
                 println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
                 return 4;
             }
-            Ok(Outcome::Picked(picked)) => {
+            Ok(Outcome::Picked(picked, _)) => {
                 // tabs went in as [chats, research]
                 let mut it = picked.into_iter();
                 let first = it.next().flatten();
@@ -874,6 +882,333 @@ fn load_both(args: &Args, cfg_path: &str, state_path: &str) -> i32 {
     let own = codes.iter().find(|(o, _)| *o).map_or(0, |(_, c)| *c);
     let other = codes.iter().find(|(o, _)| !*o).map_or(0, |(_, c)| *c);
     if own != 0 { own } else { other }
+}
+
+/// Print the ticked source files (by path: Claude reads them itself). No usage record.
+fn code_finish(files: &BTreeMap<String, code::File>, ticked: &BTreeSet<String>) -> i32 {
+    let mut bytes = 0;
+    let mut n = 0;
+    for (id, f) in files.iter().filter(|(id, _)| ticked.contains(*id)) {
+        println!("CODE {id}");
+        println!("{:>7} bytes  {}", f.bytes, f.path);
+        bytes += f.bytes;
+        n += 1;
+    }
+    let gone: Vec<&String> = ticked.iter().filter(|id| !files.contains_key(*id)).collect();
+    for id in gone {
+        println!("MISSING  code {id} (not under the profile root any more)");
+    }
+    println!("total: {n} files, {bytes} bytes");
+    0
+}
+
+/// The popup tab of a profile's source files.
+fn code_tab(files: &BTreeMap<String, code::File>, ui_path: &str) -> popup::Tab {
+    let (chip, by_time) = state::ui(ui_path, false);
+    let mut look = popup::Look { code: true, no_remember: true, chip, by_time, ..popup::Look::default() };
+    let mut sizes = BTreeMap::new();
+    for (id, f) in files {
+        look.times.insert(id.clone(), f.mtime);
+        sizes.insert(id.clone(), f.bytes as usize);
+    }
+    let ids: Vec<String> = files.keys().cloned().collect();
+    let sec = library::Section {
+        name: "code".into(),
+        kind: SetKind::Custom,
+        docs: ids.clone(),
+        main: ids,
+        other: Vec::new(),
+        new: BTreeSet::new(),
+        ticked: BTreeSet::new(),
+        remember: false,
+        first: false,
+    };
+    popup::Tab { sections: vec![sec], sizes, look }
+}
+
+/// A pick of exactly `ticked` in the one section of a profile tab.
+fn profile_pick(name: &str, ticked: BTreeSet<String>) -> TabPick {
+    let pick = popup::Pick { name: name.into(), ticked, remember: false, save_as: name.into(), title: None };
+    TabPick { picks: vec![pick], renames: BTreeMap::new(), chip: bands::Chip::All, by_time: false }
+}
+
+/// Research of a profile: the whole library in one section, nothing saved as a set default.
+fn profile_research(args: &Args, cfg_path: &str, state_path: &str) -> Option<Research> {
+    let mut a = args.clone();
+    a.sets = vec!["all".into()];
+    (a.setup, a.list, a.sync, a.no_popup, a.out) = (false, false, false, true, None); // never the first-use window
+    // as the command's own side, so `all` is the set (no first-use window: no_popup is on)
+    let mut r = research_prep(&a, cfg_path, state_path, false).ok()?;
+    for s in &mut r.secs {
+        s.ticked.clear();
+        s.remember = false;
+    }
+    Some(r)
+}
+
+/// `--profile NAME [PRESET]`: one window with Code | Chats | Research for a project, and presets
+/// that tick all three at once. Code is ready at once; chats and research load when their tab
+/// is clicked or a preset needs them. Without a window a named preset loads as saved.
+fn load_profile(args: &Args, name: &str, cfg_path: &str, state_path: &str) -> i32 {
+    let cfg_dir = util::dirname(cfg_path);
+    let (names_path, ui_path) = (util::join(&cfg_dir, "names.json"), util::join(&cfg_dir, "ui.json"));
+    let (reg_path, presets_path) = (util::join(&cfg_dir, "sessions.json"), util::join(&cfg_dir, "contexts.json"));
+    let profiles_path = util::join(&cfg_dir, "profiles.json");
+    let no_popup = args.no_popup || std::env::var_os("RESEARCHER_NO_POPUP").is_some_and(|v| !v.is_empty());
+    let name = name.trim().to_lowercase();
+    if !popup::valid_preset(&name) {
+        println!("bad profile name: {name} (use lowercase letters, digits, . _ -)");
+        return 2;
+    }
+    let cfg = match library::load_config(cfg_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("CONFIG ERROR: {e}");
+            return 6;
+        }
+    };
+    let pcfg = cfg.get("profiles").and_then(|p| p.get(&name)).and_then(toml::Value::as_table);
+    let root = pcfg.and_then(|p| p.get("root")).and_then(toml::Value::as_str).map(util::user_path);
+    let globs = match library::str_list(pcfg.and_then(|p| p.get("code")), &format!("[profiles.{name}] code")) {
+        Ok(g) if g.is_empty() => vec!["*".to_string()],
+        Ok(g) => g,
+        Err(e) => {
+            println!("CONFIG ERROR: {e}");
+            return 6;
+        }
+    };
+    if let Some(r) = root.as_deref().filter(|r| !std::path::Path::new(r).is_dir()) {
+        println!("NO ROOT: [profiles.{name}] root = {r} is not a folder; nothing loaded");
+        return 6;
+    }
+    let presets = state::profile_presets(&profiles_path, &name);
+    if args.list {
+        if presets.is_empty() {
+            println!("profile {name}: no presets saved yet");
+        }
+        for (p, l) in &presets {
+            println!(
+                "{p:20} {:>4} files {:>4} chats {:>4} docs",
+                l["code"].len(),
+                l["chats"].len(),
+                l["research"].len()
+            );
+        }
+        return 0;
+    }
+    let wanted = args.sets.first().map(|p| p.trim().to_lowercase());
+    let selected = match &wanted {
+        None => None,
+        Some(w) => match presets.iter().position(|(p, _)| p == w) {
+            Some(i) => Some(i),
+            None => {
+                let known: Vec<&str> = presets.iter().map(|(p, _)| p.as_str()).collect();
+                println!("unknown preset {w} for profile {name}; known: {}", known.join(", "));
+                return 2;
+            }
+        },
+    };
+    let files = root.as_deref().map(|r| code::scan(r, &globs));
+    let chat_out = args.out.clone().unwrap_or_else(cache_home);
+    let pname = vec![name.clone()];
+    let cargs = sessions::ContextArgs {
+        names: &pname,
+        setup: false,
+        list: false,
+        reg_path: &reg_path,
+        presets_path: &presets_path,
+        out_dir: &chat_out,
+        cfg_path,
+        ui_path: &ui_path,
+    };
+    let sessions_on = sessions::settings(&cfg).is_some();
+    let has_library = args.library.is_some()
+        || std::env::var("RESEARCHER_LIBRARY").is_ok_and(|l| !l.is_empty())
+        || library::cfg_str(&cfg, "library").ok().flatten().is_some_and(|l| !l.is_empty());
+
+    // tabs in bar order: Code | Chats | Research; picks come back the same way
+    let mut code_pick: Option<BTreeSet<String>> = None;
+    let mut chat_pick: Option<TabPick> = None;
+    let mut research_pick: Option<TabPick> = None;
+    let mut chats: Option<sessions::Chats> = None;
+    let mut research: Option<Research> = None;
+    let mut save_as: Option<String> = None;
+
+    if no_popup {
+        let Some(i) = selected else {
+            println!("NO POPUP: profile {name}: name a preset to load it without a window; nothing loaded");
+            return 5;
+        };
+        let lists = &presets[i].1;
+        let set = |k: &str| -> BTreeSet<String> { lists[k].iter().cloned().collect() };
+        if files.is_some() && !lists["code"].is_empty() {
+            code_pick = Some(set("code"));
+        }
+        if sessions_on && !lists["chats"].is_empty() {
+            chats = sessions::prep(&cfg, &cargs, true).ok();
+            chat_pick = Some(profile_pick(&name, set("chats")));
+        }
+        if has_library && !lists["research"].is_empty() {
+            research = profile_research(args, cfg_path, state_path);
+            research_pick = Some(profile_pick("all", set("research")));
+        }
+    } else {
+        let later_chats: Arc<Mutex<Option<sessions::Chats>>> = Arc::new(Mutex::new(None));
+        let later_research: Arc<Mutex<Option<Research>>> = Arc::new(Mutex::new(None));
+        let mut tabs: Vec<popup::TabSlot> = Vec::new();
+        let mut kinds: Vec<&str> = Vec::new();
+        if let Some(f) = &files {
+            tabs.push(popup::TabSlot::Ready(Box::new(code_tab(f, &ui_path))));
+            kinds.push("code");
+        }
+        if sessions_on {
+            let (got, cfg) = (Arc::clone(&later_chats), cfg.clone());
+            let (reg, pre, out, cp, ui, n) = (
+                reg_path.clone(),
+                presets_path.clone(),
+                chat_out.clone(),
+                cfg_path.to_string(),
+                ui_path.clone(),
+                pname.clone(),
+            );
+            let load = move || {
+                let a = sessions::ContextArgs {
+                    names: &n,
+                    setup: false,
+                    list: false,
+                    reg_path: &reg,
+                    presets_path: &pre,
+                    out_dir: &out,
+                    cfg_path: &cp,
+                    ui_path: &ui,
+                };
+                let mut c = sessions::prep(&cfg, &a, true).ok()?;
+                for s in &mut c.secs {
+                    s.ticked.clear();
+                }
+                let mut tab = sessions::tab(&c, &ui);
+                tab.look.no_remember = true;
+                *got.lock().ok()? = Some(c);
+                Some(tab)
+            };
+            tabs.push(popup::TabSlot::Later { chats: true, code: false, load: Box::new(load) });
+            kinds.push("chats");
+        }
+        if has_library {
+            let got = Arc::clone(&later_research);
+            let (a, cp, sp, np, ui, title) = (
+                args.clone(),
+                cfg_path.to_string(),
+                state_path.to_string(),
+                names_path.clone(),
+                ui_path.clone(),
+                format!("research for {name}"),
+            );
+            let load = move || {
+                let mut r = profile_research(&a, &cp, &sp)?;
+                let mut tab = research_tab(&mut r, &np, &ui);
+                tab.look.no_remember = true;
+                tab.look.titles.entry("all".into()).or_insert(title);
+                *got.lock().ok()? = Some(r);
+                Some(tab)
+            };
+            tabs.push(popup::TabSlot::Later { chats: false, code: false, load: Box::new(load) });
+            kinds.push("research");
+        }
+        if tabs.is_empty() {
+            println!(
+                "NOTHING TO SHOW: profile {name} has no root (code), sessions are off and there is no library; \
+                 nothing loaded"
+            );
+            return 6;
+        }
+        let profile = popup::ProfileUi {
+            name: name.clone(),
+            presets: presets
+                .iter()
+                .map(|(p, l)| (p.clone(), kinds.iter().map(|k| l[*k].iter().cloned().collect()).collect()))
+                .collect(),
+            selected,
+        };
+        let start = args.start.as_deref().and_then(|s| kinds.iter().position(|k| *k == s)).unwrap_or(0);
+        let command = format!("researcher --profile {name} {}", args.sets.join(" "));
+        match popup::popup(tabs, start, false, command.trim_end(), Some(profile)) {
+            Err(e) => {
+                println!("NO POPUP ({e}): run it with a preset name and --no-popup to load without a window");
+                return 5;
+            }
+            Ok(Outcome::Cancelled) => {
+                println!("CANCELLED: the user closed the popup, nothing loaded");
+                return 3;
+            }
+            Ok(Outcome::Timeout) => {
+                println!("TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded");
+                return 4;
+            }
+            Ok(Outcome::Picked(picked, save)) => {
+                save_as = save;
+                for (k, p) in kinds.iter().zip(picked) {
+                    match *k {
+                        "code" => code_pick = p.map(|t| t.picks.into_iter().flat_map(|p| p.ticked).collect()),
+                        "chats" => chat_pick = p,
+                        _ => research_pick = p,
+                    }
+                }
+            }
+        }
+        chats = later_chats.lock().ok().and_then(|mut g| g.take());
+        research = later_research.lock().ok().and_then(|mut g| g.take());
+    }
+
+    if let Some(preset) = &save_as {
+        let ticked = |p: &Option<TabPick>| -> Vec<String> {
+            p.as_ref().map_or_else(Vec::new, |t| t.picks.iter().flat_map(|p| p.ticked.iter().cloned()).collect())
+        };
+        let lists = BTreeMap::from([
+            ("code".to_string(), code_pick.iter().flatten().cloned().collect::<Vec<_>>()),
+            ("chats".to_string(), ticked(&chat_pick)),
+            ("research".to_string(), ticked(&research_pick)),
+        ]);
+        match state::save_profile_preset(&profiles_path, &name, preset, &lists) {
+            Ok(()) => println!(
+                "SAVED profile preset {name}/{preset}: {} files, {} chats, {} docs",
+                lists["code"].len(),
+                lists["chats"].len(),
+                lists["research"].len()
+            ),
+            Err(e) => println!("could not save the profile preset to {profiles_path}: {e}"),
+        }
+    }
+
+    // print order: the tab it opened on first, then the bar order (code, chats, research)
+    let first = args.start.as_deref().unwrap_or("code");
+    let mut order = vec!["code", "chats", "research"];
+    order.sort_by_key(|k| *k != first);
+    let mut code = 0;
+    for k in order {
+        let c = match k {
+            "code" => match (&files, code_pick.take()) {
+                (Some(f), Some(t)) if !t.is_empty() => code_finish(f, &t),
+                _ => 0,
+            },
+            "chats" => match (chats.take(), chat_pick.take()) {
+                (Some(c), Some(p)) if p.picks.iter().any(|p| !p.ticked.is_empty()) => {
+                    sessions::finish(c, &cfg, &cargs, Some(p))
+                }
+                _ => 0,
+            },
+            _ => match (research.take(), research_pick.take()) {
+                (Some(r), Some(p)) if p.picks.iter().any(|p| !p.ticked.is_empty()) => {
+                    research_finish(r, Some(p), false, cfg_path, state_path, &names_path, &ui_path)
+                }
+                _ => 0,
+            },
+        };
+        if code == 0 {
+            code = c;
+        }
+    }
+    code
 }
 
 #[cfg(test)]
