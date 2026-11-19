@@ -1046,61 +1046,24 @@ fn both_env() -> (Sess, PathBuf) {
     (s, presets)
 }
 
-/// Line numbers of the first research path and the first CHAT line.
-fn first_lines(out: &str) -> (usize, usize) {
-    let doc = out.lines().position(|l| l.contains("chars  ") && l.contains("memory-a")).expect("a research line");
-    let chat = out.lines().position(|l| l.starts_with("CHAT ")).expect("a chat line");
-    (doc, chat)
-}
-
 #[test]
-fn a_research_load_also_loads_the_saved_chat_preset_research_first() {
+fn without_a_window_only_the_own_side_loads_and_no_chat_is_scanned() {
     let (s, _) = both_env();
+    // the Chats tab only loads when it is clicked: no window, no click, no scan
     let (code, out) = s.e.run(&["rust"]);
     assert_eq!(code, 0, "{out}");
-    let (doc, chat) = first_lines(&out);
-    assert!(doc < chat, "{out}");
-    assert!(out.contains(&format!("CHAT \"Second one\" ({SID2})")), "{out}");
-    assert!(out.contains("total: 1 docs") && out.contains("total: 1 chats"), "{out}");
-    // one popup that loads both writes two records: library + chat
-    let recs = s.e.records();
-    assert_eq!(recs.len(), 2, "{out}");
-    assert_eq!(recs[0]["fmt"]["chat"], 0);
-    assert_eq!(recs[1]["fmt"]["chat"], 1);
-}
-
-#[test]
-fn start_decides_which_side_prints_first() {
-    let (s, _) = both_env();
-    let (code, out) = s.e.run(&["rust", "--start", "chats"]);
+    assert!(out.contains("total: 1 docs") && !out.contains("CHAT ") && !out.contains("chats"), "{out}");
+    assert!(!s.reg.exists(), "a research load scanned the chats");
+    assert_eq!(s.e.records().len(), 1);
+    // and the other way round: a chat load does not touch the research
+    let (code, out) = s.e.run(&["--context", "default", "--start", "research"]);
     assert_eq!(code, 0, "{out}");
-    let (doc, chat) = first_lines(&out);
-    assert!(chat < doc, "{out}");
-    let (code, out) = s.e.run(&["--context", "default"]);
-    assert_eq!(code, 0, "{out}");
-    let (doc, chat) = first_lines(&out);
-    assert!(chat < doc, "{out}"); // --context opens on Chats
-    let (_, out) = s.e.run(&["--context", "--start", "research"]);
-    let (doc, chat) = first_lines(&out);
-    assert!(doc < chat, "{out}");
+    assert!(out.contains(&format!("CHAT \"Second one\" ({SID2})")) && !out.contains("docs"), "{out}");
+    assert_eq!(s.e.records().len(), 2);
     assert_eq!(s.e.run(&["rust", "--start", "nope"]).0, 2); // clap refuses it
-}
-
-#[test]
-fn the_other_side_loads_only_a_saved_choice() {
-    let (s, presets) = context_env();
-    // no saved chat preset `default`, no saved research default: each side loads only its own
-    let (code, out) = s.e.run(&["rust"]);
-    assert_eq!(code, 0, "{out}");
-    assert!(!out.contains("CHAT ") && !out.contains("chats"), "{out}");
-    save_preset(&presets, "work", &[SID2]);
-    let (code, out) = s.e.run(&["--context", "work"]);
-    assert_eq!(code, 0, "{out}");
-    assert!(!out.contains("docs"), "{out}");
-    assert!(!s.e.conf_dir.join("choices.json").exists()); // and saves nothing for it
     // a problem on the other side is not this command's problem
     write(&s.e.cfg, &(read(&s.e.cfg).replace("default_set = \"rust\"", "default_set = \"ghost\"")));
-    assert_eq!(s.e.run(&["--context", "work"]).0, 0);
+    assert_eq!(s.e.run(&["--context", "default"]).0, 0);
 }
 
 #[test]
