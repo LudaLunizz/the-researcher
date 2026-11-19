@@ -889,7 +889,7 @@ def popup(tabs, start, setup, command=""):
                 twice.connect("pressed", lambda _g, n, _x, _y, si=si, d=r["doc"], s=shown:
                               n == 2 and start_edit(si, d, s))
                 cb.add_controller(twice)
-                pen = Gtk.Button(label="✏", tooltip_text="Rename")
+                pen = Gtk.Button(label="rename", tooltip_text="Rename (or double-click the name)")
                 pen.add_css_class("flat")
                 pen.connect("clicked", lambda _b, si=si, d=r["doc"], s=shown: start_edit(si, d, s))
                 line.append(cb)
@@ -960,7 +960,7 @@ def popup(tabs, start, setup, command=""):
                 lbl.set_markup(f"<big><b>{esc(sec['title'] or sec['name'])}</b></big>{small}")
                 top.append(lbl)
                 if not st["chats"]:
-                    pen = Gtk.Button(label="✏", tooltip_text="Give this set a display name")
+                    pen = Gtk.Button(label="rename", tooltip_text="Give this set a display name")
                     pen.add_css_class("flat")
                     pen.connect("clicked", lambda _b, si=si, t=sec["title"]: start_edit(si, "", t))
                     top.append(pen)

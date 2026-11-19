@@ -241,9 +241,9 @@ When sessions are switched on, every load opens one window with two tabs: **Chat
 
 **Time chips.** Above the list: **Day | Week | Month | All** (the last 24 hours, 7 days, 30 days), each with its count. Chats go by when they were last active, documents by when their file last changed. **Group by: time** puts the rows under Today, Yesterday, Earlier this week, Earlier this month and Older, newest first, with the project folder as a small label on each chat; **folder** is the old view. A ticked row the chip hides keeps its tick and is still loaded; the line above the buttons says how many. The window remembers the chip and the grouping per tab in `ui.json` (first time: chats on Week by time, research on All by folder).
 
-**Names.** ✏ next to a row (or a double-click on it) renames it in place; Enter keeps the name, Esc undoes it.
+**Names.** **rename** next to a row (or a double-click on it) renames it in place; Enter keeps the name, Esc undoes it.
 - A chat's name goes into `sessions.json`, the same as `--rename`; an empty name gives it its first prompt back.
-- A document's name and a research set's name (✏ next to the set) go into `names.json`; your files are never touched. The window shows the name with the real id in small text, the filter finds both, and the output gets a `DOC "name" (id)` line before the document's path.
+- A document's name and a research set's name (**rename** next to the set) go into `names.json`; your files are never touched. The window shows the name with the real id in small text, the filter finds both, and the output gets a `DOC "name" (id)` line before the document's path.
 - A chat preset has a name field next to **Remember**: a new name moves the saved ticks to it. Lowercase letters, digits, `.`, `_` and `-`, and not the name of another preset.
 
 ## Safety
