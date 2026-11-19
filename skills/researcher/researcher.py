@@ -595,6 +595,57 @@ def save_ui(path, chats, chip, by_time):
     save_conf(path, allui)
 
 
+def profile_presets(path, profile):
+    """The presets of a project profile in profiles.json, in saved order: [(name, {"code" |
+    "chats" | "research": [row ids]})]."""
+    presets = (load_conf(path).get(profile) or {}).get("presets")
+    if not isinstance(presets, dict):
+        return []
+    return [(n, {k: [x for x in (v or {}).get(k, []) if isinstance(x, str)] for k in ("code", "chats", "research")})
+            for n, v in presets.items()]
+
+
+def save_profile_preset(path, profile, preset, lists):
+    """Save (or replace) one preset of a profile."""
+    allp = load_conf(path)
+    entry = allp.get(profile)
+    if not isinstance(entry, dict) or not isinstance(entry.get("presets"), dict):
+        entry = allp[profile] = {"presets": {}}
+    entry["presets"][preset] = lists
+    save_conf(path, allp)
+
+
+CODE_SKIP_DIRS = ("target", "node_modules", "__pycache__", "dist", "build", "venv")
+CODE_MAX_BYTES = 1_000_000
+
+
+def code_scan(root, globs):
+    """Text files under `root` whose relative path matches one of `globs` (`*` crosses folders):
+    {id: (path, bytes, mtime)}. Hidden files and folders, symlinks, binaries and files over 1 MB
+    are left out."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in CODE_SKIP_DIRS
+                       and not os.path.islink(os.path.join(dirpath, d))]
+        rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        for f in filenames:
+            path = os.path.join(dirpath, f)
+            doc = f if rel == "." else f"{rel}/{f}"
+            if f.startswith(".") or os.path.islink(path):
+                continue
+            try:
+                st = os.stat(path)
+                if st.st_size > CODE_MAX_BYTES or not any(fnmatch.fnmatchcase(doc, g) for g in globs):
+                    continue
+                with open(path, "rb") as fh:
+                    if b"\0" in fh.read(8192):
+                        continue
+            except OSError:
+                continue
+            out[doc] = (path, st.st_size, int(st.st_mtime))
+    return dict(sorted(out.items()))
+
+
 def bad_preset_name(secs, taken):
     """Why a remembered chat preset name cannot be saved, or None."""
     seen = set()
@@ -640,7 +691,7 @@ def subtitle(sec, chats):
 def tab_state(tab):
     """The window's working copy of one tab: rows as small dicts."""
     look, sizes = tab["look"], tab["sizes"]
-    chats = bool(look.get("chats"))
+    chats, code = bool(look.get("chats")), bool(look.get("code"))
     labels, defaults = look.get("labels", {}), look.get("defaults", {})
     notes, groups, times = look.get("notes", {}), look.get("groups", {}), look.get("times", {})
     titles = look.get("titles", {})
@@ -656,7 +707,8 @@ def tab_state(tab):
              "main": [row(d, s) for d in s["main"]], "other": [row(d, s) for d in s["other"]],
              "other_open": not s["main"], "saved": set(s["ticked"]), "first": s["first"],
              "remember": s["remember"]} for s in tab["sections"]]
-    return {"chats": chats, "secs": secs, "sizes": sizes, "filter": "",
+    return {"chats": chats, "code": code, "no_remember": bool(look.get("no_remember")),
+            "secs": secs, "sizes": sizes, "filter": "",
             "chip": look.get("chip", "all"), "by_time": bool(look.get("by_time")), "timed": bool(times),
             "renames": {}, "taken": set(look.get("taken", ()))}
 
@@ -693,16 +745,28 @@ def chip_count(st, chip, now):
                if chip == "all" or (w is not None and chip_holds(chip, now, local_time(w))))
 
 
-def popup(tabs, start, setup, command=""):
+def tab_name(st_or_kind):
+    return "Code" if st_or_kind.get("code") else "Chats" if st_or_kind.get("chats") else "Research"
+
+
+def tab_noun(st, short=False):
+    return "files" if st["code"] else "chats" if st["chats"] else ("docs" if short else "documents")
+
+
+def popup(tabs, start, setup, command="", profile=None):
     """Show the chooser on tab `start` and wait. Returns one pick per tab ({"picks": [{name, ticked,
     remember, save_as, title}], "renames", "chip", "by_time"}), None if cancelled or "timeout".
     Raises RuntimeError when no display/GTK 4 is available.
 
     A tab is {"sections", "sizes": {id: chars} (readable rows only), "look": {"chats", "labels",
     "defaults", "notes", "groups", "times", "titles", "taken", "chip", "by_time"}}, or
-    {"chats": bool, "loader": fn} for a tab that loads only when it is first clicked (fn returns
+    {"chats": bool, "code": bool, "loader": fn} for a tab that loads only when it is first clicked (fn returns
     a tab or None; it runs in a thread so the window keeps drawing). A tab never opened gives
-    None in the result."""
+    None in the result.
+
+    profile: {"name", "presets": [(name, [row ids per tab])], "selected": index or None}: a row of
+    preset buttons that tick every tab at once, and "save these ticks as the profile preset".
+    The result is then (picks, preset name to save or None)."""
     try:
         import gi
         gi.require_version("Gtk", "4.0")
@@ -717,7 +781,10 @@ def popup(tabs, start, setup, command=""):
     result = {"value": None}
     import threading
     states = [None if "loader" in t else tab_state(t) for t in tabs]
-    kinds = [bool(t["chats"]) if "loader" in t else bool(t["look"].get("chats")) for t in tabs]
+    kinds = [{"chats": bool(t["chats"]), "code": bool(t.get("code"))} if "loader" in t else
+             {"chats": bool(t["look"].get("chats")), "code": bool(t["look"].get("code"))} for t in tabs]
+    want = [None] * len(tabs)  # ticks a profile preset asked for before the tab was loaded
+    prof = {"picked": None, "save": False, "name": ""}
     loaders = [t.get("loader") for t in tabs]
     loading = [False] * len(tabs)
     cur = {"i": min(start, len(states) - 1), "edit": None}  # edit: (tab, section, row id or "", text)
@@ -729,14 +796,34 @@ def popup(tabs, start, setup, command=""):
             box.remove(c)
 
     if len(tabs) == 1:
-        what = "choose chats to load" if kinds[0] else "choose research to load"
+        what = "choose chats to load" if kinds[0]["chats"] else "choose research to load"
     else:
-        what = "choose chats and research to load"
+        what = "choose code, chats and research to load" if profile else "choose chats and research to load"
     win = Gtk.Window(title="The Researcher - " + ("change saved presets" if setup else what))
     win.set_default_size(760, 800)
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     for m in ("top", "bottom", "start", "end"):
         getattr(outer, f"set_margin_{m}")(14)
+    if profile:
+        prow = Gtk.Box(spacing=6)
+        plabel = Gtk.Label()
+        plabel.set_markup(f"<big><b>Profile {esc(profile['name'])}:</b></big>")
+        prow.append(plabel)
+        preset_buttons = []
+        pgroup = None
+        for i, (pname, _) in enumerate(profile["presets"]):
+            b = Gtk.ToggleButton(label=pname)
+            if pgroup is not None:
+                b.set_group(pgroup)
+            pgroup = pgroup or b
+            b.connect("toggled", lambda b, i=i: b.get_active() and apply_preset(i))
+            prow.append(b)
+            preset_buttons.append(b)
+        if not profile["presets"]:
+            hint = Gtk.Label()
+            hint.set_markup("<small><span alpha='60%'>no presets yet: tick what you need, then save it below</span></small>")
+            prow.append(hint)
+        outer.append(prow)
     tabbar = Gtk.Box(spacing=6)
     tab_buttons = []
     if len(states) > 1:
@@ -763,6 +850,15 @@ def popup(tabs, start, setup, command=""):
     outer.append(scroll)
     total = Gtk.Label(xalign=0)
     outer.append(total)
+    if profile:
+        srow = Gtk.Box(spacing=6)
+        save_cb = Gtk.CheckButton(label="Save these ticks as the profile preset")
+        save_entry = Gtk.Entry(width_chars=16, tooltip_text="An existing name is replaced")
+        save_cb.connect("toggled", lambda b: (prof.__setitem__("save", b.get_active()), update()))
+        save_entry.connect("changed", lambda e: (prof.__setitem__("name", e.get_text()), update()))
+        srow.append(save_cb)
+        srow.append(save_entry)
+        outer.append(srow)
     error = Gtk.Label(xalign=0, wrap=True)
     outer.append(error)
     bar = Gtk.Box(spacing=8, halign=Gtk.Align.END)
@@ -786,13 +882,17 @@ def popup(tabs, start, setup, command=""):
             n += len(c)
             hidden += tab_hidden(st, now)
             if c or len(states) == 1:
-                parts.append(f"{len(c)} {'chats' if st['chats'] else 'documents'}")
-                short.append(f"{len(c)} {'chats' if st['chats'] else 'docs'}")
+                parts.append(f"{len(c)} {tab_noun(st)}")
+                short.append(f"{len(c)} {tab_noun(st, True)}")
         line = f"{' + '.join(parts) or 'nothing ticked'}, ~{k:.0f}k tokens" + ("" if setup else " will be loaded")
         if hidden:
             line += f" ({hidden} ticked but hidden by the time chip)"
         total.set_markup(f"<b>{esc(line)}</b>")
-        bad = next((b for st in states if st and st["chats"] for b in [bad_preset_name(st["secs"], st["taken"])] if b), None)
+        bad = next((b for st in states if st and st["chats"] and not st["no_remember"]
+                    for b in [bad_preset_name(st["secs"], st["taken"])] if b), None)
+        if profile and prof["save"] and not PRESET_RE.fullmatch(prof["name"].strip()):
+            bad = ('"' + prof["name"].strip() + '" cannot be a preset name: '
+                   'use lowercase letters, digits, . _ -')
         error.set_markup(f"<span foreground='#ff6666'>{esc(bad)}</span>" if bad else "")
         if setup:
             ok.set_label("Save presets")
@@ -800,12 +900,12 @@ def popup(tabs, start, setup, command=""):
             ok.set_label("Load " + "".join(parts))
         else:
             ok.set_label("Load " + " + ".join(short) if short else "Load")
-        ok.set_sensitive((setup or n > 0) and not bad and cur["edit"] is None)
+        ok.set_sensitive((setup or n > 0) and not bad and cur["edit"] is None and not any(loading))
         for i, b in enumerate(tab_buttons):
             st = states[i]
             status = (f"{len(tab_chosen(st))} ticked" if st else "loading…" if loading[i]
                       else "click to load" if loaders[i] else "nothing to show")
-            b.set_label(f"{'Chats' if kinds[i] else 'Research'} ({status})")
+            b.set_label(f"{tab_name(kinds[i])} ({status})")
 
     def visible(st, r, short):
         if not in_chip(st, r, now):
@@ -885,15 +985,16 @@ def popup(tabs, start, setup, command=""):
                 cb.set_child(l)
                 cb.set_active(r["on"])
                 cb.connect("toggled", lambda cb, r=r: (r.__setitem__("on", cb.get_active()), update()))
-                twice = Gtk.GestureClick()
-                twice.connect("pressed", lambda _g, n, _x, _y, si=si, d=r["doc"], s=shown:
-                              n == 2 and start_edit(si, d, s))
-                cb.add_controller(twice)
-                pen = Gtk.Button(label="rename", tooltip_text="Rename (or double-click the name)")
-                pen.add_css_class("flat")
-                pen.connect("clicked", lambda _b, si=si, d=r["doc"], s=shown: start_edit(si, d, s))
                 line.append(cb)
-                line.append(pen)
+                if not st["code"]:  # source files keep their path
+                    twice = Gtk.GestureClick()
+                    twice.connect("pressed", lambda _g, n, _x, _y, si=si, d=r["doc"], s=shown:
+                                  n == 2 and start_edit(si, d, s))
+                    cb.add_controller(twice)
+                    pen = Gtk.Button(label="rename", tooltip_text="Rename (or double-click the name)")
+                    pen.add_css_class("flat")
+                    pen.connect("clicked", lambda _b, si=si, d=r["doc"], s=shown: start_edit(si, d, s))
+                    line.append(pen)
             else:
                 l = Gtk.Label(xalign=0)
                 l.set_markup(f"<s>{esc(shown)}</s>  <span foreground='#ff6666'>MISSING or unreadable</span>")
@@ -906,10 +1007,10 @@ def popup(tabs, start, setup, command=""):
             clear(chips)
             clear(body)
             if loading[cur["i"]]:
-                what = "earlier chats (the first time can take a while)" if kinds[cur["i"]] else "research"
+                what = "earlier chats (the first time can take a while)" if kinds[cur["i"]]["chats"] else "research"
                 head.set_markup(f"<big><b>Loading {what}…</b></big>")
             else:
-                head.set_markup("<big><b>" + ("No earlier chats to show." if kinds[cur["i"]] else
+                head.set_markup("<big><b>" + ("No earlier chats to show." if kinds[cur["i"]]["chats"] else
                                 "No research to show: set `default_set` (and a library) in the config.")
                                 + "</b></big>")
             update()
@@ -919,13 +1020,14 @@ def popup(tabs, start, setup, command=""):
             head.set_markup(f"<big><b>Change the saved presets</b></big> for {names}\n"
                             "Tick what each should contain, then press <b>Save presets</b>. Nothing is loaded.")
         else:
-            whatnow = "earlier chats" if st["chats"] else "research"
+            whatnow = "source files" if st["code"] else "earlier chats" if st["chats"] else "research"
             head.set_markup(f"<big><b>{esc(host)} wants to load {whatnow}</b></big> for {names}\n"
                             "Tick what this session needs, then press <b>Load</b>. Nothing is sent to "
                             f"{esc('Claude' if host == 'Claude Code' else host)} until then; "
                             "<b>Cancel</b> loads nothing."
                             + (f"\n<small>Asked by: <tt>{esc(command)}</tt></small>" if command else ""))
-        search.set_placeholder_text("Filter: words from the name, the first prompt or the folder"
+        search.set_placeholder_text("Filter: words from the path" if st["code"] else
+                                    "Filter: words from the name, the first prompt or the folder"
                                     if st["chats"] else "Filter: words from the name or the id")
         clear(chips)
         if st["timed"]:
@@ -959,7 +1061,7 @@ def popup(tabs, start, setup, command=""):
                 small = f"  <small><span alpha='60%'><tt>{esc(sec['name'])}</tt></span></small>" if sec["title"] else ""
                 lbl.set_markup(f"<big><b>{esc(sec['title'] or sec['name'])}</b></big>{small}")
                 top.append(lbl)
-                if not st["chats"]:
+                if not st["chats"] and not st["code"]:
                     pen = Gtk.Button(label="rename", tooltip_text="Give this set a display name")
                     pen.add_css_class("flat")
                     pen.connect("clicked", lambda _b, si=si, t=sec["title"]: start_edit(si, "", t))
@@ -1008,6 +1110,8 @@ def popup(tabs, start, setup, command=""):
                 ex.set_child(inner)
                 body.append(ex)
                 add_rows(inner, st, si, sec["other"], 0)
+            if st["no_remember"]:
+                continue
             rem = Gtk.Box(spacing=6)
             rem.set_margin_start(12)
             rem.set_margin_top(6)
@@ -1042,6 +1146,9 @@ def popup(tabs, start, setup, command=""):
         def loaded(tab):
             loading[i] = False
             states[i] = tab_state(tab) if tab else None
+            if states[i] is not None and want[i] is not None:
+                tick_only(states[i], want[i])
+                want[i] = None
             if not cur.get("closed"):
                 render()
 
@@ -1052,6 +1159,24 @@ def popup(tabs, start, setup, command=""):
                 tab = None
             GLib.idle_add(lambda: (loaded(tab), False)[1])
         threading.Thread(target=work, daemon=True).start()
+
+    def tick_only(st, ids):
+        for r in tab_rows(st):
+            r["on"] = r["readable"] and r["doc"] in ids
+
+    def apply_preset(i):
+        """Tick what profile preset i holds, in every tab (loading the tabs it needs)."""
+        pname, lists = profile["presets"][i]
+        for j, ids in enumerate(lists):
+            if states[j] is not None:
+                tick_only(states[j], set(ids))
+            else:
+                if ids:
+                    open_tab(j)
+                want[j] = set(ids)
+        prof["picked"] = i
+        save_entry.set_text(pname)
+        later(render)
 
     def switch(i):
         cur["i"], cur["edit"] = i, None
@@ -1066,12 +1191,16 @@ def popup(tabs, start, setup, command=""):
         loop.quit()
 
     def done(*_):
-        finish([{"picks": [{"name": s["name"], "ticked": {r["doc"] for r in s["main"] + s["other"] if r["on"]},
+        picks = [{"picks": [{"name": s["name"], "ticked": {r["doc"] for r in s["main"] + s["other"] if r["on"]},
                             "remember": s["remember"], "save_as": s["save_as"].strip(),
                             "title": s["title"].strip() if s["title"].strip() != s["title0"] else None}
                            for s in st["secs"]],
                  "renames": dict(st["renames"]), "chip": st["chip"], "by_time": st["by_time"]} if st else None
-                for st in states])
+                 for st in states]
+        if profile:
+            finish((picks, prof["name"].strip() if prof["save"] else None))
+        else:
+            finish(picks)
 
     def refilter(*_):
         if states[cur["i"]] is None:
@@ -1098,6 +1227,8 @@ def popup(tabs, start, setup, command=""):
     win.add_controller(keys)
     GLib.timeout_add_seconds(POPUP_TIMEOUT, lambda: (finish("timeout"), False)[1])
     open_tab(cur["i"])  # --start on the other side: that tab is wanted, load it now
+    if profile and profile.get("selected") is not None:
+        preset_buttons[profile["selected"]].set_active(True)  # the preset named on the command line
     render()
     win.present()
     loop.run()
@@ -2206,8 +2337,12 @@ def main(argv=None):
     ap.add_argument("--context", action="store_true",
                     help="pick earlier Claude Code chats (all folders) to load as context; "
                          "SET names are presets")
-    ap.add_argument("--start", choices=("chats", "research"),
-                    help="the tab the window opens on (default: chats with --context, research otherwise)")
+    ap.add_argument("--start", choices=("code", "chats", "research"),
+                    help="the tab the window opens on (default: chats with --context, code with --profile, "
+                         "research otherwise)")
+    ap.add_argument("--profile", metavar="NAME",
+                    help="a project profile: code, chats and research in one window, with presets; "
+                         "SET = the preset")
     ap.add_argument("--limit", type=int, default=30, help="sessions shown by --sessions (default 30)")
     ap.add_argument("--init", nargs="?", const="", metavar="LIBRARY", help="write a starter config")
     ap.add_argument("--config", help="config.toml path (default ~/.config/researcher/config.toml)")
@@ -2283,6 +2418,8 @@ def main(argv=None):
                              os.path.join(os.path.dirname(cfg_path), "sessions.json"),
                              args.out or cache_home())
 
+    if args.profile:
+        return load_profile(args, args.profile, cfg_path, state_path)
     return load_both(args, cfg_path, state_path)
 
 
@@ -2540,6 +2677,196 @@ def load_both(args, cfg_path, state_path):
     codes = {t: side(t) for t in ((True, False) if chats_first else (False, True))}
     # the command's own side decides the exit code; the other side only adds to it
     return codes[args.context] or codes[not args.context]
+
+
+def code_finish(files, ticked):
+    """Print the ticked source files (by path: Claude reads them itself). No usage record."""
+    n = size = 0
+    for doc, (path, nbytes, _) in files.items():
+        if doc in ticked:
+            print(f"CODE {doc}")
+            print(f"{nbytes:>7} bytes  {path}")
+            n, size = n + 1, size + nbytes
+    for doc in sorted(d for d in ticked if d not in files):
+        print(f"MISSING  code {doc} (not under the profile root any more)")
+    print(f"total: {n} files, {size} bytes")
+    return 0
+
+
+def code_tab(files, ui_path):
+    """The popup tab of a profile's source files."""
+    chip, by_time = ui_state(ui_path, False)
+    ids = list(files)
+    sec = {"name": "code", "kind": "custom", "docs": ids, "main": ids, "other": [], "new": set(),
+           "ticked": set(), "remember": False, "first": False}
+    return {"sections": [sec], "sizes": {d: f[1] for d, f in files.items()},
+            "look": {"code": True, "no_remember": True, "chip": chip, "by_time": by_time,
+                     "times": {d: f[2] for d, f in files.items()}}}
+
+
+def profile_pick(name, ticked):
+    """A pick of exactly `ticked` in the one section of a profile tab."""
+    return {"picks": [{"name": name, "ticked": set(ticked), "remember": False, "save_as": name,
+                       "title": None}], "renames": {}, "chip": "all", "by_time": False}
+
+
+def profile_research(args, cfg_path, state_path):
+    """Research of a profile: the whole library in one section, nothing saved as a set default."""
+    a = argparse.Namespace(**vars(args))
+    a.sets, a.setup, a.list, a.sync, a.no_popup, a.out = ["all"], False, False, False, True, None
+    r = research_prep(a, cfg_path, state_path)
+    if isinstance(r, int):
+        return None
+    for s in r["secs"]:
+        s["ticked"], s["remember"] = set(), False
+    return r
+
+
+def load_profile(args, name, cfg_path, state_path):
+    """--profile NAME [PRESET]: one window with Code | Chats | Research for a project, and presets
+    that tick all three at once. Code is ready at once; chats and research load when their tab
+    is clicked or a preset needs them. Without a window a named preset loads as saved."""
+    conf_dir = os.path.dirname(cfg_path)
+    names_path, ui_path = os.path.join(conf_dir, "names.json"), os.path.join(conf_dir, "ui.json")
+    profiles_path = os.path.join(conf_dir, "profiles.json")
+    cpaths = {"reg": os.path.join(conf_dir, "sessions.json"), "presets": os.path.join(conf_dir, "contexts.json"),
+              "ui": ui_path}
+    no_popup = args.no_popup or bool(os.environ.get("RESEARCHER_NO_POPUP"))
+    name = name.strip().lower()
+    if not PRESET_RE.fullmatch(name):
+        print(f"bad profile name: {name} (use lowercase letters, digits, . _ -)")
+        return 2
+    try:
+        cfg = load_config(cfg_path)
+    except ConfigError as e:
+        print(f"CONFIG ERROR: {e}")
+        return 6
+    pcfg = (cfg.get("profiles") or {}).get(name) or {}
+    root = os.path.abspath(os.path.expanduser(pcfg["root"])) if pcfg.get("root") else None
+    globs = pcfg.get("code") or ["*"]
+    if root and not os.path.isdir(root):
+        print(f"NO ROOT: [profiles.{name}] root = {root} is not a folder; nothing loaded")
+        return 6
+    presets = profile_presets(profiles_path, name)
+    if args.list:
+        if not presets:
+            print(f"profile {name}: no presets saved yet")
+        for p, l in presets:
+            print(f"{p:20} {len(l['code']):>4} files {len(l['chats']):>4} chats {len(l['research']):>4} docs")
+        return 0
+    selected = None
+    if args.sets:
+        w = args.sets[0].strip().lower()
+        selected = next((i for i, (p, _) in enumerate(presets) if p == w), None)
+        if selected is None:
+            print(f"unknown preset {w} for profile {name}; known: {', '.join(p for p, _ in presets)}")
+            return 2
+    files = code_scan(root, globs) if root else None
+    chat_out = args.out or cache_home()
+    sessions_on = sessions_settings(cfg) is not None
+    has_library = bool(args.library or os.environ.get("RESEARCHER_LIBRARY") or cfg.get("library"))
+
+    picks = {}  # kind -> pick (code: a set of ids)
+    chats = research = None
+    save_as = None
+    later = {}
+    if no_popup:
+        if selected is None:
+            print(f"NO POPUP: profile {name}: name a preset to load it without a window; nothing loaded")
+            return 5
+        lists = presets[selected][1]
+        if files is not None and lists["code"]:
+            picks["code"] = set(lists["code"])
+        if sessions_on and lists["chats"]:
+            chats = context_prep(args, cfg, cpaths, [name], secondary=True)
+            chats = None if isinstance(chats, int) else chats
+            picks["chats"] = profile_pick(name, lists["chats"])
+        if has_library and lists["research"]:
+            research = profile_research(args, cfg_path, state_path)
+            picks["research"] = profile_pick("all", lists["research"])
+    else:
+        tabs, kinds = [], []
+        if files is not None:
+            tabs.append(code_tab(files, ui_path))
+            kinds.append("code")
+        if sessions_on:
+            def load_chats():
+                c = context_prep(args, cfg, cpaths, [name], secondary=True)
+                if isinstance(c, int):
+                    return None
+                for s in c["secs"]:
+                    s["ticked"] = set()
+                tab = context_tab(c, ui_path)
+                tab["look"]["no_remember"] = True
+                later["chats"] = c
+                return tab
+            tabs.append({"chats": True, "loader": load_chats})
+            kinds.append("chats")
+        if has_library:
+            def load_research():
+                r = profile_research(args, cfg_path, state_path)
+                if r is None:
+                    return None
+                tab = research_tab(r, names_path, ui_path)
+                tab["look"]["no_remember"] = True
+                tab["look"]["titles"].setdefault("all", f"research for {name}")
+                later["research"] = r
+                return tab
+            tabs.append({"chats": False, "loader": load_research})
+            kinds.append("research")
+        if not tabs:
+            print(f"NOTHING TO SHOW: profile {name} has no root (code), sessions are off and there is no "
+                  "library; nothing loaded")
+            return 6
+        profile = {"name": name, "selected": selected,
+                   "presets": [(p, [l[k] for k in kinds]) for p, l in presets]}
+        start = kinds.index(args.start) if args.start in kinds else 0
+        try:
+            picked = popup(tabs, start, False, f"researcher --profile {name} {' '.join(args.sets)}".rstrip(),
+                           profile)
+        except RuntimeError as e:
+            print(f"NO POPUP ({e}): run it with a preset name and --no-popup to load without a window")
+            return 5
+        if picked is None:
+            print("CANCELLED: the user closed the popup, nothing loaded")
+            return 3
+        if picked == "timeout":
+            print(f"TIMEOUT: popup closed after {POPUP_TIMEOUT} s without a choice, nothing loaded")
+            return 4
+        tab_picks, save_as = picked
+        for k, p in zip(kinds, tab_picks):
+            if p is not None:
+                picks[k] = {d for q in p["picks"] for d in q["ticked"]} if k == "code" else p
+        chats, research = later.get("chats"), later.get("research")
+
+    if save_as:
+        def ticked(p):
+            return [d for q in p["picks"] for d in q["ticked"]] if p else []
+        lists = {"code": sorted(picks.get("code") or ()), "chats": ticked(picks.get("chats")),
+                 "research": ticked(picks.get("research"))}
+        try:
+            save_profile_preset(profiles_path, name, save_as, lists)
+            print(f"SAVED profile preset {name}/{save_as}: {len(lists['code'])} files, "
+                  f"{len(lists['chats'])} chats, {len(lists['research'])} docs")
+        except OSError as e:
+            print(f"could not save the profile preset to {profiles_path}: {e}")
+
+    # print order: the tab it opened on first, then the bar order (code, chats, research)
+    first = args.start or "code"
+    order = sorted(("code", "chats", "research"), key=lambda k: k != first)
+    code = 0
+    for k in order:
+        p = picks.get(k)
+        if k == "code":
+            c = code_finish(files, p) if files is not None and p else 0
+        elif k == "chats":
+            c = (context_finish(chats, args, cfg, cfg_path, cpaths, chat_out, p)
+                 if chats and p and any(q["ticked"] for q in p["picks"]) else 0)
+        else:
+            c = (research_finish(research, args, cfg_path, state_path, names_path, ui_path, p)
+                 if research and p and any(q["ticked"] for q in p["picks"]) else 0)
+        code = code or c
+    return code
 
 
 if __name__ == "__main__":

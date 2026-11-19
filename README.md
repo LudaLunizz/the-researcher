@@ -193,7 +193,8 @@ researcher --rename ID NAME       rename a tracked session ("" = back to the aut
 researcher --resume ID            print the command that resumes a session
 researcher --session-load ID      write a session's conversation as a .txt to load as context
 researcher --context [PRESET ...] pick earlier chats in a popup and load them (see Earlier chats)
-researcher --start chats|research  the tab the window opens on (see One window, two tabs)
+researcher --start code|chats|research  the tab the window opens on (see One window, two tabs)
+researcher --profile NAME [PRESET]  code, chats and research of a project, with presets (see Project profiles)
 researcher --context --setup P    change a context preset, load nothing
 researcher --context --list       list the saved context presets
 ```
@@ -245,6 +246,20 @@ When sessions are switched on, every load opens one window with two tabs: **Chat
 - A chat's name goes into `sessions.json`, the same as `--rename`; an empty name gives it its first prompt back.
 - A document's name and a research set's name (**rename** next to the set) go into `names.json`; your files are never touched. The window shows the name with the real id in small text, the filter finds both, and the output gets a `DOC "name" (id)` line before the document's path.
 - A chat preset has a name field next to **Remember**: a new name moves the saved ticks to it. Lowercase letters, digits, `.`, `_` and `-`, and not the name of another preset.
+
+## Project profiles
+
+A profile puts a project's source code next to its chats and research, with presets that tick all three at once: say one for the full source, one for the GUI and one for the libraries, each with its own chats and research. Set it up in `config.toml`:
+
+```toml
+[profiles.myapp]
+root = "~/src/myapp"          # the project folder (optional: without it there is no Code tab)
+code = ["src/*", "*.toml"]    # globs over paths inside root; `*` crosses folders (default: "*")
+```
+
+`researcher --profile myapp` opens one window with **Code | Chats | Research** and a row of preset buttons. Code is ready at once; Chats and Research load when you click their tab or a preset that needs them. Clicking a preset ticks its files, chats and documents (you can still change the ticks); tick **Save these ticks as the profile preset**, give it a name and press Load to keep them (an existing name is replaced). Presets live in `profiles.json` next to the config. `researcher --profile myapp gui` opens with the preset `gui` ticked, `--no-popup` loads it without a window, `--profile myapp --list` shows the presets.
+
+Source files are printed as `CODE <path in the project>` followed by their size and full path; Claude reads them from disk, so there is no text copy, and code is not counted in the usage log. Hidden files and folders, `target`, `node_modules`, `__pycache__`, `dist`, `build`, `venv`, symlinks, binaries and files over 1 MB are left out. A profile saves no set defaults or chat presets of its own.
 
 ## Safety
 

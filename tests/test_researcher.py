@@ -907,6 +907,90 @@ class TwoTabTests(ContextTests.__base__):
         self.assertEqual(read(os.path.join(self.lib, "rust", "memory-a.md")), "# A")
 
 
+class ProfileTests(SessionEnv):
+    """--profile: code, chats and research presets for one project."""
+
+    def setUp(self):
+        super().setUp()
+        jl(os.path.join(self.proj, "-work-web", SID4 + ".jsonl"),
+           [user("Newest chat, other folder", ts="2026-11-17T09:00:00Z", cwd="/work/web")])
+        self.root = os.path.join(self.tmp.name, "repo")
+        write(os.path.join(self.root, "src", "main.rs"), "fn main() {}")
+        write(os.path.join(self.root, "src", "gui", "popup.rs"), "// popup")
+        write(os.path.join(self.root, "docs", "notes.md"), "notes")
+        write(os.path.join(self.root, "target", "x.rs"), "built")
+        with open(self.cfg, "a", encoding="utf-8") as f:
+            f.write(f'\n[profiles.app]\nroot = "{self.root}"\ncode = ["src/*"]\n')
+        self.profiles = os.path.join(self.conf_dir, "profiles.json")
+        write(self.profiles, json.dumps({"app": {"presets": {"gui": {
+            "code": ["src/gui/popup.rs"], "chats": [SID2], "research": ["rust/memory-a"]}}}}))
+
+    def test_code_scan_finds_text_source_and_skips_the_rest(self):
+        write(os.path.join(self.root, "src", "blob.rs"), "a\0b")
+        self.assertEqual(list(R.code_scan(self.root, ["*"])), ["docs/notes.md", "src/gui/popup.rs", "src/main.rs"])
+        self.assertEqual(list(R.code_scan(self.root, ["src/*"])), ["src/gui/popup.rs", "src/main.rs"])
+
+    def test_a_preset_loads_code_chats_and_research_without_a_window(self):
+        code, out = self.run_main("--profile", "app", "gui")
+        self.assertEqual(code, 0, out)
+        lines = out.splitlines()
+        c = lines.index("CODE src/gui/popup.rs")
+        self.assertTrue(lines[c + 1].endswith(os.path.join("src", "gui", "popup.rs")), out)
+        self.assertNotIn("src/main.rs", out)
+        chat = next(i for i, l in enumerate(lines) if l.startswith('CHAT "Second one"'))
+        doc = next(i for i, l in enumerate(lines) if "chars  " in l and "memory-a" in l)
+        self.assertTrue(c < chat < doc, out)
+        self.assertEqual([r["fmt"]["chat"] for r in R.read_usage()], [1, 0])  # code is not logged
+        self.assertFalse(os.path.exists(os.path.join(self.conf_dir, "choices.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.conf_dir, "contexts.json")))
+
+    def test_a_code_only_preset_writes_no_usage_record(self):
+        write(self.profiles, json.dumps({"app": {"presets": {"src": {"code": ["src/main.rs"]}}}}))
+        code, out = self.run_main("--profile", "app", "src")
+        self.assertEqual(code, 0, out)
+        self.assertIn("CODE src/main.rs", out)
+        self.assertEqual(R.read_usage(), [])
+        self.assertFalse(os.path.exists(self.reg))  # no chat scan for a code-only preset
+
+    def test_list_unknown_preset_and_no_window(self):
+        code, out = self.run_main("--profile", "app", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("gui", out)
+        self.assertIn("1 files", out)
+        code, out = self.run_main("--profile", "app", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown preset nope for profile app; known: gui", out)
+        code, out = self.run_main("--profile", "app")
+        self.assertEqual(code, 5)
+        self.assertEqual(self.run_main("--profile", "Bad/Name")[0], 2)
+
+    def test_the_window_saves_its_ticks_as_a_preset_and_loads_lazily(self):
+        seen = {}
+
+        def fake_popup(tabs, start, setup, command="", profile=None):
+            seen["profile"] = profile
+            self.assertEqual([t.get("loader") is None for t in tabs], [True, False, False])
+            self.assertFalse(os.path.exists(self.reg))  # chats not scanned before a click
+            chats = tabs[1]["loader"]()  # the user clicks a preset that needs chats
+            sid = next(iter(chats["sizes"]))
+            pick = lambda n, t: {"picks": [{"name": n, "ticked": set(t), "remember": False, "save_as": n,
+                                            "title": None}], "renames": {}, "chip": "all", "by_time": False}
+            return ([pick("code", ["src/main.rs"]), pick("app", [sid]), None], "both")
+        os.environ.pop("RESEARCHER_NO_POPUP")
+        self.addCleanup(os.environ.__setitem__, "RESEARCHER_NO_POPUP", "1")
+        orig = R.popup
+        R.popup = fake_popup
+        self.addCleanup(setattr, R, "popup", orig)
+        code, out = self.run_main("--profile", "app")
+        self.assertEqual(code, 0, out)
+        self.assertEqual([p for p, _ in seen["profile"]["presets"]], ["gui"])
+        self.assertIn("SAVED profile preset app/both: 1 files, 1 chats, 0 docs", out)
+        saved = dict(R.profile_presets(self.profiles, "app"))
+        self.assertEqual(saved["both"]["code"], ["src/main.rs"])
+        self.assertIn("CODE src/main.rs", out)
+        self.assertIn("CHAT ", out)
+
+
 class WindowLogicTests(unittest.TestCase):
     """The parts of the window that are plain logic: time bands, chips, names, presets."""
 
