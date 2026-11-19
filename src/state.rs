@@ -58,6 +58,47 @@ pub fn save_ui(path: &str, chats: bool, chip: Chip, by_time: bool) -> std::io::R
     library::save_choices(path, &all)
 }
 
+/// The presets of a project profile in profiles.json, in saved order: name → {"code" |
+/// "chats" | "research" → row ids}.
+pub fn profile_presets(path: &str, profile: &str) -> Vec<(String, BTreeMap<String, Vec<String>>)> {
+    let all = library::load_choices(path);
+    let Some(presets) = all.get(profile).and_then(|p| p.get("presets")).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    presets
+        .iter()
+        .map(|(name, kinds)| {
+            let lists = ["code", "chats", "research"]
+                .iter()
+                .map(|k| {
+                    let ids = kinds
+                        .get(*k)
+                        .and_then(Value::as_array)
+                        .map_or_else(Vec::new, |a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
+                    (k.to_string(), ids)
+                })
+                .collect();
+            (name.clone(), lists)
+        })
+        .collect()
+}
+
+/// Save (or replace) one preset of a profile.
+pub fn save_profile_preset(
+    path: &str,
+    profile: &str,
+    preset: &str,
+    lists: &BTreeMap<String, Vec<String>>,
+) -> std::io::Result<()> {
+    let mut all = library::load_choices(path);
+    let entry = all.entry(profile.to_string()).or_insert_with(|| json!({"presets": {}}));
+    if !entry.get("presets").is_some_and(Value::is_object) {
+        *entry = json!({"presets": {}});
+    }
+    entry["presets"][preset] = json!(lists);
+    library::save_choices(path, &all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +121,16 @@ mod tests {
         rename(n, "docs", &ch("rust/linux", "")).unwrap();
         assert!(names(n, "docs").is_empty());
         assert_eq!(names(n, "sets"), ch("rust", "Rust"));
+        let p = d.join("profiles.json");
+        let p = p.to_str().unwrap();
+        assert!(profile_presets(p, "app").is_empty());
+        let lists = BTreeMap::from([("code".to_string(), vec!["src/gui.rs".to_string()])]);
+        save_profile_preset(p, "app", "gui", &lists).unwrap();
+        save_profile_preset(p, "app", "full", &BTreeMap::new()).unwrap();
+        let got = profile_presets(p, "app");
+        assert_eq!(got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["gui", "full"]);
+        assert_eq!(got[0].1["code"], ["src/gui.rs"]);
+        assert!(got[0].1["chats"].is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

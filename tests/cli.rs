@@ -1079,6 +1079,78 @@ fn a_display_name_shows_before_the_path() {
     assert_eq!(read(&s.e.lib.join("rust/memory-a.md")), "# A"); // the library is never touched
 }
 
+// ---------------------------------------------------------------- project profiles
+
+/// A profile `app` over a small source tree, with a saved preset `gui`.
+fn profile_env() -> (Sess, PathBuf) {
+    let (s, presets) = context_env();
+    let root = s.e.tmp.join("repo");
+    write(&root.join("src/main.rs"), "fn main() {}");
+    write(&root.join("src/gui/popup.rs"), "// popup");
+    write(&root.join("docs/notes.md"), "notes");
+    write(&root.join("target/x.rs"), "built");
+    s.e.append_cfg(&format!("\n[profiles.app]\nroot = \"{}\"\ncode = [\"src/*\"]\n", root.display()));
+    let gui = serde_json::json!({"app": {"presets": {"gui": {
+        "code": ["src/gui/popup.rs"], "chats": [SID2], "research": ["rust/memory-a"]}}}});
+    write(&s.e.conf_dir.join("profiles.json"), &gui.to_string());
+    (s, presets)
+}
+
+#[test]
+fn a_profile_preset_loads_code_chats_and_research_without_a_window() {
+    let (s, _) = profile_env();
+    let (code, out) = s.e.run(&["--profile", "app", "gui"]);
+    assert_eq!(code, 0, "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let c = lines.iter().position(|l| *l == "CODE src/gui/popup.rs").expect("CODE line");
+    assert!(lines[c + 1].ends_with("src/gui/popup.rs") && lines[c + 1].contains("bytes  "), "{out}");
+    assert!(!out.contains("src/main.rs"), "{out}"); // not in the preset
+    let chat = lines.iter().position(|l| l.starts_with("CHAT \"Second one\"")).expect("CHAT line");
+    let doc = lines.iter().position(|l| l.contains("chars  ") && l.contains("memory-a")).expect("research line");
+    assert!(c < chat && chat < doc, "code, chats, research: {out}");
+    // research and chats are counted as always; code has no usage record
+    let recs = s.e.records();
+    assert_eq!(recs.len(), 2, "{out}");
+    assert_eq!(recs.iter().map(|r| r["fmt"]["chat"].as_u64().unwrap()).collect::<Vec<_>>(), [1, 0]); // chats print first
+    // a profile load saves no set default or chat preset
+    assert!(!s.e.conf_dir.join("choices.json").exists());
+    assert!(!s.e.conf_dir.join("contexts.json").exists());
+}
+
+#[test]
+fn a_code_only_preset_writes_no_usage_record() {
+    let (s, _) = profile_env();
+    write(
+        &s.e.conf_dir.join("profiles.json"),
+        r#"{"app": {"presets": {"src": {"code": ["src/main.rs"], "chats": [], "research": []}}}}"#,
+    );
+    let (code, out) = s.e.run(&["--profile", "app", "src", "--start", "code"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("CODE src/main.rs") && out.contains("total: 1 files"), "{out}");
+    assert!(!s.e.usage_file().exists(), "{out}");
+    assert!(!s.reg.exists(), "a code-only preset scanned the chats");
+}
+
+#[test]
+fn profile_list_unknown_preset_and_no_window() {
+    let (s, _) = profile_env();
+    let (code, out) = s.e.run(&["--profile", "app", "--list"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("gui") && out.contains("1 files") && out.contains("1 chats") && out.contains("1 docs"),
+        "{out}"
+    );
+    let (code, out) = s.e.run(&["--profile", "app", "nope"]);
+    assert_eq!(code, 2);
+    assert!(out.contains("unknown preset nope for profile app; known: gui"), "{out}");
+    let (code, out) = s.e.run(&["--profile", "app"]);
+    assert_eq!(code, 5);
+    assert!(out.contains("name a preset"), "{out}");
+    assert_eq!(s.e.run(&["--profile", "Bad/Name"]).0, 2);
+    s.e.append_cfg("[profiles.gone]\nroot = \"/no/such/folder\"\n");
+    assert_eq!(s.e.run(&["--profile", "gone", "--list"]).0, 6);
+}
+
 // ---------------------------------------------------------------- parity with the Python version
 
 /// Both versions share the text copy (same TEXT_VERSION), so they must write the same text.
