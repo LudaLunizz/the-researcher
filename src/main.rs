@@ -343,6 +343,8 @@ fn usage_send(cfg: &toml::Table, dry_run: bool) -> i32 {
 }
 
 fn main() -> ExitCode {
+    // the popup deadline counts from the start, before any scan: the skill's 600 s limit does too
+    let _ = popup::remaining();
     let args = Args::parse();
     let code = run(args);
     ExitCode::from(code.clamp(0, 255) as u8)
@@ -509,6 +511,13 @@ fn research_prep(args: &Args, cfg_path: &str, state_path: &str, secondary: bool)
             .map_or_else(text_home, str::to_string),
     };
     let store = util::user_path(&store);
+    let real = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    if real(&store).starts_with(real(&lib)) {
+        // the copies would overwrite the user's own files, or be read as documents again
+        return Err(cfg_err(ConfigError(format!(
+            "the text folder {store} is inside the library {lib}; set text_dir (or --out) to a folder outside it"
+        ))));
+    }
 
     if args.sync && !secondary {
         let mut texts = Texts::new(&paths, &store);
@@ -663,6 +672,9 @@ fn research_finish(
 
     let order: BTreeMap<&str, Vec<&String>> =
         secs.iter().map(|s| (s.name.as_str(), s.main.iter().chain(&s.other).collect())).collect();
+    if picks.iter().any(|(_, _, keep)| *keep || setup) {
+        conf = library::load_choices(state_path); // a save another run made while the window was open stays
+    }
     let mut saved_any = false;
     for (n, ticked, keep) in &picks {
         if *keep || setup {
@@ -927,9 +939,11 @@ fn code_tab(files: &BTreeMap<String, code::File>, ui_path: &str) -> popup::Tab {
 }
 
 /// A pick of exactly `ticked` in the one section of a profile tab.
-fn profile_pick(name: &str, ticked: BTreeSet<String>) -> TabPick {
+fn profile_pick(name: &str, ticked: BTreeSet<String>, ui_path: &str, chats: bool) -> TabPick {
     let pick = popup::Pick { name: name.into(), ticked, remember: false, save_as: name.into(), title: None };
-    TabPick { picks: vec![pick], renames: BTreeMap::new(), chip: bands::Chip::All, by_time: false }
+    // the window settings as saved: finishing the load saves them back unchanged
+    let (chip, by_time) = state::ui(ui_path, chats);
+    TabPick { picks: vec![pick], renames: BTreeMap::new(), chip, by_time }
 }
 
 /// Research of a profile: the whole library in one section, nothing saved as a set default.
@@ -1046,11 +1060,11 @@ fn load_profile(args: &Args, name: &str, cfg_path: &str, state_path: &str) -> i3
         }
         if sessions_on && !lists["chats"].is_empty() {
             chats = sessions::prep(&cfg, &cargs, true).ok();
-            chat_pick = Some(profile_pick(&name, set("chats")));
+            chat_pick = Some(profile_pick(&name, set("chats"), &ui_path, true));
         }
         if has_library && !lists["research"].is_empty() {
             research = profile_research(args, cfg_path, state_path);
-            research_pick = Some(profile_pick("all", set("research")));
+            research_pick = Some(profile_pick("all", set("research"), &ui_path, false));
         }
     } else {
         let later_chats: Arc<Mutex<Option<sessions::Chats>>> = Arc::new(Mutex::new(None));

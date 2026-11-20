@@ -167,6 +167,9 @@ pub fn split_ext(name: &str) -> (&str, &str) {
 /// Write a file through a temporary name and a rename, so a reader never sees half of it. The
 /// temporary name holds the process id: two runs at once never write into the same one.
 pub fn write_atomic(path: &str, data: &[u8]) -> io::Result<()> {
+    // a symlinked file (dotfiles) stays a link: write where it points, and keep its permissions
+    let path = &fs::canonicalize(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned());
+    let perms = fs::metadata(path).ok().map(|m| m.permissions());
     let tmp = format!("{path}.{}.tmp", std::process::id());
     {
         let mut f = fs::File::create(&tmp)?;
@@ -175,10 +178,21 @@ pub fn write_atomic(path: &str, data: &[u8]) -> io::Result<()> {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
+        if let Some(p) = perms {
+            let _ = f.set_permissions(p);
+        }
     }
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// A state file that exists but does not parse is kept as `PATH.bad` before the next save
+/// overwrites it with an empty state.
+pub fn set_aside(path: &str) {
+    if fs::metadata(path).is_ok_and(|m| m.is_file()) && fs::rename(path, format!("{path}.bad")).is_ok() {
+        eprintln!("NOTE: {path} could not be read; kept as {path}.bad, starting empty");
+    }
 }
 
 /// `os.makedirs(dirname(path), exist_ok=True)`.

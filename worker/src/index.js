@@ -26,8 +26,9 @@ const SQUEEZE = "COALESCE(SUM(MAX(raw - chars, 0) * 1000.0 / tk), 0)";
 const CONVERT =
   `COALESCE(SUM((COALESCE(html_chars, 0) * ${SAVED_PER_CHAR.html} + COALESCE(pdf_chars, 0) * ${SAVED_PER_CHAR.pdf}) * 1000.0 / tk), 0)`;
 const STATS =
-  "SELECT COUNT(DISTINCT id) AS installs, COUNT(*) AS loads, COALESCE(SUM(docs), 0) AS docs, " +
-  "COALESCE(SUM(raw), 0) AS raw_chars, COALESCE(SUM(chars), 0) AS chars, " +
+  // TOTAL, not SUM: an integer SUM that overflows is an error, and the stats would fail for good
+  "SELECT COUNT(DISTINCT id) AS installs, COUNT(*) AS loads, TOTAL(docs) AS docs, " +
+  "TOTAL(raw) AS raw_chars, TOTAL(chars) AS chars, " +
   `${SQUEEZE} AS tokens_from_squeeze, ${CONVERT} AS tokens_from_conversion, ` +
   "COALESCE(SUM(MAX(lib_chars - chars, 0) * 1000.0 / tk), 0) AS tokens_not_loaded, " +
   "COALESCE(SUM(chat > 0), 0) AS chat_loads, COUNT(pdf_chars) AS loads_with_formats FROM loads";

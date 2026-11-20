@@ -25,7 +25,8 @@ const LOAD_KEYS = ["chars", "day", "docs", "fmt", "id", "lib_chars", "lib_docs",
 /** The keys a record must have: version 2 adds fmt_chars, request schema 2 adds seq. */
 const keysFor = (v, withSeq) => [...LOAD_KEYS, ...(v === 2 ? ["fmt_chars"] : []), ...(withSeq ? ["seq"] : [])].sort();
 const COUNT_MAX = 1_000_000; // documents
-const SIZE_MAX = 10_000_000_000; // characters or bytes
+const BYTES_MAX = 10_000_000_000; // source bytes (not in the stats)
+const SIZE_MAX = 1_000_000_000; // characters: they feed the public token numbers
 const DAY_FIRST = Date.UTC(2026, 0, 1);
 const DAY_SLACK = 2 * 86_400_000; // clocks and time zones
 
@@ -52,10 +53,13 @@ export function recordError(rec, now = Date.now(), withSeq = false) {
   if (typeof rec.id !== "string" || !/^[0-9a-f]{16}$/.test(rec.id)) return "bad id";
   if (!validDay(rec.day, now)) return "bad day";
   if (!isInt(rec.docs, COUNT_MAX) || !isInt(rec.lib_docs, COUNT_MAX)) return "bad document count";
-  for (const k of ["src_bytes", "raw", "chars", "lib_chars"]) {
+  if (!isInt(rec.src_bytes, BYTES_MAX)) return "bad src_bytes";
+  for (const k of ["raw", "chars", "lib_chars"]) {
     if (!isInt(rec[k], SIZE_MAX)) return `bad ${k}`;
   }
-  if (!Number.isSafeInteger(rec.tk) || rec.tk < 1 || rec.tk > 100_000) return "bad tk";
+  // characters per 1000 tokens (the app sends 2400): the stats divide by it, so a tiny one
+  // would let one record add billions of tokens
+  if (!Number.isSafeInteger(rec.tk) || rec.tk < 1000 || rec.tk > 10_000) return "bad tk";
   const kinds = rec.v === 2 ? KINDS_V2 : KINDS_V1;
   if (!isObject(rec.fmt) || !sameKeys(rec.fmt, [...kinds].sort())) return "bad fmt";
   let sum = 0;

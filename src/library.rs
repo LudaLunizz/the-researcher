@@ -429,14 +429,14 @@ pub fn sections_for(names: &[String], sets: &Sets, conf: &Choices, texts: &mut T
 }
 
 pub fn load_choices(path: &str) -> Choices {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| match v {
-            Value::Object(m) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default()
+    let Ok(bytes) = fs::read(path) else { return Choices::default() };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(m)) => m,
+        _ => {
+            util::set_aside(path);
+            Choices::default()
+        }
+    }
 }
 
 pub fn save_choices(path: &str, conf: &Choices) -> std::io::Result<()> {

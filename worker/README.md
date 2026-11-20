@@ -10,7 +10,9 @@ main README. No dependencies: plain JavaScript, a D1 database, nothing else.
 
 - **schema 2**, what `researcher --usage-send` sends: every record also has `seq`, its line
   number in the user's log (`researcher --usage-send --dry-run` prints the exact body);
-- **schema 1**, exactly the file `researcher --usage-export` writes (no `seq`):
+- **schema 1**, the shape of the file `researcher --usage-export` writes (no `seq`). Don't post
+  that file from an install that also shares automatically: its rows have no `seq`, so every
+  load would be counted a second time.
 
 ```json
 {"schema": 1, "loads": [

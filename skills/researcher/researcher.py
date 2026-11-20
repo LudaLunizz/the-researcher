@@ -39,6 +39,7 @@ folder. `exclude = [globs]` in config.toml leaves documents out of the library. 
 """
 import argparse
 import atexit
+import contextlib
 import datetime
 import fnmatch
 import html
@@ -46,6 +47,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -105,8 +107,25 @@ def load_config(path):
 
 
 def library_path(cfg, override=None):
-    p = override or os.environ.get("RESEARCHER_LIBRARY") or cfg.get("library")
+    p = override or os.environ.get("RESEARCHER_LIBRARY") or cfg_str(cfg, "library")
     return os.path.abspath(os.path.expanduser(p)) if p else None
+
+
+def cfg_str(cfg, key):
+    """A string value of the config, or ConfigError naming the key."""
+    v = cfg.get(key)
+    if v is not None and not isinstance(v, str):
+        raise ConfigError(f"`{key}` must be a string")
+    return v
+
+
+def str_list(v, what):
+    """A list of strings from the config (`exclude`, `docs`, `include`)."""
+    if v is None:
+        return []
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise ConfigError(f"{what} must be a list of strings")
+    return v
 
 
 STARTER = """\
@@ -150,9 +169,13 @@ def init_config(path, library):
     if os.path.exists(path):
         print(f"{path} already exists; not overwriting")
         return 1
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(STARTER.format(library=library.replace("\\", "\\\\").replace('"', '\\"')))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(STARTER.format(library=library.replace("\\", "\\\\").replace('"', '\\"')))
+    except OSError as e:
+        print(f"CONFIG ERROR: {path}: {e}")
+        return 6
     print(f"wrote {path}")
     return 0
 
@@ -169,6 +192,11 @@ def scan(library, exclude=()):
             found[doc_id] = (pref, path)
 
     for root, dirs, files in os.walk(library):
+        try:
+            root.encode("utf-8")  # names that are not UTF-8 are left out, as in the Rust version
+        except UnicodeEncodeError:
+            dirs[:] = []
+            continue
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         rel = os.path.relpath(root, library)
         rel = "" if rel == "." else rel.replace(os.sep, "/")
@@ -182,23 +210,31 @@ def scan(library, exclude=()):
             if fn.startswith(".") or ext.lower() not in DOC_EXTS:
                 continue
             path = os.path.join(root, fn)
+            try:
+                path.encode("utf-8")
+            except UnicodeEncodeError:
+                continue
             if os.path.isfile(path):
                 offer(f"{rel}/{stem}" if rel else stem, path, ext.lower())
     return {k: v[1] for k, v in sorted(found.items())
             if not any(fnmatch.fnmatchcase(k, pat) for pat in exclude)}
 
 
-COMMENT_RE = re.compile(r"(?s)<!--(?:>|->|.*?(?:-->|\Z))")  # <!--> and <!---> are empty comments; unclosed runs to the end
+# Comments and <script>/<style>/<svg> in one left-to-right pass, so a <!-- inside a script is
+# script text. <!--> and <!---> are empty comments; an unclosed comment runs to the end.
+HIDDEN_RE = re.compile(r"(?is)<!--(?:>|->|.*?(?:-->|\Z))|<script\b.*?</script>|<style\b.*?</style>|<svg\b.*?</svg>")
+# Markdown: closed comments, and an unclosed one only when it starts a line (CommonMark HTML block).
+MD_COMMENT_RE = re.compile(r"(?ms)<!--(?:>|->|.*?-->)|^<!--.*")
 
 
 def drop_comments(raw):
-    """Remove <!-- ... --> comments as a unit, so nothing hidden in one reaches the model.
-    Runs before the tag step: a '>' inside a comment must not end it early."""
-    return COMMENT_RE.sub(" ", raw)
+    """Remove <!-- ... --> comments of a Markdown file as a unit, so nothing hidden in one
+    reaches the model; a <!-- inside inline code does not swallow the rest of the file."""
+    return MD_COMMENT_RE.sub(" ", raw)
 
 
 def html_text(raw):
-    t = re.sub(r"(?is)<(script|style|svg)\b.*?</\1>", " ", drop_comments(raw))
+    t = HIDDEN_RE.sub(" ", raw)  # before the tag step: a '>' inside a comment must not end it early
     t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6]|section|table)>", "\n", t)
     t = re.sub(r"(?i)<(td|th)\b[^>]*>", " | ", t)
     t = re.sub(r"(?i)<li\b[^>]*>", "- ", t)
@@ -209,7 +245,7 @@ def html_text(raw):
     return "\n".join(line.strip() for line in t.splitlines()).strip()
 
 
-TEXT_VERSION = 3  # bump when to_text(), drop_comments() or squeeze() changes: every stored copy is made again
+TEXT_VERSION = 4  # bump when to_text(), drop_comments(), free_store_name() or squeeze() changes: every stored copy is made again
 INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))  # zero-width, soft hyphen
 PAGE_NUMBER_RE = re.compile(r"(?i)^(page\s+)?\d{1,4}(\s*(/|of)\s*\d{1,4})?$")
 PAGE_WORD_RE = re.compile(r"(?i)\b(page|pagina|blz|seite|p\.)\s*\d")
@@ -278,13 +314,14 @@ def convert(path):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         try:
-            r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True,
-                               text=True, check=True)
+            r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, check=True)
         except FileNotFoundError:
             raise RuntimeError("pdftotext not found (install poppler-utils)")
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"pdftotext failed: {e.stderr.strip() or e.returncode}")
-        return r.stdout, squeeze(r.stdout, "pdf")
+            err = e.stderr.decode("utf-8", "replace").strip()
+            raise RuntimeError(f"pdftotext failed: {err or e.returncode}")
+        out = r.stdout.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+        return out, squeeze(out, "pdf")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
     if ext in (".html", ".htm"):
@@ -310,11 +347,11 @@ def expand(name, defs, catalog, stack=()):
     if not isinstance(spec, dict):
         raise ConfigError(f"[sets.{name}] must be a table")
     out = []
-    for inc in spec.get("include", []):
+    for inc in str_list(spec.get("include"), f"[sets.{name}] include"):
         if inc not in defs:
             raise ConfigError(f"set '{name}' includes unknown set '{inc}'")
         out += expand(inc, defs, catalog, stack + (name,))
-    for pat in spec.get("docs", []):
+    for pat in str_list(spec.get("docs"), f"[sets.{name}] docs"):
         hits = [d for d in catalog if fnmatch.fnmatchcase(d, pat)] if re.search(r"[*?\[]", pat) else []
         out += hits or [pat]  # no hit stays in the list and shows up as MISSING
     return list(dict.fromkeys(out))
@@ -332,7 +369,7 @@ def build_sets(cfg, catalog, conf, names):
     for n in list(conf) + list(names):
         if n in sets:
             continue
-        if n in conf and not conf[n].get("custom"):
+        if n in conf and not (isinstance(conf[n], dict) and conf[n].get("custom")):
             continue  # saved choice of a set that no longer exists
         if n not in conf and not NAME_RE.fullmatch(n):
             continue
@@ -353,12 +390,18 @@ def id_hash(d):
 
 
 def free_store_name(d, index):
-    """store_name, unless another document already uses that file (`a/b` and `a - b`): then the
-    id's hash goes into the name, so two documents never share one copy."""
+    """store_name, unless another document already uses that file (`a/b` and `a - b`) or the name
+    is too long for the file system: then the id's hash goes into the name, so two documents
+    never share one copy."""
     fn = store_name(d)
-    if any(i != d and isinstance(r, dict) and r.get("file") == fn for i, r in index.items()):
-        return f"{d.replace('/', ' - ')} ({id_hash(d):08x}).txt"
-    return fn
+    taken = any(i != d and isinstance(r, dict) and r.get("file") == fn for i, r in index.items())
+    if not taken and len(fn.encode("utf-8")) <= LONGEST_NAME:
+        return fn
+    stem = d.replace("/", " - ").encode("utf-8")[:LONGEST_NAME - 15].decode("utf-8", "ignore")
+    return f"{stem} ({id_hash(d):08x}).txt"
+
+
+LONGEST_NAME = 200  # bytes; room for the .PID.tmp while writing; the Rust version uses the same
 
 
 class Texts:
@@ -471,6 +514,8 @@ def sections_for(names, sets, kinds, conf, texts, setup):
     for n in names:
         docs = sets[n]
         saved = conf.get(n)
+        if saved is not None and not isinstance(saved, dict):
+            saved = {}  # a damaged entry counts as saved with nothing in it, as in the Rust version
         known = set(saved.get("known", [])) if saved else set()
         selected = set(saved.get("selected", [])) if saved else set()
         new = {d for d in docs if d not in known} if saved else set()
@@ -490,7 +535,8 @@ def sections_for(names, sets, kinds, conf, texts, setup):
 
 
 def resolve_names(argv_names, cfg):
-    aliases = {k.lower(): v for k, v in cfg.get("aliases", {}).items()}
+    al = cfg.get("aliases")
+    aliases = {k.lower(): v for k, v in al.items() if isinstance(v, str)} if isinstance(al, dict) else {}
     sets = cfg.get("sets", {}) if isinstance(cfg.get("sets"), dict) else {}
     defined = {k.lower(): k for k in reversed(list(sets))}  # `[sets.MyRust]` is reached by `myrust`
 
@@ -499,26 +545,42 @@ def resolve_names(argv_names, cfg):
     names = [canon(aliases.get(n.lower(), n.lower())) for n in argv_names]
     if not names:
         d = cfg.get("default_set")
-        names = [canon(d)] if d else []
+        names = [canon(d)] if isinstance(d, str) and d else []
     return list(dict.fromkeys(names))
 
 
 # ---------------------------------------------------------------- saved choices
 
+def set_aside(path):
+    """A state file that exists but does not parse is kept as PATH.bad before the next save
+    overwrites it with an empty state."""
+    if os.path.isfile(path):
+        try:
+            os.replace(path, path + ".bad")
+        except OSError:
+            return
+        print(f"NOTE: {path} could not be read; kept as {path}.bad, starting empty", file=sys.stderr)
+
+
 def load_conf(path):
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
         return {}
+    try:
+        conf = json.loads(data)
+    except ValueError:
+        conf = None
+    if isinstance(conf, dict):
+        return conf
+    set_aside(path)
+    return {}
 
 
 def save_conf(path, conf):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(conf, f, indent=1, ensure_ascii=False)
-    os.replace(tmp, path)
+    write_atomic(path, json.dumps(conf, indent=1, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------- time bands, names, window state
@@ -1306,9 +1368,12 @@ def sent_file():
 
 
 def write_atomic(path, text):
+    path = os.path.realpath(path)  # a symlinked file (dotfiles) stays a link: write where it points
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8", newline="") as f:  # line endings exactly as given
         f.write(text)
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))  # and keeps its permissions
     os.replace(tmp, path)
 
 
@@ -1769,22 +1834,17 @@ def session_info(entries):
 
 
 def load_registry(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            reg = json.load(f)
-        if isinstance(reg.get("sessions"), dict):
-            return reg
-    except (OSError, ValueError, AttributeError):
-        pass
+    reg = load_conf(path)
+    if isinstance(reg.get("sessions"), dict):
+        return reg
+    if reg:
+        set_aside(path)
     return {"version": 1, "sessions": {}}
 
 
 def save_registry(path, reg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(reg, f, indent=1, ensure_ascii=False)
-    os.replace(tmp, path)
+    write_atomic(path, json.dumps(reg, indent=1, ensure_ascii=False))
 
 
 def register(reg, sid, path, mtime, proj, entries, source=None):
@@ -1823,7 +1883,7 @@ def up_to_date(reg, sid, path, mtime):
                 and "first" in rec and "chars" in rec)
 
 
-def scan_sessions(reg, settings, now=None, idle=None, skip="", reg_path="", in_opencode=False):
+def scan_sessions(reg, settings, now=None, idle=None, skip="", reg_path="", in_opencode=False, live_out=None):
     """Add sessions untouched for `idle` seconds (default: idle_minutes) to the registry and
     refresh the changed ones (never `skip`, the session that runs this). Returns the number added.
     opencode chats are added too when `[sessions] opencode` is on; `in_opencode` = this runs inside
@@ -1858,7 +1918,7 @@ def scan_sessions(reg, settings, now=None, idle=None, skip="", reg_path="", in_o
                 continue
             added += register(reg, sid, path, mtime, proj, read_transcript(path))
     if settings["opencode"]:
-        added += scan_opencode(reg, settings, now, idle, reg_path, in_opencode)
+        added += scan_opencode(reg, settings, now, idle, reg_path, in_opencode, live_out)
     return added
 
 
@@ -1907,7 +1967,7 @@ def oc_entries(export, directory):
     return out
 
 
-def scan_opencode(reg, settings, now, idle, reg_path, in_opencode):
+def scan_opencode(reg, settings, now, idle, reg_path, in_opencode, live_out=None):
     """Add opencode's chats (top-level ones; sub-agent sessions are not listed by opencode) to the
     registry. Each changed chat is exported once and cached as a transcript next to the registry."""
     from concurrent.futures import ThreadPoolExecutor
@@ -1928,6 +1988,8 @@ def scan_opencode(reg, settings, now, idle, reg_path, in_opencode):
         recent = [v for v in listing if isinstance(v, dict) and now - upd(v) < 600]
         if recent:
             live = max(recent, key=upd).get("id")
+    if live_out is not None and live:
+        live_out.append(live)  # an earlier scan from Claude Code may have registered it
     cache = os.path.join(os.path.dirname(reg_path), "sessions-opencode")
     todo = []
     for v in listing:
@@ -2037,7 +2099,8 @@ def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
             save_registry(reg_path, reg)
             print(f"RENAMED {session_label(sid, reg['sessions'][sid])}")
             return 0
-        save_registry(reg_path, reg)
+        with contextlib.suppress(OSError):
+            save_registry(reg_path, reg)
         if args.resume:
             sid = find_session(reg, args.resume)
             print(f"SESSION {session_label(sid, reg['sessions'][sid])}")
@@ -2056,11 +2119,11 @@ def sessions_main(args, cfg, cfg_path, reg_path, out_dir):
             print(f"total: 1 session, {len(text)} chars (~{len(text) // CHARS_PER_K}k tokens)")
             # one chat, against every chat up to it (last active at or before it)
             note = usage_of_chats(cfg, cfg_path, [(len(text), file_size(rec["file"]))],
-                                  chats_up_to(reg["sessions"].values(), last_of(rec)))
+                                  chats_up_to((reg["sessions"][s] for s in chat_catalog(reg)), last_of(rec)))
             if note:
                 print(note)
             return 0
-    except ConfigError as e:
+    except (ConfigError, OSError) as e:
         print(f"SESSION ERROR: {e}")
         return 8
     # --context also registers sessions that were open a moment ago; the list shows closed ones
@@ -2116,12 +2179,12 @@ def chats_up_to(recs, cutoff):
     return n, c
 
 
-def chat_catalog(reg, skip):
+def chat_catalog(reg, skip=()):
     """Every chat that can be loaded, by folder (the folder used most recently first), newest
     first inside a folder."""
     folders = {}
     for sid, rec in reg["sessions"].items():
-        if sid == skip or not os.path.isfile(rec.get("file") or ""):
+        if sid in skip or not os.path.isfile(rec.get("file") or ""):
             continue
         folders.setdefault(chat_folder(rec), []).append((last_of(rec), sid))
     # sorts are stable (also with reverse=True): newest first, ties by name
@@ -2156,8 +2219,13 @@ def reset_name(reg, sid):
     if rec is None:
         return
     rec["name_source"] = "auto"
+    entries = read_transcript(rec.get("file") or "")
+    if not entries:  # the transcript is gone: nothing to read a title from, so the first prompt it had
+        if clean_name(rec.get("first") or ""):
+            rec["name"] = clean_name(rec["first"])
+        return
     register(reg, sid, rec.get("file") or "", rec.get("mtime") or 0, rec.get("project") or "",
-             read_transcript(rec.get("file") or ""), rec.get("source"))
+             entries, rec.get("source"))
 
 
 def set_name(reg, sid, name):
@@ -2209,12 +2277,14 @@ def context_prep(args, cfg, paths, names, secondary=False):
 
     me = os.environ.get("CLAUDE_CODE_SESSION_ID", "").lower()  # never offer the chat running this
     reg = load_registry(paths["reg"])
-    scan_sessions(reg, settings, idle=0, skip=me, reg_path=paths["reg"], in_opencode="OPENCODE" in os.environ)
+    live = []  # inside opencode: the opencode chat that runs this
+    scan_sessions(reg, settings, idle=0, skip=me, reg_path=paths["reg"], in_opencode="OPENCODE" in os.environ,
+                  live_out=live)
     try:
         save_registry(paths["reg"], reg)
     except OSError as e:
         say(f"could not save the session registry to {paths['reg']}: {e}")
-    catalog = chat_catalog(reg, me)
+    catalog = chat_catalog(reg, (me, *live))
     if not catalog:
         if settings["opencode"]:
             say(f"NO CHATS: no earlier Claude Code ({settings['projects_dir']}) or opencode chats; "
@@ -2234,18 +2304,19 @@ def context_tab(c, ui_path):
     """The popup tab of the chats."""
     recs, catalog = c["reg"]["sessions"], c["catalog"]
     chip, by_time = ui_state(ui_path, True)
-    times = {}
+    times, notes = {}, {}
     for sid in catalog:
         w = parse_iso(last_of(recs[sid]))
         if w is None and isinstance(recs[sid].get("mtime"), (int, float)):
             w = int(recs[sid]["mtime"])
         if w is not None:
             times[sid] = w
+            notes[sid] = local_time(w).strftime("%Y-%m-%d")  # the local day, like the headings
     look = {"chats": True, "chip": chip, "by_time": by_time, "taken": set(c["presets"]), "times": times,
             "labels": {sid: shown_name(recs[sid]) for sid in catalog},
             "defaults": {sid: recs[sid]["first"] for sid in catalog if recs[sid].get("first")},
             "groups": {sid: chat_folder(recs[sid]) for sid in catalog},
-            "notes": {sid: last_of(recs[sid])[:10] for sid in catalog}}
+            "notes": notes}
     return {"sections": c["secs"], "sizes": {sid: int(recs[sid].get("chars") or 0) for sid in catalog},
             "look": look}
 
@@ -2260,11 +2331,13 @@ def context_finish(c, args, cfg, cfg_path, paths, out_dir, picks):
             return 0
         print(f"NO POPUP: context preset {', '.join(unsaved)} has no saved choice yet; nothing loaded")
         return 5
-    gone = []
-    if picks is None:  # a saved preset can name a chat whose transcript was deleted since
-        have = set(catalog)
-        gone = list(dict.fromkeys(d for n in names for d in presets[n].get("selected", [])
-                                  if d not in have))
+    # a saved preset can name a chat whose transcript was deleted since (the popup just drops it;
+    # a profile preset passes it on)
+    saved = ([d for n in names for d in presets[n].get("selected", [])] if picks is None
+             else [d for p in picks["picks"] for d in p["ticked"]])
+    have = set(catalog)
+    gone = list(dict.fromkeys(d for d in saved if d not in have))
+    if picks is None:
         chosen_picks = [{"name": s["name"], "ticked": s["ticked"], "remember": False,
                          "save_as": s["name"], "title": None} for s in secs]
     else:
@@ -2272,18 +2345,22 @@ def context_finish(c, args, cfg, cfg_path, paths, out_dir, picks):
             save_ui(paths["ui"], True, picks["chip"], picks["by_time"])
         except OSError as e:
             print(f"could not save the window settings to {paths['ui']}: {e}")
+        fresh = load_registry(paths["reg"]) if picks["renames"] else None
         for sid, name in picks["renames"].items():
             set_name(reg, sid, name)
+            set_name(fresh, sid, name)  # renamed in the file as it is now: another run's rename stays
             print(f'RENAMED "{shown_name(reg["sessions"][sid])}" ({sid})')
         if picks["renames"]:
             try:
-                save_registry(paths["reg"], reg)
+                save_registry(paths["reg"], fresh)
             except OSError as e:
                 print(f"could not save the session registry to {paths['reg']}: {e}")
         chosen_picks = picks["picks"]
     if c["secondary"] and not any(p["ticked"] for p in chosen_picks):
         return 0  # the other tab, left alone
 
+    if any(p["remember"] or args.setup for p in chosen_picks):
+        presets = load_conf(paths["presets"])  # a preset another run saved meanwhile stays
     if save_presets(presets, chosen_picks, catalog, args.setup):
         try:
             save_conf(paths["presets"], presets)
@@ -2402,7 +2479,11 @@ def main(argv=None):
         print(share_line(usage_share(cfg), len(usage_pending())))
         return 0
     if args.usage_export:
-        n = usage_export(args.usage_export)
+        try:
+            n = usage_export(args.usage_export)
+        except OSError as e:
+            print(f"could not write {args.usage_export}: {e}")
+            return 1
         print(f"wrote {n} records to {os.path.abspath(args.usage_export)}")
         print("each record: day, random install id, document counts per format, character sums "
               "(source bytes, converted, squeezed, whole library). No titles, paths or set names. "
@@ -2443,7 +2524,8 @@ def research_prep(args, cfg_path, state_path, secondary=False):
         if not os.path.isdir(library):
             say(f"NO LIBRARY: {library} is not a folder; nothing loaded")
             return 6
-        paths = scan(library, cfg.get("exclude", []))
+        paths = scan(library, str_list(cfg.get("exclude"), "exclude"))
+        text_dir = cfg_str(cfg, "text_dir")
         conf = load_conf(state_path)
         # the set names on the command line belong to the tab the command is for
         names = resolve_names([] if secondary else args.sets, cfg)
@@ -2453,8 +2535,13 @@ def research_prep(args, cfg_path, state_path, secondary=False):
         return 6
 
     # the second tab keeps its text copy where it always is; --out is for the first tab
-    store = os.path.abspath(os.path.expanduser((None if secondary else args.out) or cfg.get("text_dir")
-                                               or text_home()))
+    store = os.path.abspath(os.path.expanduser((None if secondary else args.out) or text_dir or text_home()))
+    real_store, real_lib = os.path.realpath(store), os.path.realpath(library)
+    if real_store == real_lib or real_store.startswith(real_lib.rstrip(os.sep) + os.sep):
+        # the copies would overwrite the user's own files, or be read as documents again
+        say(f"CONFIG ERROR: the text folder {store} is inside the library {library}; "
+            "set text_dir (or --out) to a folder outside it")
+        return 6
 
     if args.sync and not secondary:
         texts = Texts(paths, store)
@@ -2472,13 +2559,17 @@ def research_prep(args, cfg_path, state_path, secondary=False):
         print(f"library: {library} ({len(paths)} documents)")
         for n, docs in sets.items():
             if n == "all" or kinds[n] != "custom" or n in conf:
-                saved = conf.get(n, {}).get("selected")
+                saved = conf[n].get("selected") if isinstance(conf.get(n), dict) else None
                 sel = f", saved default {len(saved)}" if saved is not None else ""
                 print(f"{n:20} {len(docs):>4} docs  ({kinds[n]}{sel})")
         if cfg.get("aliases"):
             print("aliases: " + ", ".join(f"{a}={b}" for a, b in cfg["aliases"].items()))
         return 0
 
+    if not paths:
+        say(f"EMPTY LIBRARY: {library} has no documents yet (.html, .md, .txt, .pdf); save or copy "
+            "research into it; nothing loaded")
+        return 6
     if not names:
         say("NO SET: name a set, or set `default_set` in the config; known: " + ", ".join(sets))
         return 2
@@ -2552,6 +2643,8 @@ def research_finish(r, args, cfg_path, state_path, names_path, ui_path, picks):
         return 0  # the other tab, left alone
 
     order = {s["name"]: s["main"] + s["other"] for s in secs}
+    if any(keep or setup for _, keep in chosen_picks.values()):
+        conf = load_conf(state_path)  # a save another run made while the window was open stays
     for n, (ticked, keep) in chosen_picks.items():
         if keep or setup:
             conf[n] = {"selected": [d for d in order[n] if d in ticked], "known": list(sets[n])}
@@ -2559,7 +2652,10 @@ def research_finish(r, args, cfg_path, state_path, names_path, ui_path, picks):
                 conf[n]["custom"] = True
             print(f"SAVED default for {n}: {len(ticked)} of {len(sets[n])} docs")
     if any(keep or setup for _, keep in chosen_picks.values()):
-        save_conf(state_path, conf)
+        try:
+            save_conf(state_path, conf)
+        except OSError as e:
+            print(f"could not save the defaults to {state_path}: {e}")
     if setup:
         print("setup only: nothing loaded")
         return 0
@@ -2709,10 +2805,12 @@ def code_tab(files, ui_path):
                      "times": {d: f[2] for d, f in files.items()}}}
 
 
-def profile_pick(name, ticked):
-    """A pick of exactly `ticked` in the one section of a profile tab."""
+def profile_pick(name, ticked, ui_path, chats):
+    """A pick of exactly `ticked` in the one section of a profile tab (the window settings as
+    saved: finishing the load saves them back unchanged)."""
+    chip, by_time = ui_state(ui_path, chats)
     return {"picks": [{"name": name, "ticked": set(ticked), "remember": False, "save_as": name,
-                       "title": None}], "renames": {}, "chip": "all", "by_time": False}
+                       "title": None}], "renames": {}, "chip": chip, "by_time": by_time}
 
 
 def profile_research(args, cfg_path, state_path):
@@ -2785,10 +2883,10 @@ def load_profile(args, name, cfg_path, state_path):
         if sessions_on and lists["chats"]:
             chats = context_prep(args, cfg, cpaths, [name], secondary=True)
             chats = None if isinstance(chats, int) else chats
-            picks["chats"] = profile_pick(name, lists["chats"])
+            picks["chats"] = profile_pick(name, lists["chats"], ui_path, True)
         if has_library and lists["research"]:
             research = profile_research(args, cfg_path, state_path)
-            picks["research"] = profile_pick("all", lists["research"])
+            picks["research"] = profile_pick("all", lists["research"], ui_path, False)
     else:
         tabs, kinds = [], []
         if files is not None:
