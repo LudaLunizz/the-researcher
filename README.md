@@ -101,6 +101,10 @@ Measured with Anthropic's `count_tokens` endpoint (model `claude-sonnet-5-5`, 16
 - The researcher still reads every ticked document in full. The larger saving is what you leave unticked, which costs nothing. It also replaces the search-and-read turns of "read my notes on X" with one call.
 - The converted text came to **2.4 characters per token** over the 85 documents (2.0 to 3.0 per document, token-weighted 2.42), and the popup sizes and the usage log assume **2.4**. An earlier flat 4 characters per token understated the real cost by roughly 1.7x. The ratio varies with the content: code, tables and non-English text tokenize denser than prose (the nine Dutch documents averaged 2.05, the others 2.5), so treat popup sizes as close, not exact.
 
+### Keep research out of `MEMORY.md`
+
+Claude Code loads `MEMORY.md` (and `CLAUDE.md`) in full at the start of every session. If it lists a pointer to every research document you own, you pay for all of those lines in every session, including the ones that never touch the topic. Do not do that. Keep at most one line in `MEMORY.md` that says research lives in the library and is loaded with `/researcher SET`, and let the window pick what a session needs. The pointers then cost nothing until you load them.
+
 Eighty-five documents from one person's library is still a sample of one topic mix, so read the percentages as indicative.
 
 ## Requirements
