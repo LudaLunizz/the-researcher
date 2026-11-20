@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC = importlib.util.spec_from_file_location(
@@ -383,6 +384,34 @@ class ScanTests(Env):
         self.assertIn("three", text)
         self.assertIn("hidden", R.convert(txt)[1])  # a .txt has no comments: shown as written
 
+    def test_comment_marks_inside_scripts_and_code_keep_the_text(self):
+        page = '<script>var m=s.indexOf("<!--");</script><h1>Title</h1><p>All the text.</p>'
+        self.assertEqual(R.html_text(page), "Title\nAll the text.")
+        self.assertEqual(R.html_text("<p>a</p><!-- <script> --><p>b</p>"), "a\nb")
+        md = "Use `<!--` to open one.\n\nMore text."
+        self.assertEqual(R.drop_comments(md), md)
+        self.assertEqual(R.drop_comments("a\n<!-- never closed\nhidden"), "a\n ")
+
+    def test_long_names_are_cut_and_hashed(self):
+        d = "é" * 60 + "/" + "y" * 200
+        name = R.free_store_name(d, {})
+        self.assertLessEqual(len(name.encode()), R.LONGEST_NAME)
+        self.assertTrue(name.startswith("é" * 60) and name.endswith(f" ({R.id_hash(d):08x}).txt"), name)
+        self.assertEqual(R.free_store_name("short", {}), "short.txt")
+
+    def test_bad_utf8_names_and_pdf_output_do_not_crash(self):
+        if os.name != "posix":
+            self.skipTest("byte file names")
+        open(os.path.join(os.fsencode(self.lib), b"b\xff.md"), "w").close()
+        self.assertNotIn("b\udcff", R.scan(self.lib))
+        bin_dir = os.path.join(self.tmp.name, "bin")
+        write(os.path.join(bin_dir, "pdftotext"), "#!/bin/sh\nprintf 'ok \\355\\240\\200 x'\n")
+        os.chmod(os.path.join(bin_dir, "pdftotext"), 0o755)
+        pdf = os.path.join(self.tmp.name, "c.pdf")
+        write(pdf, "x")
+        with mock.patch.dict(os.environ, {"PATH": bin_dir + os.pathsep + os.environ["PATH"]}):
+            self.assertEqual(R.convert(pdf)[1], "ok \ufffd\ufffd\ufffd x")
+
 
 class SetTests(Env):
     def test_glob_include_and_missing(self):
@@ -601,6 +630,46 @@ class MainTests(Env):
         code, out = self.run_main("--no-popup", "rust")
         self.assertIn("total: 1 docs", out)
         self.assertIn("left out by choice (2)", out)
+
+    def test_text_folder_inside_the_library_is_refused(self):
+        code, out = self.run_main("--out", self.lib, "--sync")
+        self.assertEqual(code, 6, out)
+        self.assertIn("is inside the library", out)
+        self.assertEqual(read(os.path.join(self.lib, "rust", "memory-b.txt")), "B")
+
+    def test_unreadable_choices_are_kept_aside_not_wiped(self):
+        state = os.path.join(self.conf_dir, "choices.json")
+        write(state, "{bad")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_main("--no-popup", "--setup", "rust")[0], 0)
+        self.assertEqual(read(state + ".bad"), "{bad")
+        self.assertIn('"rust"', read(state))
+
+    def test_wrong_config_types_are_config_errors(self):
+        base = read(self.cfg)
+        for top, tail in (('exclude = "*"\n', ""), ("text_dir = 5\n", ""), ("", '[sets.x]\ndocs = "a"\n')):
+            write(self.cfg, top + base + tail)  # top-level keys before the first table
+            code, out = self.run_main("--no-popup", "rust")
+            self.assertEqual(code, 6, out)
+            self.assertIn("CONFIG ERROR", out)
+
+    def test_empty_library_exits_6(self):
+        empty = os.path.join(self.tmp.name, "empty")
+        os.makedirs(empty)
+        write(self.cfg, f'library = "{empty}"\n')
+        code, out = self.run_main("--no-popup", "all")
+        self.assertEqual(code, 6, out)
+        self.assertIn("EMPTY LIBRARY", out)
+
+    @unittest.skipUnless(os.name == "posix", "symlinks")
+    def test_a_symlinked_config_stays_a_link(self):
+        real = os.path.join(self.tmp.name, "dotfiles", "config.toml")
+        write(real, read(self.cfg))
+        os.remove(self.cfg)
+        os.symlink(real, self.cfg)
+        self.assertEqual(self.run_main("--usage-share", "off")[0], 0)
+        self.assertTrue(os.path.islink(self.cfg))
+        self.assertIn("share = false", read(real))
 
     def test_list(self):
         code, out = self.run_main("--list")

@@ -92,6 +92,8 @@ test("anything outside the whitelist is refused", () => {
     record({ chars: 1.5 }),
     record({ raw: "69655" }),
     record({ tk: 0 }),
+    record({ tk: 1, raw: 1e9, lib_chars: 1e9 }), // would add a billion tokens per record
+    record({ lib_chars: 2e9 }),
     record({ v: 2 }),
   ];
   for (const rec of bad) assert.notEqual(recordError(rec, NOW), null, JSON.stringify(rec));

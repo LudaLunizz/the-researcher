@@ -717,6 +717,37 @@ fn setup_saves_defaults_and_loads_nothing() {
 }
 
 #[test]
+fn text_folder_inside_the_library_is_refused() {
+    let e = Env::new();
+    let o = e.cmd().arg("--config").arg(&e.cfg).arg("--out").arg(&e.lib).arg("--sync").output().unwrap();
+    assert_eq!(o.status.code(), Some(6));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("is inside the library"));
+    assert_eq!(read(&e.lib.join("rust/memory-b.txt")), "B"); // the user's own file is untouched
+}
+
+#[test]
+fn unreadable_choices_are_kept_aside_not_wiped() {
+    let e = Env::new();
+    write(&e.conf_dir.join("choices.json"), "{bad");
+    assert_eq!(e.run(&["--setup", "rust"]).0, 0);
+    assert_eq!(read(&e.conf_dir.join("choices.json.bad")), "{bad");
+    assert!(read(&e.conf_dir.join("choices.json")).contains("\"rust\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_stays_a_link() {
+    let e = Env::new();
+    let real = e.tmp.join("dotfiles/config.toml");
+    write(&real, &read(&e.cfg));
+    fs::remove_file(&e.cfg).unwrap();
+    std::os::unix::fs::symlink(&real, &e.cfg).unwrap();
+    assert_eq!(e.run(&["--usage-share", "off"]).0, 0);
+    assert!(fs::symlink_metadata(&e.cfg).unwrap().file_type().is_symlink());
+    assert!(read(&real).contains("share = false"));
+}
+
+#[test]
 fn list() {
     let e = Env::new();
     let (code, out) = e.run(&["--list"]);

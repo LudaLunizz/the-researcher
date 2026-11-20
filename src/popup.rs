@@ -483,7 +483,10 @@ fn draw_rows(ui: &mut egui::Ui, rows: &mut [Row], v: &mut View, indent: f32) -> 
                     e.focus = false;
                 }
                 if resp.lost_focus() {
-                    asked.commit = Some((r.doc.clone(), util::py_strip(&e.buf).to_string()));
+                    let name = util::py_strip(&e.buf).to_string();
+                    // left as it was: only end the edit (an empty id commits nothing)
+                    let doc = if name == shown { String::new() } else { r.doc.clone() };
+                    asked.commit = Some((doc, name));
                 }
                 ui.label(RichText::new("Enter keeps it, Esc undoes").small().weak());
             } else if r.readable {
@@ -875,19 +878,23 @@ impl eframe::App for App {
                                     .to_lowercase()
                                     .contains(&filter))
                     };
+                    // a folded "other" list shows nothing (a filter always unfolds it)
+                    let other_rows = if narrowed && !sec.other_open && filter.is_empty() { 0 } else { sec.other.len() };
                     ui.horizontal(|ui| {
                         // with a filter or a chip on, the buttons act on the rows that show
                         if ui.button(if narrowed { "Select shown" } else { "Select all" }).clicked() {
-                            sec.rows_mut().filter(|r| in_view(r)).for_each(|r| r.on = r.readable);
+                            let rows = sec.main.iter_mut().chain(sec.other.iter_mut().take(other_rows));
+                            rows.filter(|r| in_view(r)).for_each(|r| r.on = r.readable);
                         }
                         if ui.button(if narrowed { "Unselect shown" } else { "Select none" }).clicked() {
-                            sec.rows_mut().filter(|r| in_view(r)).for_each(|r| r.on = false);
+                            let rows = sec.main.iter_mut().chain(sec.other.iter_mut().take(other_rows));
+                            rows.filter(|r| in_view(r)).for_each(|r| r.on = false);
                         }
                         if !no_remember
                             && ui.add_enabled(!sec.first, egui::Button::new("Back to saved preset")).clicked()
                         {
                             let saved = sec.saved.clone();
-                            sec.rows_mut().for_each(|r| r.on = saved.contains(&r.doc));
+                            sec.rows_mut().for_each(|r| r.on = r.readable && saved.contains(&r.doc));
                         }
                     });
                     let mut view = View {
@@ -907,11 +914,12 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
                             let id = ui.make_persistent_id(("other", chats, &sec.name));
-                            egui::CollapsingHeader::new(&sec.other_label)
+                            let folded = egui::CollapsingHeader::new(&sec.other_label)
                                 .id_salt(id)
                                 .default_open(sec.other_open)
                                 .open((!filter.is_empty()).then_some(true))
                                 .show(ui, |ui| asks.push(draw_rows(ui, &mut sec.other, &mut view, 0.0)));
+                            sec.other_open = folded.openness > 0.0; // for the buttons in the next frame
                         });
                     }
                     for a in asks {
@@ -1251,6 +1259,29 @@ mod tab_tests {
         assert!(h.query_by_label("Chats (1 ticked)").is_some());
         assert!(h.query_by_label("Load 1 chats + 1 docs").is_some());
         assert!(result.lock().unwrap().is_none()); // nothing loaded or cancelled by the test
+    }
+
+    /// "Select shown" with a chip on ticks only the rows that show: not the chats inside the
+    /// folded "other chats" list.
+    #[test]
+    fn select_shown_leaves_a_folded_list_alone() {
+        use egui_kittest::kittest::Queryable;
+        let now = Local::now().timestamp();
+        let mut look = Look { chats: true, chip: Chip::Week, by_time: false, ..Look::default() };
+        for c in ["chat-1", "chat-2"] {
+            look.times.insert(c.into(), now);
+        }
+        let mut sec = section("default", &["chat-1"], &[]);
+        sec.other = vec!["chat-2".into()];
+        let sizes = [("chat-1".to_string(), 2400), ("chat-2".to_string(), 2400)].into(); // a size = readable
+        let chats = Tab { sections: vec![sec], sizes, look };
+        let result = Arc::new(Mutex::new(None));
+        let app = new_app(vec![TabSlot::Ready(Box::new(chats))], 0, false, "researcher --context", None, result);
+        let mut h = egui_kittest::Harness::builder().with_size([760.0, 800.0]).build_eframe(|_| app);
+        h.run_steps(5);
+        h.get_by_label("Select shown").click();
+        h.run_steps(3);
+        assert!(h.query_by_label("Load 1 chats").is_some(), "the folded chat was ticked too");
     }
 
     /// A profile preset ticks every tab at once and loads the waiting Chats tab it needs.

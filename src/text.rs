@@ -11,21 +11,26 @@ use serde_json::{Map, Value, json};
 
 use crate::util::{self, chars, py_rstrip, py_splitlines, py_strip};
 
-/// Bump when `html_text`, `drop_comments`, `convert` or `squeeze` changes: every stored copy is made again.
+/// Bump when `html_text`, `drop_comments`, `free_store_name`, `convert` or `squeeze` changes: every stored copy is made again.
 /// Shared with the Python version, which writes the same copies.
-pub const TEXT_VERSION: i64 = 3;
+pub const TEXT_VERSION: i64 = 4;
 
 fn re(p: &str) -> Regex {
     Regex::new(p).expect("valid built-in pattern")
 }
 
-static OPEN_SKIP: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<(script|style|svg)\b"));
+// Comments and `<script>`/`<style>`/`<svg>` in one left-to-right pass, so a `<!--` inside a script
+// is script text, not a comment. `<!-->` and `<!--->` are complete (empty) comments; an unclosed
+// comment runs to the end, like in a browser; an element without its closing tag stays.
+static HIDDEN: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?is)<!--(?:>|->|.*?(?:-->|\z))|<script\b.*?</script>|<style\b.*?</style>|<svg\b.*?</svg>"));
+// Markdown: closed comments, and an unclosed one only when it starts a line (CommonMark HTML
+// block); a `<!--` inside inline code must not swallow the rest of the file.
+static MD_COMMENT: LazyLock<Regex> = LazyLock::new(|| re(r"(?ms)<!--(?:>|->|.*?-->)|^<!--.*"));
 static BREAKS: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)<br[\s\x1c-\x1f]*/?>|</(p|div|li|tr|h[1-6]|section|table)>"));
 static CELL: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<(td|th)\b[^>]*>"));
 static ITEM: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<li\b[^>]*>"));
-// `<!-->` and `<!--->` are complete (empty) comments; an unclosed one runs to the end, like in a browser.
-static COMMENT: LazyLock<Regex> = LazyLock::new(|| re(r"(?s)<!--(?:>|->|.*?(?:-->|\z))"));
 static TAG: LazyLock<Regex> = LazyLock::new(|| re(r"<[^>]+>"));
 static INLINE_WS: LazyLock<Regex> = LazyLock::new(|| re(r"[ \t\r\x0c\x0b]+"));
 static BLANK_RUNS: LazyLock<Regex> = LazyLock::new(|| re(r"\n[\s\x1c-\x1f]*\n+"));
@@ -37,42 +42,16 @@ static DIGITS: LazyLock<Regex> = LazyLock::new(|| re(r"\d+"));
 static WIDE_GAP: LazyLock<Regex> = LazyLock::new(|| re(r" {3,}"));
 static SPACE_RUN: LazyLock<Regex> = LazyLock::new(|| re(r"[ \t]{2,}"));
 
-/// Remove `<script>`, `<style>` and `<svg>` elements with their content.
-fn drop_skipped(raw: &str) -> String {
-    let lower = raw.to_ascii_lowercase(); // same byte offsets as `raw`
-    let mut out = String::with_capacity(raw.len());
-    let (mut copied, mut pos) = (0, 0);
-    while let Some(caps) = OPEN_SKIP.captures_at(raw, pos) {
-        let open = caps.get(0).expect("whole match");
-        let close = format!("</{}>", caps[1].to_ascii_lowercase());
-        match lower[open.end()..].find(&close) {
-            Some(i) => {
-                let end = open.end() + i + close.len();
-                out.push_str(&raw[copied..open.start()]);
-                out.push(' ');
-                copied = end;
-                pos = end;
-            }
-            None => pos = open.start() + 1, // no closing tag: try the next opening one
-        }
-        if pos >= raw.len() {
-            break;
-        }
-    }
-    out.push_str(&raw[copied..]);
-    out
-}
-
-/// Remove `<!-- ... -->` comments as a unit, so nothing hidden in one reaches the model.
-/// Runs before the tag step: a `>` inside a comment must not end it early.
+/// Remove `<!-- ... -->` comments of a Markdown file as a unit, so nothing hidden in one reaches
+/// the model.
 pub fn drop_comments(raw: &str) -> String {
-    COMMENT.replace_all(raw, " ").into_owned()
+    MD_COMMENT.replace_all(raw, " ").into_owned()
 }
 
 /// HTML → plain text (block tags become line breaks, table cells " | ", list items "- ").
 pub fn html_text(raw: &str) -> String {
-    let t = drop_comments(raw);
-    let t = drop_skipped(&t);
+    // before the tag step: a `>` inside a comment must not end it early
+    let t = HIDDEN.replace_all(raw, " ");
     let t = BREAKS.replace_all(&t, "\n");
     let t = CELL.replace_all(&t, " | ");
     let t = ITEM.replace_all(&t, "- ");
@@ -244,13 +223,25 @@ fn id_hash(d: &str) -> u32 {
     d.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
 }
 
-/// `store_name`, unless another document already uses that file (`a/b` and `a - b`): then the
-/// id's hash goes into the name, so two documents never share one copy.
+/// `store_name`, unless another document already uses that file (`a/b` and `a - b`) or the name
+/// is too long for the file system (255 bytes, with room for the `.PID.tmp` while writing): then
+/// the id's hash goes into the name, so two documents never share one copy.
 fn free_store_name(d: &str, index: &Map<String, Value>) -> String {
     let file = store_name(d);
     let taken = index.iter().any(|(id, r)| id != d && r.get("file").and_then(Value::as_str) == Some(file.as_str()));
-    if taken { format!("{} ({:08x}).txt", d.replace('/', " - "), id_hash(d)) } else { file }
+    if !taken && file.len() <= LONGEST_NAME {
+        return file;
+    }
+    let stem = d.replace('/', " - ");
+    let mut cut = stem.len().min(LONGEST_NAME - 15); // room for " (xxxxxxxx).txt"
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} ({:08x}).txt", &stem[..cut], id_hash(d))
 }
+
+/// Longest copy name in bytes; the Python version uses the same.
+const LONGEST_NAME: usize = 200;
 
 /// Lazy {doc id: plain text}, kept as a persistent copy in the researcher's own folder.
 ///
@@ -469,6 +460,15 @@ mod tests {
     }
 
     #[test]
+    fn long_names_are_cut_and_hashed() {
+        let id = format!("{}/{}", "é".repeat(60), "y".repeat(200));
+        let name = free_store_name(&id, &Map::new());
+        assert!(name.len() <= LONGEST_NAME && name.ends_with(&format!(" ({:08x}).txt", id_hash(&id))), "{name}");
+        assert!(name.starts_with(&"é".repeat(60))); // cut on a char boundary, later in the name
+        assert_eq!(free_store_name("short", &Map::new()), "short.txt");
+    }
+
+    #[test]
     fn html_to_text() {
         let t = html_text("<h1>T</h1><ul><li>a</li><li>b &amp; c</li></ul><style>p{}</style>");
         assert_eq!(t, "T\n- a\n- b & c");
@@ -484,6 +484,15 @@ mod tests {
         assert_eq!(html_text("a<!---->b"), "a b");
         assert_eq!(html_text("<p>a</p><!-- never closed <p>hidden</p>"), "a");
         assert_eq!(drop_comments("x <!-- y --> z <!-- w -->"), "x   z  ");
+    }
+
+    #[test]
+    fn comment_marks_inside_scripts_and_code_keep_the_text() {
+        let page = r#"<script>var m=s.indexOf("<!--");</script><h1>Title</h1><p>All the text.</p>"#;
+        assert_eq!(html_text(page), "Title\nAll the text.");
+        assert_eq!(html_text("<p>a</p><!-- <script> --><p>b</p>"), "a\nb");
+        assert_eq!(drop_comments("Use `<!--` to open one.\n\nMore text."), "Use `<!--` to open one.\n\nMore text.");
+        assert_eq!(drop_comments("a\n<!-- never closed\nhidden"), "a\n ");
     }
 
     #[test]

@@ -197,7 +197,8 @@ pub fn log(rec: &Value) {
     let _ = (|| -> std::io::Result<()> {
         fs::create_dir_all(data_home())?;
         let mut f = fs::OpenOptions::new().create(true).append(true).open(usage_file())?;
-        writeln!(f, "{}", serde_json::to_string(&util::sorted(rec)).unwrap_or_default())
+        // one write call, so two loads finishing together never split a line
+        f.write_all(format!("{}\n", serde_json::to_string(&util::sorted(rec)).unwrap_or_default()).as_bytes())
     })();
 }
 

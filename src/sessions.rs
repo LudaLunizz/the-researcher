@@ -153,11 +153,14 @@ fn session_info(entries: &[Map<String, Value>]) -> Info {
 }
 
 fn load_registry(path: &str) -> Map<String, Value> {
-    let reg = fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok());
-    match reg {
-        Some(Value::Object(m)) if m.get("sessions").is_some_and(Value::is_object) => m,
-        _ => json!({"version": 1, "sessions": {}}).as_object().cloned().expect("object"),
+    let reg = library::load_choices(path);
+    if reg.get("sessions").is_some_and(Value::is_object) {
+        return reg;
     }
+    if !reg.is_empty() {
+        util::set_aside(path);
+    }
+    json!({"version": 1, "sessions": {}}).as_object().cloned().expect("object")
 }
 
 fn save_registry(path: &str, reg: &Map<String, Value>) -> std::io::Result<()> {
@@ -250,6 +253,7 @@ fn scan_sessions(
     skip: &str,
     reg_path: &str,
     in_opencode: bool,
+    live_out: &mut Option<String>,
 ) -> usize {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let mut added = 0;
@@ -280,7 +284,7 @@ fn scan_sessions(
         }
     }
     if st.opencode {
-        added += scan_opencode(reg, st, idle_secs, reg_path, in_opencode);
+        added += scan_opencode(reg, st, idle_secs, reg_path, in_opencode, live_out);
     }
     added
 }
@@ -350,6 +354,7 @@ fn scan_opencode(
     idle_secs: f64,
     reg_path: &str,
     in_opencode: bool,
+    live_out: &mut Option<String>,
 ) -> usize {
     let list = match oc_run(&st.opencode_cmd, &["session", "list", "--format", "json"]) {
         Ok(b) => serde_json::from_slice::<Value>(&b).ok().and_then(|v| v.as_array().cloned()),
@@ -374,6 +379,7 @@ fn scan_opencode(
     } else {
         None
     };
+    *live_out = live.map(str::to_string); // an earlier scan from Claude Code may have registered it
     let cache = util::join(&util::dirname(reg_path), "sessions-opencode");
     let mut todo: Vec<(String, f64, String, String)> = Vec::new(); // id, mtime, directory, cache file
     for v in &list {
@@ -531,8 +537,8 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
         return 7;
     };
     let mut reg = load_registry(reg_path);
-    let added =
-        scan_sessions(&mut reg, &st, st.idle_minutes * 60.0, "", reg_path, std::env::var_os("OPENCODE").is_some());
+    let in_oc = std::env::var_os("OPENCODE").is_some();
+    let added = scan_sessions(&mut reg, &st, st.idle_minutes * 60.0, "", reg_path, in_oc, &mut None);
     let result = (|| -> Result<Option<i32>, ConfigError> {
         let io = |e: std::io::Error| ConfigError(e.to_string());
         match &action {
@@ -575,7 +581,7 @@ pub fn main(action: Action, cfg: &Config, cfg_path: &str, reg_path: &str, out_di
                 println!("{n:>7} chars  {}", written[0]);
                 println!("total: 1 session, {n} chars (~{}k tokens)", n / CHARS_PER_K);
                 // one chat, against every chat up to it (last active at or before it)
-                let lib = chats_up_to(sessions(&reg).values(), &last_of(&rec));
+                let lib = chats_up_to(chat_catalog(&reg, &[]).iter().map(|s| &sessions(&reg)[s]), &last_of(&rec));
                 let bytes = fs::metadata(&file).map_or(0, |m| m.len());
                 if let Some(note) = usage_of_chats(cfg, cfg_path, &[(n, bytes)], lib) {
                     println!("{note}");
@@ -659,13 +665,13 @@ fn last_of(rec: &Value) -> String {
 
 /// Every chat that can be loaded, by folder (the folder used most recently first), newest first
 /// inside a folder.
-fn chat_catalog(reg: &Map<String, Value>, skip: &str) -> Vec<String> {
+fn chat_catalog(reg: &Map<String, Value>, skip: &[&str]) -> Vec<String> {
     /// (folder, its newest last-active time, [(last-active, session id)])
     type Folder = (String, String, Vec<(String, String)>);
     let mut by_folder: Vec<Folder> = Vec::new();
     for (sid, rec) in sessions(reg) {
         let file = rec.get("file").and_then(Value::as_str).unwrap_or("");
-        if sid == skip || !fs::metadata(file).is_ok_and(|m| m.is_file()) {
+        if skip.contains(&sid.as_str()) || !fs::metadata(file).is_ok_and(|m| m.is_file()) {
             continue;
         }
         let (folder, last) = (chat_folder(rec), last_of(rec));
@@ -807,11 +813,12 @@ pub fn prep(cfg: &Config, a: &ContextArgs, secondary: bool) -> Result<Chats, i32
     // the chat that runs this is never offered; chats closed a moment ago are
     let me = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default().to_lowercase();
     let mut reg = load_registry(a.reg_path);
-    scan_sessions(&mut reg, &st, 0.0, &me, a.reg_path, std::env::var_os("OPENCODE").is_some());
+    let mut live = None; // inside opencode: the opencode chat that runs this
+    scan_sessions(&mut reg, &st, 0.0, &me, a.reg_path, std::env::var_os("OPENCODE").is_some(), &mut live);
     if let Err(e) = save_registry(a.reg_path, &reg) {
         say(format!("could not save the session registry to {}: {e}", a.reg_path));
     }
-    let catalog = chat_catalog(&reg, &me);
+    let catalog = chat_catalog(&reg, &[&me, live.as_deref().unwrap_or("")]);
     if catalog.is_empty() {
         if st.opencode {
             say(format!("NO CHATS: no earlier Claude Code ({}) or opencode chats; nothing loaded", st.projects_dir));
@@ -843,11 +850,12 @@ pub fn tab(c: &Chats, ui_path: &str) -> popup::Tab {
             look.defaults.insert(sid.clone(), first.to_string());
         }
         look.groups.insert(sid.clone(), chat_folder(rec));
-        look.notes.insert(sid.clone(), util::take_chars(&last_of(rec), 10).to_string());
         let when = crate::bands::parse_iso(&last_of(rec))
             .or_else(|| rec.get("mtime").and_then(Value::as_f64).map(|m| m as i64));
         if let Some(w) = when {
             look.times.insert(sid.clone(), w);
+            // the local day, like the Today / Yesterday headings (the record holds UTC)
+            look.notes.insert(sid.clone(), crate::bands::local(w).format("%Y-%m-%d").to_string());
         }
         sizes.insert(sid.clone(), chat_chars(rec) as usize);
     }
@@ -862,6 +870,14 @@ fn reset_name(reg: &mut Map<String, Value>, sid: &str) {
     let (file, proj, source) = (get("file"), get("project"), get("source"));
     let mtime = rec.get("mtime").and_then(Value::as_f64).unwrap_or(0.0);
     let entries = read_transcript(&file);
+    if entries.is_empty() {
+        // the transcript is gone: nothing to read a title from, so the first prompt it had
+        let first = clean_name(&get("first"));
+        if !first.is_empty() {
+            rec.insert("name".into(), Value::String(first));
+        }
+        return;
+    }
     register(reg, sid, &file, mtime, &proj, Some(source.as_str()).filter(|s| !s.is_empty()), &entries);
 }
 
@@ -907,25 +923,28 @@ pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabP
         }
         return 0;
     }
-    // a saved preset can name a chat whose transcript was deleted since (the popup just drops it)
-    let gone: Vec<String> = if picks.is_none() {
-        let all: BTreeSet<&String> = catalog.iter().collect();
-        let saved = names.iter().flat_map(|n| str_set(presets.get(n), "selected"));
-        library::dedupe(saved.filter(|d| !all.contains(d)))
-    } else {
-        Vec::new()
+    // a saved preset can name a chat whose transcript was deleted since (the popup just drops it;
+    // a profile preset passes it on)
+    let all: BTreeSet<&String> = catalog.iter().collect();
+    let saved: Vec<String> = match &picks {
+        None => names.iter().flat_map(|n| str_set(presets.get(n), "selected")).collect(),
+        Some(t) => t.picks.iter().flat_map(|p| p.ticked.iter().cloned()).collect(),
     };
+    let gone = library::dedupe(saved.into_iter().filter(|d| !all.contains(d)));
     let picks = match picks {
         Some(t) => {
             if let Err(e) = crate::state::save_ui(a.ui_path, true, t.chip, t.by_time) {
                 println!("could not save the window settings to {}: {e}", a.ui_path);
             }
             if !t.renames.is_empty() {
+                // renamed in the file as it is now: a rename another run saved meanwhile stays
+                let mut fresh = load_registry(a.reg_path);
                 for (sid, name) in &t.renames {
                     set_name(&mut reg, sid, name);
+                    set_name(&mut fresh, sid, name);
                     println!("RENAMED {}", chat_label(sid, &sessions(&reg)[sid]));
                 }
-                if let Err(e) = save_registry(a.reg_path, &reg) {
+                if let Err(e) = save_registry(a.reg_path, &fresh) {
                     println!("could not save the session registry to {}: {e}", a.reg_path);
                 }
             }
@@ -946,6 +965,9 @@ pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabP
         return 0; // the other tab, left alone
     }
 
+    if picks.iter().any(|p| p.remember || a.setup) {
+        presets = library::load_choices(a.presets_path); // a preset another run saved meanwhile stays
+    }
     let saved_any = save_presets(&mut presets, &picks, &catalog, a.setup);
     if saved_any && let Err(e) = library::save_choices(a.presets_path, &presets) {
         println!("could not save the presets to {}: {e}", a.presets_path);
@@ -987,7 +1009,7 @@ pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabP
     }
     println!("total: {} chats, {total} chars (~{}k tokens)", docs.len(), total / CHARS_PER_K);
     // the "whole library" of this load: every chat up to the newest one picked
-    let newest = chosen.iter().map(|sid| last_of(&map[*sid])).max().unwrap_or_default();
+    let newest = chosen.iter().filter_map(|sid| map.get(*sid)).map(last_of).max().unwrap_or_default();
     let lib = chats_up_to(catalog.iter().map(|sid| &map[sid]), &newest);
     if let Some(note) = usage_of_chats(cfg, a.cfg_path, &loaded, lib) {
         println!("{note}");
