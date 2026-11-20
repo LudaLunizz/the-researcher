@@ -883,7 +883,9 @@ impl eframe::App for App {
                         if ui.button(if narrowed { "Unselect shown" } else { "Select none" }).clicked() {
                             sec.rows_mut().filter(|r| in_view(r)).for_each(|r| r.on = false);
                         }
-                        if ui.add_enabled(!sec.first, egui::Button::new("Back to saved preset")).clicked() {
+                        if !no_remember
+                            && ui.add_enabled(!sec.first, egui::Button::new("Back to saved preset")).clicked()
+                        {
                             let saved = sec.saved.clone();
                             sec.rows_mut().for_each(|r| r.on = saved.contains(&r.doc));
                         }
@@ -985,7 +987,19 @@ fn tab_state(t: &Tab) -> TabState {
                 name: sec.name.clone(),
                 title: look.titles.get(&sec.name).cloned().unwrap_or_default(),
                 save_as: sec.name.clone(),
-                sub: subtitle(sec, look.chats),
+                sub: if look.no_remember {
+                    // a profile tab: no saved preset of its own
+                    let noun = if look.code {
+                        "files under the profile root"
+                    } else if look.chats {
+                        "chats"
+                    } else {
+                        "documents in your library"
+                    };
+                    format!("{} {noun}; a profile preset above ticks them", sec.docs.len())
+                } else {
+                    subtitle(sec, look.chats)
+                },
                 main: rows(&sec.main, sec, &t.sizes, look),
                 other: rows(&sec.other, sec, &t.sizes, look),
                 other_label: match (other_open, look.chats) {

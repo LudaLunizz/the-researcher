@@ -703,7 +703,10 @@ def tab_state(tab):
                 "when": times.get(d), "on": d in sizes and d in sec["ticked"], "readable": d in sizes,
                 "new": d in sec["new"]}
     secs = [{"name": s["name"], "title": titles.get(s["name"], ""), "title0": titles.get(s["name"], ""),
-             "save_as": s["name"], "sub": subtitle(s, chats),
+             "save_as": s["name"],
+             "sub": (f"{len(s['docs'])} " + ("files under the profile root" if code else "chats" if chats
+                                              else "documents in your library")
+                     + "; a profile preset above ticks them") if look.get("no_remember") else subtitle(s, chats),
              "main": [row(d, s) for d in s["main"]], "other": [row(d, s) for d in s["other"]],
              "other_open": not s["main"], "saved": set(s["ticked"]), "first": s["first"],
              "remember": s["remember"]} for s in tab["sections"]]
@@ -1083,9 +1086,11 @@ def popup(tabs, start, setup, command="", profile=None):
                 for r in sec["main"] + sec["other"]:
                     r["on"] = r["doc"] in sec["saved"]
                 later(render)
-            for text, fn in (("Select shown" if narrowed else "Select all", lambda _b, s=sec: pick(s, True)),
-                             ("Unselect shown" if narrowed else "Select none", lambda _b, s=sec: pick(s, False)),
-                             ("Back to saved preset", lambda _b, s=sec: back(s))):
+            buttons = [("Select shown" if narrowed else "Select all", lambda _b, s=sec: pick(s, True)),
+                       ("Unselect shown" if narrowed else "Select none", lambda _b, s=sec: pick(s, False))]
+            if not st["no_remember"]:  # a profile tab has no saved preset of its own
+                buttons.append(("Back to saved preset", lambda _b, s=sec: back(s)))
+            for text, fn in buttons:
                 b = Gtk.Button(label=text)
                 b.connect("clicked", fn)
                 if text == "Back to saved preset":
