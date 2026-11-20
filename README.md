@@ -16,7 +16,7 @@ If you keep research notes, reports, or saved articles on disk and keep telling 
 
 ## How it looks
 
-The first picture is a set with a saved preset: the documents you ticked last time are ticked, a document added since is marked **NEW**, and the rest of your library is folded under "Add other research". The second is a set you have never used: your whole library, grouped by folder, with nothing ticked. **Cancel (load nothing)** always leaves without sending anything.
+The first picture is a set with a saved preset: the documents you ticked last time are ticked, a document added since is marked **NEW**, and the rest of your library is folded under "Add other research". The second is a set you have never used: your whole library, grouped by folder, with nothing ticked. Above the list are the time chips (Day | Week | Month | All) and "Group by: time | folder"; **rename** gives a document or a set a display name. **Cancel (load nothing)** always leaves without sending anything.
 
 ![Popup with a saved preset](docs/img/popup-saved-preset.png)
 
@@ -26,13 +26,17 @@ The first time you load research, before a library is set, a smaller window asks
 
 ![First use: choose the research folder](docs/img/first-use.png)
 
-`/load-context` (earlier chats as context, see [below](#earlier-chats-as-context-load-context)) opens the same kind of window for your earlier Claude Code chats. The first picture is a saved preset: the chats ticked last time are ticked, the rest are folded under "Add other chats", and chats started since are counted as newer and marked **NEW** once you unfold it. The second is a preset you have never used: every chat, grouped by project folder, nothing ticked.
+`/load-context` (earlier chats as context, see [below](#earlier-chats-as-context-load-context)) opens the same window on its **Chats** tab; the **Research** tab next to it loads only when you click it (see [One window, two tabs](#one-window-two-tabs)). The first picture is a saved preset on the Week chip, grouped by time: the chats ticked last time are ticked, the rest are folded under "Add other chats", and chats started since are counted as newer and marked **NEW** once you unfold it. The second is a preset you have never used: the chats of this week under Today, Yesterday and Earlier this week, nothing ticked, with the preset's name field next to Remember.
 
 ![Chat window with a saved preset](docs/img/context-saved-preset.png)
 
 ![Chat window for a new preset](docs/img/context-new-preset.png)
 
-All pictures use the made-up documents in [examples/library](examples/library) and made-up chats. `tools/screenshots.sh` makes them again: it opens the windows five times for about a second each, needs a display, and runs with a throwaway home folder, so none of your own files, settings or paths are touched or shown.
+`/researcher profile myapp gui` opens a [project profile](#project-profiles): Code | Chats | Research, with the preset buttons on top. The preset `gui` ticked two source files, two chats and one research document at once; Chats and Research loaded because the preset needed them.
+
+![A project profile with the preset gui](docs/img/profile.png)
+
+All pictures use the made-up documents in [examples/library](examples/library) and made-up chats. `tools/screenshots.sh` makes them again: it opens the windows six times for about a second each, needs a display, and runs with a throwaway home folder, so none of your own files, settings or paths are touched or shown.
 
 ## The text copy
 
