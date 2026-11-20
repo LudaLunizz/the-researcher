@@ -4,6 +4,8 @@
 
 [![tokens squeezed](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/squeezed)](#sharing-opt-in) [![tokens not loaded](https://img.shields.io/endpoint?url=https://the-researcher-usage.ludalunizz.workers.dev/v1/badge/not-loaded)](#sharing-opt-in)   *so far, by all users*
 
+New here? The [user manual](docs/MANUAL.md) walks through everything step by step.
+
 Load your saved research into a [Claude Code](https://claude.com/claude-code) or [opencode](https://opencode.ai) session in one step, and only the part you need.
 
 If you keep research notes, reports, or saved articles on disk and keep telling Claude "read my notes on X first", this does that for you. You name a **set** (`/researcher rust`), a small window lists the documents with their size in tokens, you tick what this session needs, and Claude reads exactly those. No tokens are spent while the window is open or on anything you leave unticked.
