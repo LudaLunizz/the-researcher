@@ -736,6 +736,35 @@ fn unreadable_choices_are_kept_aside_not_wiped() {
 
 #[cfg(unix)]
 #[test]
+fn a_new_text_folder_inside_a_symlinked_library_is_refused() {
+    let e = Env::new();
+    let link = e.tmp.join("liblink");
+    std::os::unix::fs::symlink(&e.lib, &link).unwrap();
+    let out = link.join("copies");
+    let o = e.cmd().arg("--config").arg(&e.cfg).arg("--out").arg(&out).arg("--sync").output().unwrap();
+    assert_eq!(o.status.code(), Some(6));
+    assert!(!e.lib.join("copies").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn choices_that_cannot_be_read_are_kept_aside() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Env::new();
+    let p = e.conf_dir.join("choices.json");
+    write(&p, r#"{"mine": {"selected": []}}"#);
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&p).is_ok() {
+        return; // root reads anything
+    }
+    assert_eq!(e.run(&["--no-popup", "--setup", "rust"]).0, 0);
+    let bad = e.conf_dir.join("choices.json.bad");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(read(&bad).contains("mine"));
+}
+
+#[cfg(unix)]
+#[test]
 fn a_symlinked_config_stays_a_link() {
     let e = Env::new();
     let real = e.tmp.join("dotfiles/config.toml");
@@ -1002,6 +1031,17 @@ fn context_never_offers_the_running_chat() {
 }
 
 #[test]
+fn the_running_chat_in_its_own_preset_is_not_missing() {
+    let (s, presets) = context_env();
+    save_preset(&presets, "work", &[]);
+    s.e.run(&["--context", "--setup", "work"]); // registers SID3 while it is not running
+    save_preset(&presets, "work", &[SID2, SID3]);
+    let (code, out) = s.e.run_with(&["--context", "work"], &[("CLAUDE_CODE_SESSION_ID", SID3)]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("MISSING"), "{out}");
+}
+
+#[test]
 fn context_preset_loads_chats_named_by_first_prompt() {
     let (s, presets) = context_env();
     save_preset(&presets, "work", &[SID2, SID4, "99999999-9999-4999-8999-999999999999"]);
@@ -1125,6 +1165,17 @@ fn profile_env() -> (Sess, PathBuf) {
         "code": ["src/gui/popup.rs"], "chats": [SID2], "research": ["rust/memory-a"]}}}});
     write(&s.e.conf_dir.join("profiles.json"), &gui.to_string());
     (s, presets)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_in_the_code_root_is_skipped() {
+    let (s, _) = profile_env();
+    let pipe = s.e.tmp.join("repo/src/events.pipe");
+    assert!(Command::new("mkfifo").arg(&pipe).status().unwrap().success());
+    let (code, out) = s.e.run(&["--profile", "app", "gui"]); // hung on the read before
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("events.pipe"), "{out}");
 }
 
 #[test]

@@ -41,8 +41,8 @@ const BADGES = {
 export function short(n) {
   const v = Math.round(n);
   for (const [d, unit] of [[1e9, "B"], [1e6, "M"], [1e3, "k"]]) {
-    if (v >= d) {
-      const x = v / d;
+    if (v >= d - d / 2000) {
+      const x = Math.max(v / d, 1); // 999.5k rounds up: "1M", not "1000k"
       return `${x >= 100 ? Math.round(x) : Number(x.toFixed(1))}${unit}`;
     }
   }

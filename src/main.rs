@@ -511,7 +511,14 @@ fn research_prep(args: &Args, cfg_path: &str, state_path: &str, secondary: bool)
             .map_or_else(text_home, str::to_string),
     };
     let store = util::user_path(&store);
-    let real = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    // like realpath: resolve the deepest part that exists, so a text folder not made yet is
+    // still seen through a symlinked library
+    let real = |p: &str| {
+        let p = std::path::Path::new(p);
+        p.ancestors()
+            .find_map(|a| std::fs::canonicalize(a).ok().map(|r| r.join(p.strip_prefix(a).unwrap_or(p))))
+            .unwrap_or_else(|| p.to_path_buf())
+    };
     if real(&store).starts_with(real(&lib)) {
         // the copies would overwrite the user's own files, or be read as documents again
         return Err(cfg_err(ConfigError(format!(

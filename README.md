@@ -48,7 +48,7 @@ Every document of your library gets one plain-text file in the researcher's own 
 - `researcher --sync` makes or refreshes the copy of the whole library and loads nothing.
 - Copies stay when a document leaves the library (a library on an unplugged drive keeps working). Delete the folder any time; it is rebuilt.
 - HTML and Markdown comments (`<!-- ... -->`) are dropped before anything else, so text hidden in a comment never reaches Claude. Hidden elements (`display:none`, `<details>`) are still kept.
-- The text is squeezed for tokens, without dropping content: PDF layout padding and indentation, page numbers and headers/footers that repeat on most pages, lines of rule characters, zero-width characters, runs of blank lines and exact repeated lines. Markdown and text files are only tidied (indentation and code are kept).
+- The text is squeezed for tokens, without dropping content: PDF layout padding and indentation, page numbers and headers/footers that repeat on most pages, lines of rule characters, zero-width characters, runs of blank lines and exact repeated lines (PDF and HTML only). Markdown and text files are only tidied (indentation, code and repeated lines are kept).
 - Measured in characters on 11 sampled PDFs (16 Nov 2026): 394,359 characters from `pdftotext -layout`, 251,104 after squeezing, so **36% fewer**; per document 2% to 48%. The spread follows how much of a PDF is padding. Tokens were not counted for this step. A library that mostly holds HTML gains little, because HTML is already converted to text.
 
 ## Usage log

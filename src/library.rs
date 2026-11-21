@@ -429,7 +429,15 @@ pub fn sections_for(names: &[String], sets: &Sets, conf: &Choices, texts: &mut T
 }
 
 pub fn load_choices(path: &str) -> Choices {
-    let Ok(bytes) = fs::read(path) else { return Choices::default() };
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Choices::default(),
+        Err(_) => {
+            // unreadable (permissions, a folder): keep it aside instead of saving over it
+            util::set_aside(path);
+            return Choices::default();
+        }
+    };
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(m)) => m,
         _ => {
