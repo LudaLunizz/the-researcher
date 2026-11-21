@@ -311,3 +311,11 @@ test("the migration brings an old table to the new shape", () => {
   const cols = (d) => d.prepare("PRAGMA table_info(loads)").all().map((c) => c.name).sort();
   assert.deepEqual(cols(db), cols(fresh));
 });
+
+test("badge numbers that round up move to the next unit", () => {
+  assert.equal(short(999), "999");
+  assert.equal(short(999_499), "999k");
+  assert.equal(short(999_500), "1M");
+  assert.equal(short(999_500_000), "1B");
+  assert.equal(short(2_712_345), "2.7M");
+});

@@ -97,7 +97,33 @@ class SqueezeTests(unittest.TestCase):
         self.assertEqual(R.squeeze("x\n==========\ny", "plain"), "x\n\ny")
 
     def test_exact_repeat_lines_collapse(self):
-        self.assertEqual(R.squeeze("same\nsame\nother", "plain"), "same\nother")
+        self.assertEqual(R.squeeze("same\nsame\nother", "html"), "same\nother")
+        self.assertEqual(R.squeeze("x += 1\nx += 1", "plain"), "x += 1\nx += 1")  # code keeps its repeats
+
+    def test_a_bare_less_than_is_not_a_tag(self):
+        self.assertEqual(R.html_text("<p>if x < 3 and y > 2 then</p>"), "if x < 3 and y > 2 then")
+
+    def test_pastes_are_prompts_and_compaction_summaries_are_not(self):
+        paste = {"type": "user", "message": {"content":
+                 '\n\n<pasted_content id="ab12">\nthe brief\n</pasted_content id="ab12">\n'}}
+        self.assertEqual(R.real_prompt(paste), "the brief")
+        self.assertEqual(R.real_prompt({"type": "user", "isCompactSummary": True,
+                                        "message": {"content": "This session is"}}), "")
+
+    def test_unreadable_state_is_kept_aside(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "choices.json")
+            with mock.patch("builtins.open", side_effect=PermissionError):
+                self.assertEqual(R.load_conf(p), {})
+            write(p, "{}")
+            with mock.patch("builtins.open", side_effect=PermissionError):
+                R.load_conf(p)
+            self.assertTrue(os.path.exists(p + ".bad"))
+
+    def test_a_bare_config_file_name_saves(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.chdir(d):
+            R.save_conf("c.json", {"a": 1})
+            self.assertEqual(json.loads(read(os.path.join(d, "c.json"))), {"a": 1})
 
 
 class UsageTests(Env):

@@ -105,12 +105,17 @@ fn message_text(e: &Map<String, Value>) -> String {
     block_text(e.get("message").and_then(Value::as_object).and_then(|m| m.get("content")))
 }
 
+static PASTE_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</?pasted_content[^>]*>").unwrap());
+
 /// The user's own prompt of an entry, or "" (tool results, meta and system text, commands).
 fn real_prompt(e: &Map<String, Value>) -> String {
-    if s(e, "type") != Some("user") || util::truthy_json(e.get("isMeta")) {
-        return String::new();
+    if s(e, "type") != Some("user")
+        || ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"].iter().any(|k| util::truthy_json(e.get(*k)))
+    {
+        return String::new(); // a compaction summary is Claude Code's text, not the user's
     }
-    let text = message_text(e);
+    // a large paste is the user's own prompt, wrapped in <pasted_content id="..."> tags
+    let text = PASTE_TAG.replace_all(&message_text(e), "").into_owned();
     let text = py_strip(&text);
     if text.is_empty() || text.starts_with('<') { String::new() } else { text.to_string() }
 }
@@ -930,7 +935,15 @@ pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabP
         None => names.iter().flat_map(|n| str_set(presets.get(n), "selected")).collect(),
         Some(t) => t.picks.iter().flat_map(|p| p.ticked.iter().cloned()).collect(),
     };
-    let gone = library::dedupe(saved.into_iter().filter(|d| !all.contains(d)));
+    // the running chat (and the live opencode one) is left out of the catalog, but not gone
+    let on_disk = |d: &String| {
+        sessions(&reg)
+            .get(d)
+            .and_then(|r| r.get("file"))
+            .and_then(Value::as_str)
+            .is_some_and(|f| std::path::Path::new(f).is_file())
+    };
+    let gone = library::dedupe(saved.into_iter().filter(|d| !all.contains(d) && !on_disk(d)));
     let picks = match picks {
         Some(t) => {
             if let Err(e) = crate::state::save_ui(a.ui_path, true, t.chip, t.by_time) {
@@ -1020,6 +1033,17 @@ pub fn finish(c: Chats, cfg: &Config, a: &ContextArgs, picks: Option<popup::TabP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pastes_are_prompts_and_compaction_summaries_are_not() {
+        let e = |v: Value| v.as_object().unwrap().clone();
+        let paste = e(json!({"type": "user", "message": {"content":
+            "\n\n<pasted_content id=\"ab12\">\nthe brief\n</pasted_content id=\"ab12\">\n"}}));
+        assert_eq!(real_prompt(&paste), "the brief");
+        let summary = e(json!({"type": "user", "isCompactSummary": true, "message": {"content": "This session is"}}));
+        assert_eq!(real_prompt(&summary), "");
+        assert_eq!(real_prompt(&e(json!({"type": "user", "message": {"content": "<command-name>x"}}))), "");
+    }
 
     #[test]
     fn names_are_cleaned_and_cut() {

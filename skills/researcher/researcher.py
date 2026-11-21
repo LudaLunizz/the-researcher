@@ -170,7 +170,7 @@ def init_config(path, library):
         print(f"{path} already exists; not overwriting")
         return 1
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(STARTER.format(library=library.replace("\\", "\\\\").replace('"', '\\"')))
     except OSError as e:
@@ -238,14 +238,14 @@ def html_text(raw):
     t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6]|section|table)>", "\n", t)
     t = re.sub(r"(?i)<(td|th)\b[^>]*>", " | ", t)
     t = re.sub(r"(?i)<li\b[^>]*>", "- ", t)
-    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"<[A-Za-z/!?][^>]*>", " ", t)
     t = html.unescape(t)
     t = re.sub(r"[ \t\r\f\v]+", " ", t)
     t = re.sub(r"\n\s*\n+", "\n\n", t)
     return "\n".join(line.strip() for line in t.splitlines()).strip()
 
 
-TEXT_VERSION = 4  # bump when to_text(), drop_comments(), free_store_name() or squeeze() changes: every stored copy is made again
+TEXT_VERSION = 5  # bump when to_text(), drop_comments(), free_store_name() or squeeze() changes: every stored copy is made again
 INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"))  # zero-width, soft hyphen
 PAGE_NUMBER_RE = re.compile(r"(?i)^(page\s+)?\d{1,4}(\s*(/|of)\s*\d{1,4})?$")
 PAGE_WORD_RE = re.compile(r"(?i)\b(page|pagina|blz|seite|p\.)\s*\d")
@@ -302,7 +302,7 @@ def squeeze(text, kind):
                 out.append("")
             blank = True
             continue
-        if out and ln == out[-1]:  # an exact repeat of the line above
+        if kind != "plain" and out and ln == out[-1]:  # an exact repeat (Markdown/text keep theirs: code repeats)
             continue
         out.append(ln)
         blank = False
@@ -566,7 +566,10 @@ def load_conf(path):
     try:
         with open(path, "rb") as f:
             data = f.read()
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError:  # unreadable (permissions, a folder): keep it aside instead of saving over it
+        set_aside(path)
         return {}
     try:
         conf = json.loads(data)
@@ -579,7 +582,7 @@ def load_conf(path):
 
 
 def save_conf(path, conf):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     write_atomic(path, json.dumps(conf, indent=1, ensure_ascii=False))
 
 
@@ -697,6 +700,8 @@ def code_scan(root, globs):
                 continue
             try:
                 st = os.stat(path)
+                if not stat.S_ISREG(st.st_mode):
+                    continue  # a pipe or socket would block the read below
                 if st.st_size > CODE_MAX_BYTES or not any(fnmatch.fnmatchcase(doc, g) for g in globs):
                     continue
                 with open(path, "rb") as fh:
@@ -1808,10 +1813,11 @@ def read_transcript(path):
 
 def real_prompt(entry):
     """The user's own prompt of an entry, or '' (tool results, meta and system text, commands)."""
-    if entry.get("type") != "user" or entry.get("isMeta"):
-        return ""
+    if entry.get("type") != "user" or any(entry.get(k) for k in ("isMeta", "isCompactSummary", "isVisibleInTranscriptOnly")):
+        return ""  # a compaction summary is Claude Code's text, not the user's
     msg = entry.get("message")
-    text = block_text(msg.get("content") if isinstance(msg, dict) else "").strip()
+    # a large paste is the user's own prompt, wrapped in <pasted_content id="..."> tags
+    text = re.sub(r"</?pasted_content[^>]*>", "", block_text(msg.get("content") if isinstance(msg, dict) else "")).strip()
     return "" if not text or text.startswith("<") else text
 
 
@@ -1843,7 +1849,7 @@ def load_registry(path):
 
 
 def save_registry(path, reg):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     write_atomic(path, json.dumps(reg, indent=1, ensure_ascii=False))
 
 
@@ -2336,7 +2342,9 @@ def context_finish(c, args, cfg, cfg_path, paths, out_dir, picks):
     saved = ([d for n in names for d in presets[n].get("selected", [])] if picks is None
              else [d for p in picks["picks"] for d in p["ticked"]])
     have = set(catalog)
-    gone = list(dict.fromkeys(d for d in saved if d not in have))
+    # the running chat (and the live opencode one) is left out of the catalog, but not gone
+    on_disk = lambda d: os.path.isfile((reg["sessions"].get(d) or {}).get("file") or "")
+    gone = list(dict.fromkeys(d for d in saved if d not in have and not on_disk(d)))
     if picks is None:
         chosen_picks = [{"name": s["name"], "ticked": s["ticked"], "remember": False,
                          "save_as": s["name"], "title": None} for s in secs]

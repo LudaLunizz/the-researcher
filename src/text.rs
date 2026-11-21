@@ -13,7 +13,7 @@ use crate::util::{self, chars, py_rstrip, py_splitlines, py_strip};
 
 /// Bump when `html_text`, `drop_comments`, `free_store_name`, `convert` or `squeeze` changes: every stored copy is made again.
 /// Shared with the Python version, which writes the same copies.
-pub const TEXT_VERSION: i64 = 4;
+pub const TEXT_VERSION: i64 = 5;
 
 fn re(p: &str) -> Regex {
     Regex::new(p).expect("valid built-in pattern")
@@ -31,7 +31,7 @@ static BREAKS: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)<br[\s\x1c-\x1f]*/?>|</(p|div|li|tr|h[1-6]|section|table)>"));
 static CELL: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<(td|th)\b[^>]*>"));
 static ITEM: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)<li\b[^>]*>"));
-static TAG: LazyLock<Regex> = LazyLock::new(|| re(r"<[^>]+>"));
+static TAG: LazyLock<Regex> = LazyLock::new(|| re(r"<[A-Za-z/!?][^>]*>"));
 static INLINE_WS: LazyLock<Regex> = LazyLock::new(|| re(r"[ \t\r\x0c\x0b]+"));
 static BLANK_RUNS: LazyLock<Regex> = LazyLock::new(|| re(r"\n[\s\x1c-\x1f]*\n+"));
 static PAGE_NUMBER: LazyLock<Regex> =
@@ -171,8 +171,8 @@ pub fn squeeze(text: &str, kind: Kind) -> String {
             blank = true;
             continue;
         }
-        if out.last() == Some(&ln) {
-            continue; // an exact repeat of the line above
+        if kind != Kind::Plain && out.last() == Some(&ln) {
+            continue; // an exact repeat of the line above (Markdown/text keep theirs: code repeats)
         }
         out.push(ln);
         blank = false;
@@ -435,7 +435,8 @@ mod tests {
 
     #[test]
     fn exact_repeat_lines_collapse() {
-        assert_eq!(squeeze("same\nsame\nother", Kind::Plain), "same\nother");
+        assert_eq!(squeeze("same\nsame\nother", Kind::Html), "same\nother");
+        assert_eq!(squeeze("x += 1\nx += 1", Kind::Plain), "x += 1\nx += 1"); // code keeps its repeats
     }
 
     #[test]
@@ -472,6 +473,7 @@ mod tests {
     fn html_to_text() {
         let t = html_text("<h1>T</h1><ul><li>a</li><li>b &amp; c</li></ul><style>p{}</style>");
         assert_eq!(t, "T\n- a\n- b & c");
+        assert_eq!(html_text("<p>if x < 3 and y > 2 then</p>"), "if x < 3 and y > 2 then"); // not a tag
     }
 
     #[test]

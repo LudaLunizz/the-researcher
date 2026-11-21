@@ -42,6 +42,9 @@ pub fn scan(root: &str, globs: &[String]) -> BTreeMap<String, File> {
                 }
                 continue;
             }
+            if !ft.is_file() {
+                continue; // a pipe or socket would block the read in is_text
+            }
             let Ok(meta) = e.metadata() else { continue };
             if meta.len() > MAX_BYTES || !globs.iter().any(|g| g.matches(&id)) || !is_text(&path) {
                 continue;
